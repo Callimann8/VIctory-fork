@@ -16,15 +16,15 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // Values of the SDK's GFSDK_Aftermath_Defines.h / GpuCrashDump.h /
-// GpuCrashDumpDecoding.h (SDK 2025.x). `API_VERSION` must match the DLL.
-const API_VERSION: u32 = 0x0000_0217;
+// GpuCrashDumpDecoding.h (SDK 2.27). `API_VERSION` must match the DLL.
+const API_VERSION: u32 = 0x0000_021B;
 const WATCHED_API_DX: u32 = 0x1;
 const FEATURE_DEFER_DEBUG_INFO: u32 = 0x1;
 const DX12_ENABLE_MARKERS: u32 = 0x1;
 const DX12_ENABLE_RESOURCE_TRACKING: u32 = 0x2;
 const DX12_GENERATE_SHADER_DEBUG_INFO: u32 = 0x8;
-const DX12_ENABLE_SHADER_ERROR_REPORTING: u32 = 0x40;
-const DECODER_ALL_INFO: u32 = 0xFFF;
+const DX12_ENABLE_SHADER_ERROR_REPORTING: u32 = 0x10;
+const DECODER_ALL_INFO: u32 = 0x3FFF;
 const JSON_FORMAT_DEFAULT: u32 = 0;
 const STATUS_FINISHED: u32 = 4;
 const STATUS_FAILED: u32 = 2;
@@ -56,6 +56,14 @@ type GenerateJsonFn = unsafe extern "C" fn(
 ) -> u32;
 type GetJsonFn = unsafe extern "C" fn(*mut c_void, u32, *mut u8) -> u32;
 type DestroyDecoderFn = unsafe extern "C" fn(*mut c_void) -> u32;
+type ShaderHashFn = unsafe extern "C" fn(u32, *const ShaderBytecode, *mut u64) -> u32;
+
+/// `D3D12_SHADER_BYTECODE`.
+#[repr(C)]
+struct ShaderBytecode {
+    code: *const c_void,
+    len: usize,
+}
 
 struct Lib {
     dx12_init: Dx12InitFn,
@@ -64,6 +72,7 @@ struct Lib {
     generate_json: GenerateJsonFn,
     get_json: GetJsonFn,
     destroy_decoder: DestroyDecoderFn,
+    shader_hash: ShaderHashFn,
     dir: PathBuf,
 }
 
@@ -120,6 +129,9 @@ fn load(path: &std::ffi::OsStr, dir: PathBuf) -> Result<Lib, String> {
             generate_json: func(sym(b"GFSDK_Aftermath_GpuCrashDump_GenerateJSON\0")?),
             get_json: func(sym(b"GFSDK_Aftermath_GpuCrashDump_GetJSON\0")?),
             destroy_decoder: func(sym(b"GFSDK_Aftermath_GpuCrashDump_DestroyDecoder\0")?),
+            shader_hash: func(sym(
+                b"GFSDK_Aftermath_GetShaderHash\0",
+            )?),
             dir,
         };
         let r = enable(
@@ -154,6 +166,30 @@ pub(crate) fn attach(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device
             result = format_args!("{r:#x}"),
             "GFSDK_Aftermath_DX12_Initialize failed"
         );
+    }
+}
+
+/// The hash crash dumps name a DXIL shader by ("Shader hash"), if enabled.
+pub(crate) fn shader_hash(dxil: &[u8]) -> Option<u64> {
+    let lib = lib()?;
+    let code = ShaderBytecode {
+        code: dxil.as_ptr().cast(),
+        len: dxil.len(),
+    };
+    let mut hash = 0u64;
+    // SAFETY: valid bytecode bytes for the call.
+    let r = unsafe { (lib.shader_hash)(API_VERSION, &code, &mut hash) };
+    (r == RESULT_SUCCESS).then_some(hash)
+}
+
+/// Saves a shader's console container and its DXIL under `shaders/` in
+/// the dump directory, so a dump's faulting shader can be disassembled.
+pub(crate) fn save_shader(hash: &str, container: &[u8], dxil: &[u8]) {
+    let Some(lib) = lib() else { return };
+    let dir = lib.dir.join("shaders");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(format!("{hash}.container")), container);
+        let _ = std::fs::write(dir.join(format!("{hash}.dxil")), dxil);
     }
 }
 

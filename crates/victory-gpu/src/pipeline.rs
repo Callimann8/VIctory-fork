@@ -108,6 +108,15 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                // Diagnostics: the hash Aftermath crash dumps name this
+                // shader by, next to ours.
+                #[cfg(feature = "diagnostics")]
+                if let Ok(t) = &done
+                    && let Some(nv) = crate::aftermath::shader_hash(&t.host.dxil)
+                {
+                    tracing::info!(stage = self.stage, hash = %self.hash, aftermath = nv, "aftermath shader hash");
+                    crate::aftermath::save_shader(&self.hash, &self.container, &t.host.dxil);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -275,7 +284,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
