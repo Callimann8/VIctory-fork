@@ -292,6 +292,10 @@ fn next() -> Arc<Pending> {
     }
 }
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -301,13 +305,17 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // The driver compiles pipelines on this thread, recursively:
+                // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+                // on a world compute program and refused it as out of memory
+                // (upstream #1129).
+                .stack_size(PIPELINE_STACK)
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    // At the title's own priority: below it, the world's busy
+                    // threads starved the workers (236 pipelines a minute at
+                    // the start screen, 7 a minute in the world on a 16-thread
+                    // laptop), and draws stay dropped until their pipelines
+                    // exist (upstream #1505).
                     loop {
                         next().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
