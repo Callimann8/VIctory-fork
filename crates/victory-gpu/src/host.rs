@@ -456,8 +456,10 @@ struct Deferred {
 /// freed GPU memory.
 static RETIREMENT_QUEUE: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
 
-/// Submissions to retain released resources past their release point.
-const RETAIN_SUBMISSIONS: u64 = 3;
+/// Submissions to retain released resources past their release point. GTA VI
+/// streams textures out while later submissions still read them (upstream
+/// #557); 3 was too few on NVIDIA, where such a read is a page fault.
+const RETAIN_SUBMISSIONS: u64 = 2000;
 
 /// Retains `resource` until the GPU has completed past its submission window.
 pub(crate) fn release_late(resource: ID3D12Resource) {
