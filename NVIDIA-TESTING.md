@@ -19,6 +19,7 @@ clean mirror of upstream (Marvisak/VIctory).
 | [#233](https://github.com/Marvisak/VIctory/pull/233) | Wave64 compute on 32-lane hosts (in halves and in the console flow) | No compute pipeline refused any more on the RTX 4070; much more of the night skyline lights up (some post effects still smear). About 2.8 s per frame (more shader writes to copy back). Merged with #254: the wave size is part of the cache key. |
 | [#453](https://github.com/Marvisak/VIctory/pull/453) | Pixel barycentrics through SV_Barycentrics | 35 fewer untranslatable shaders (582 -> 547); stable. |
 | [#704](https://github.com/Marvisak/VIctory/pull/704) (+ #193) | Unknown-stride buffers through a raw view | Removes the top unknown-stride compute drop (e30970f1727063fd, about 200 draws/frame). Hand-merged with our raw structured buffers. |
+| [#439](https://github.com/Marvisak/VIctory/pull/439) | One console wave sharing LDS runs in the console flow on 32-lane hosts | About 330 more shaders translate (compute 1,249 -> 1,468 emitted in the warm-up); exposed two NVIDIA faults, fixed below (own fixes 5 and 6). Dropped draws 1,607 -> 1,212 per frame. |
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
 ## Own additions
@@ -48,6 +49,12 @@ clean mirror of upstream (Marvisak/VIctory).
   4. A capped view heap (NVIDIA: 1,000,000) keeps 262,144 dynamic slots
      instead of 65,536: the game's per-draw tables past the cap ran them out
      and about 450 draws a frame were dropped. Draws per frame 1,547 -> 3,568.
+
+  5. Out-of-bounds LDS (group shared) accesses go to a sink dword after the
+     allocation, as the console tolerates them (NVIDIA: Out-Of-Range Address
+     Error).
+  6. Raw buffer accesses ignore the byte offset's low two bits, as the
+     console's dword accesses do (NVIDIA: Misaligned Address Error).
 
 ## Tested, not included (no effect on the NVIDIA world hang)
 #542, #334, #587 (alone, in pairs, with #650), #693, #581, #483, #431
