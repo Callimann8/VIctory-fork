@@ -5329,7 +5329,20 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into host memory the source is read in user mode, without a system
+    // call per copy (about 0.8 us each, and a world frame fills many small
+    // constant buffers); a page that cannot be read fails it as the kernel's
+    // read fails, and the fallback below runs (upstream #1010).
+    // `VICTORY_USER_COPY=0` reads through the kernel, as before.
+    static USER: OnceLock<bool> = OnceLock::new();
+    let user = !title_dst
+        && *USER.get_or_init(|| std::env::var_os("VICTORY_USER_COPY").is_none_or(|v| v != "0"));
+    let whole = if user {
+        // SAFETY: the destination is host memory of `len` bytes.
+        unsafe { crate::title_copy::copy(dst, src, len) }
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
