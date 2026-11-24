@@ -97,6 +97,9 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    // Diagnostics: let Aftermath finish its crash dump before the run ends.
+    #[cfg(feature = "diagnostics")]
+    crate::aftermath::wait_for_dump();
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
@@ -134,6 +137,10 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
+        // Diagnostics: NVIDIA crash dumps (`VICTORY_AFTERMATH`), enabled
+        // before the device exists.
+        #[cfg(feature = "diagnostics")]
+        crate::aftermath::enable();
         // The debug layer only in builds with diagnostics.
         let debug =
             cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
@@ -184,6 +191,8 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        crate::aftermath::attach(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
