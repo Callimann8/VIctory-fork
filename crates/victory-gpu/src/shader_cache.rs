@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use victory_pipeline::Cache;
 use victory_pipeline::Converter;
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -47,10 +47,15 @@ pub fn use_shader_cache(dir: PathBuf) {
 }
 
 /// Stores an already-translated [`HostShader`] for `container` into `cache`
-/// under the current translator fingerprint. Returns `true` if a new entry was
+/// under the current translator fingerprint and `target`'s wave sizes. Returns `true` if a new entry was
 /// written, `false` if it was already present.
-pub fn store(cache: &Cache, container: &[u8], shader: &HostShader) -> anyhow::Result<bool> {
-    store_with_build(cache, build(), container, shader)
+pub fn store(
+    cache: &Cache,
+    container: &[u8],
+    shader: &HostShader,
+    target: Target,
+) -> anyhow::Result<bool> {
+    store_with_build(cache, &key(build(), target), container, shader)
 }
 
 fn store_with_build(
@@ -97,12 +102,13 @@ fn build_fingerprint(source_hash: &str, schema_version: u32, loop_limit: u32) ->
     *h.finalize().as_bytes()
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one.
+pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &key(build(), target), container, translate),
         None => translate(container),
     }
 }
@@ -110,6 +116,16 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// Converter identity shared by [`Translate`] and [`store_with_build`] so
 /// offline cache warming and runtime lookups compute identical keys.
 struct KeySpec;
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    *h.finalize().as_bytes()
+}
+
 
 impl Converter for KeySpec {
     fn id(&self) -> &'static str {
@@ -377,6 +393,22 @@ mod tests {
         assert!(cached(&cache, &build, b"other", fail).is_err());
     }
 
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(key(&build, nvidia), key(&build, nvidia));
+        assert_ne!(key(&build, nvidia), key(&build, rdna));
+        assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut files = Vec::new();
         for e in std::fs::read_dir(dir).unwrap().flatten() {
@@ -435,11 +467,15 @@ mod tests {
         let container = b"prewarmed-container".as_slice();
         let expected = shader();
 
-        assert!(store(&cache, container, &expected).unwrap());
-        assert!(!store(&cache, container, &expected).unwrap());
+        let target = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        assert!(store(&cache, container, &expected, target).unwrap());
+        assert!(!store(&cache, container, &expected, target).unwrap());
 
         let runs = AtomicU64::new(0);
-        let got = cached(&cache, build(), container, |_| {
+        let got = cached(&cache, &key(build(), target), container, |_| {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(expected.clone())
         });
