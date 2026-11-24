@@ -909,7 +909,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
+        // Rectangles whose vertices the shader fetches itself draw as the
+        // triangles their first three corners make.
+        let rects = self.topology == RECTANGLES && self.rect_inputs();
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
@@ -932,6 +934,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// Whether the pipeline reads per-vertex inputs, which a rectangle list
+    /// is expanded through.
+    ///
+    /// shortcut: without them (the vertex shader fetches its vertices) a
+    /// rectangle list draws as a triangle list, half of each rectangle.
+    fn rect_inputs(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.inputs.iter().any(|e| !e.per_instance))
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1070,7 +1082,7 @@ impl State {
         // still be written by the GPU): those vertices are expanded into
         // triangles like a direct draw's, and the record is patched for the
         // execution to draw them, then put back.
-        let rects = if kind == DRAW && self.topology == RECTANGLES {
+        let rects = if kind == DRAW && self.topology == RECTANGLES && self.rect_inputs() {
             if max != 1 || counter.is_some() || stride < 16 {
                 why("rectangles: more than one record");
                 return false;
@@ -1101,7 +1113,7 @@ impl State {
         self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
-                (self.topology != RECTANGLES || rects.is_some())
+                (self.topology != RECTANGLES || kind == DRAW)
                     && self.prepare(list, kind == INDEXED)
                     && rects.is_none_or(|(count, first)| self.rectangles(list, count, first))
             }
