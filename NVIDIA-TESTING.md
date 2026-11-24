@@ -65,5 +65,5 @@ enough to time out the GPU otherwise); speed; missing draws.
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
 $env:VICTORY_SHADER_LOOP_LIMIT = "4096"
-target\diagictory.exe run "<game dir>\game_scarlett_master.exe" --execute
+target\diag\victory.exe run "<game dir>\game_scarlett_master.exe" --execute
 ```
