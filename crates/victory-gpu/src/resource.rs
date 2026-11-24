@@ -1649,6 +1649,15 @@ fn host_texture(
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
+    // Card memory: big sampled textures may lose their most detailed mips
+    // (`VICTORY_TEXTURE_MIP_DROP`, [`compute_mip_drop`]); views, uploads and
+    // copies find the drop from the two descriptions ([`mip_drop`]).
+    let drop = compute_mip_drop(desc);
+    if drop > 0 {
+        d.width = (d.width >> drop).max(1);
+        d.height = (d.height >> drop).max(1);
+        d.mip_levels -= drop as u16;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1696,10 +1705,130 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x} (mips dropped: {drop})",
+                d.width, d.height, d.format, d.flags
+            )
         });
+        if drop > 0 {
+            MIP_DROPPED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     texture
+}
+
+/// Textures made with dropped mips (diagnostics and the memory line).
+pub(crate) static MIP_DROPPED: [std::sync::atomic::AtomicU64; 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1];
+
+/// Mips to drop from a host copy of `desc`: `VICTORY_TEXTURE_MIP_DROP` (0,
+/// the default, keeps them all) for sampled power-of-two 2D textures of at
+/// least `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE` (1024) texels a side.
+/// Ported from upstream VIctory PR #1296 (GPL-3.0-or-later): the same rule,
+/// on this fork's lazily made host copies.
+#[cfg(windows)]
+fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
+    static SETTING: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let &(drop, min_size) = SETTING.get_or_init(|| {
+        let num = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        let drop = num("VICTORY_TEXTURE_MIP_DROP", 0).min(4) as u32;
+        let min_size = num("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE", 1024).max(4);
+        if drop > 0 {
+            tracing::info!(drop, min_size, "big sampled textures lose their most detailed mips");
+        }
+        (drop, min_size)
+    });
+    compute_mip_drop_explicit(desc, drop, min_size)
+}
+
+/// [`compute_mip_drop`] with the setting given.
+pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    // Not buffers, 3D textures, MSAA, nor targets, depth or unordered access.
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if drop == 0
+        || desc.dimension == BUFFER
+        || desc.dimension == TEXTURE_3D
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+        || !desc.width.is_power_of_two()
+        || !desc.height.is_power_of_two()
+        || desc.width < min_size
+        || u64::from(desc.height) < min_size
+    {
+        return 0;
+    }
+    let block = element(pc_format(desc.format)).map_or(1, |(_, b)| b);
+    let mut k = drop;
+    while k > 0 {
+        let (w, h) = (desc.width >> k, u64::from(desc.height) >> k);
+        // At least two mips left, and whole blocks for block formats.
+        if u32::from(desc.mip_levels) > k + 1
+            && w > 0
+            && h > 0
+            && (block <= 1 || (w >= block && h >= block && w % block == 0 && h % block == 0))
+        {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
+/// Mips the host copy `host` of a title texture described by `title` was
+/// made without ([`compute_mip_drop`]): 0 unless it is smaller.
+#[cfg(windows)]
+pub(crate) fn mip_drop(
+    title: &ResourceDesc,
+    host: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+) -> u32 {
+    let (t, h) = (u32::from(title.mip_levels), u32::from(host.MipLevels));
+    if title.dimension == BUFFER || title.dimension == TEXTURE_3D || h == 0 || t <= h {
+        return 0;
+    }
+    let drop = t - h;
+    if title.width >> drop == host.Width { drop } else { 0 }
+}
+
+/// Title texture `this` and its host copy `host`: (title mips per slice,
+/// mips dropped from the host copy). (0, 0) for buffers.
+#[cfg(windows)]
+pub(crate) fn mip_mapping(
+    this: This,
+    host: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> (u32, u32) {
+    let Some((_, title)) = texture_memory(this) else {
+        return (0, 0);
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { host.GetDesc() };
+    (u32::from(title.mip_levels), mip_drop(&title, &d))
+}
+
+/// A title subresource index of `this` as its host copy's, `None` for a
+/// dropped mip.
+#[cfg(windows)]
+pub(crate) fn host_sub(
+    this: This,
+    host: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    title_sub: u32,
+) -> Option<u32> {
+    let (mips, drop) = mip_mapping(this, host);
+    host_subresource(title_sub, mips, drop)
+}
+
+/// A title subresource index as the host copy's, `None` for a dropped mip.
+pub(crate) fn host_subresource(title_sub: u32, title_mips: u32, drop: u32) -> Option<u32> {
+    if drop == 0 || title_mips == 0 {
+        return Some(title_sub);
+    }
+    let (slice, mip) = (title_sub / title_mips, title_sub % title_mips);
+    if mip < drop {
+        return None;
+    }
+    let host_mips = title_mips.saturating_sub(drop).max(1);
+    Some(slice * host_mips + mip - drop)
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -2280,6 +2409,42 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// The mip drop rule (from upstream PR #1296's test): only big sampled
+    /// power-of-two textures, at least two mips left, whole BC blocks.
+    #[test]
+    fn mip_drop_takes_only_big_sampled_power_of_two_textures() {
+        let t = texture(1024, 1024, 28, 10);
+        assert_eq!(compute_mip_drop_explicit(&t, 0, 1024), 0);
+        assert_eq!(compute_mip_drop_explicit(&t, 1, 1024), 1);
+        for flags in [1, 2, 4] {
+            let mut x = t;
+            x.flags = flags;
+            assert_eq!(compute_mip_drop_explicit(&x, 1, 1024), 0, "flags {flags}");
+        }
+        let mut one_mip = t;
+        one_mip.mip_levels = 1;
+        assert_eq!(compute_mip_drop_explicit(&one_mip, 1, 1024), 0);
+        assert_eq!(compute_mip_drop_explicit(&buffer(1024), 1, 1024), 0);
+        assert_eq!(compute_mip_drop_explicit(&texture(1920, 1080, 28, 11), 1, 1024), 0);
+        assert_eq!(compute_mip_drop_explicit(&texture(512, 512, 28, 9), 1, 1024), 0);
+        assert_eq!(compute_mip_drop_explicit(&texture(2048, 1024, 28, 11), 1, 1024), 1);
+        assert_eq!(compute_mip_drop_explicit(&texture(16, 16, 98, 5), 3, 4), 2);
+        assert_eq!(compute_mip_drop_explicit(&texture(4, 4, 98, 3), 1, 4), 0);
+    }
+
+    #[test]
+    fn dropped_mips_map_title_subresources_to_the_host_copy() {
+        // 8 title mips, 2 dropped: 6 per slice on the host.
+        assert_eq!(host_subresource(0, 8, 2), None);
+        assert_eq!(host_subresource(1, 8, 2), None);
+        assert_eq!(host_subresource(2, 8, 2), Some(0));
+        assert_eq!(host_subresource(7, 8, 2), Some(5));
+        assert_eq!(host_subresource(8, 8, 2), None);
+        assert_eq!(host_subresource(10, 8, 2), Some(6));
+        assert_eq!(host_subresource(28, 8, 2), Some(20));
+        assert_eq!(host_subresource(15, 8, 0), Some(15));
     }
 
     fn heap(size: u64) -> This {

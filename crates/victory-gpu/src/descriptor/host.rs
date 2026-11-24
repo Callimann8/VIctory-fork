@@ -1357,6 +1357,52 @@ macro_rules! once {
 }
 
 /// A view description from its words, with the format as the host has it.
+/// A view's mip window on a host copy made without the `drop` most
+/// detailed mips (`host_mips` left): levels below what is left start at the
+/// copy's first; the minimum LOD clamp moves down as well.
+/// From upstream VIctory PR #1296 (GPL-3.0-or-later).
+fn drop_srv_mips(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, drop: u32, host_mips: u32) {
+    fn window(most_detailed: &mut u32, levels: &mut u32, clamp: &mut f32, drop: u32, host_mips: u32) {
+        let dropped_from_view = drop.saturating_sub(*most_detailed);
+        *most_detailed = most_detailed.saturating_sub(drop).min(host_mips.saturating_sub(1));
+        if *levels != u32::MAX {
+            let left = levels.saturating_sub(dropped_from_view);
+            *levels = left.min(host_mips.saturating_sub(*most_detailed)).max(1);
+        }
+        *clamp = (*clamp - drop as f32).max(0.0);
+    }
+    // SAFETY (each arm): the member the dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1D => {
+                let t = &mut desc.Anonymous.Texture1D;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                let t = &mut desc.Anonymous.Texture1DArray;
+                window(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp, drop, host_mips);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -1887,6 +1933,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // A host copy made without the most detailed mips: the
+                // view's levels move down by as many.
+                if let (Some(d), Some((_, title))) =
+                    (desc.as_mut(), crate::resource::texture_memory(resource))
+                {
+                    // SAFETY: a live resource.
+                    let host = unsafe { texture.GetDesc() };
+                    let drop = crate::resource::mip_drop(&title, &host);
+                    if drop > 0 {
+                        drop_srv_mips(d, drop, u32::from(host.MipLevels));
+                    }
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
