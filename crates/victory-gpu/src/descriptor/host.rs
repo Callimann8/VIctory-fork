@@ -503,6 +503,24 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    // Structured views are made raw: translated shaders read structured
+    // buffers as raw bytes (`raw_byte` in victory-shader), and NVIDIA faults
+    // on a raw access through a structured view.
+    {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        let stride = u64::from(b.StructureByteStride);
+        // A raw view starts on 16 bytes; a structured view that does not
+        // stays structured.
+        let start = shadow.offset(address) + b.FirstElement * stride;
+        if stride > 0 && stride.is_multiple_of(4) && start.is_multiple_of(16) {
+            b.FirstElement = b.FirstElement * stride / 4;
+            b.NumElements = u32::try_from(u64::from(b.NumElements) * stride / 4).ok()?;
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -542,6 +560,22 @@ fn buffer_uav(
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
+    }
+    // Structured views are made raw, as in `buffer_srv`.
+    {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        let stride = u64::from(b.StructureByteStride);
+        // A raw view starts on 16 bytes; a structured view that does not
+        // stays structured.
+        let start = shadow.offset(address) + b.FirstElement * stride;
+        if stride > 0 && stride.is_multiple_of(4) && start.is_multiple_of(16) {
+            b.FirstElement = b.FirstElement * stride / 4;
+            b.NumElements = u32::try_from(u64::from(b.NumElements) * stride / 4).ok()?;
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
