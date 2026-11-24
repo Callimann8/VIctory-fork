@@ -89,16 +89,24 @@ enough to time out the GPU otherwise); speed; missing draws.
   64 KiB, SRV 4 MiB, UAV 2 MiB). Stable for 6 minutes, but barely more draws
   (about 790 vs 850 dropped per frame) and slower frames (copy-back of root
   UAV ranges on every submission roughly doubles).
-- **Indirect rectangle lists**, branch `draw/rect-indirect`: the 256 draws
+
+## Merged 2026-11-24 evening (same-session 6-minute runs, DRED off)
+- **Indirect rectangle lists** (from `draw/rect-indirect`): the 256 draws
   per frame that failed with "indirect kind 0: prepare failed" are
-  rectangle-list `ExecuteIndirect` draws with one record and no count buffer
-  (190 per frame with 240 rectangles, 62 with 1). The fix expands the
-  record's vertices like a direct draw and patches the record's vertex count
-  and first vertex with `WriteBufferImmediate` around the execution.
-  Stable in two 6-minute runs, those drops are gone, and about 650-950 more
-  draws per frame run, but frames got slower in both runs (5.8 and 6.8 s
-  vs 4.0 s for this branch on the same day, mostly unexplained "other"
-  time, GPU time unchanged). Not merged until the slowdown is understood.
+  rectangle-list `ExecuteIndirect` draws with one record and no count
+  buffer. Records whose pipeline reads vertex inputs are expanded like a
+  direct draw (count patched with `WriteBufferImmediate`); lists whose
+  vertex shader fetches its own vertices (the 720-vertex ones) draw as
+  triangle lists, half of each rectangle. The earlier slowdown was only
+  the diagnostics build's DRED notes (`VICTORY_D3D12_DRED=1`), not this.
+- **Copy-back with `NtWriteVirtualMemory`**: `WriteProcessMemory` flushed
+  the instruction cache on every 64 KiB piece (0.5-0.7 s a frame for
+  ~46 MB); copy-back is now ~100 ms a frame. `WriteProcessMemory` stays as
+  the fallback.
+- **Snapshot pool up to 2 GiB** (was 8 buffers): ~90 ms less preparation.
+- Result: 2,238 -> 1,346 ms a frame (0.47 -> 0.77 fps), 3,418 -> 4,498
+  draws a frame; a 10-minute run held 1,339 ms with no GPU fault. Speed
+  runs should leave `VICTORY_D3D12_DRED` unset (it costs ~0.3 s a frame).
 
 ## Run it
 ```powershell
