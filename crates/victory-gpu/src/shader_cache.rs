@@ -76,7 +76,7 @@ fn build() -> &'static [u8; 32] {
 /// clean-up passes, and what the host GPU allows (its widest wave, a capped
 /// view heap's null slot). `victory translate --cache` makes the host
 /// device first ([`match_host`]) so its entries are the ones a run reads.
-fn settings() -> Vec<u8> {
+pub(crate) fn settings() -> Vec<u8> {
     let mut bytes = vec![victory_shader::emit::group_sync()];
     for name in [
         "VICTORY_WAVE_WIDE",

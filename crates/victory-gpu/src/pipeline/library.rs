@@ -12,6 +12,12 @@
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
 //!
+//! 3. The pre-build (`victory translate --cache --pipelines`) lists the
+//!    title pipelines it has put in the library, by the same key, so a
+//!    second pre-build skips them without translating or loading anything.
+//!    The list holds only for the library bytes it was saved with and for
+//!    what names the pipelines (the translator, this module and `host`).
+//!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
@@ -398,6 +404,10 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// Title pipelines the pre-build put in the library or found there, by
+    /// key, and whether that list changed since the last save.
+    prebuilt: Mutex<HashSet<String>>,
+    prebuilt_changed: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -431,6 +441,7 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -440,7 +451,15 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let tag = tag(&sample(blob.bytes()));
             let library = open(&device, blob);
+            // The pre-build's list, if it was saved with these bytes.
+            if let (Some(l), Some(list)) =
+                (library.as_ref(), DIR.get().and_then(|d| std::fs::read(d.join(PREBUILT_FILE)).ok()))
+                && !l._blob.bytes().is_empty()
+            {
+                *l.prebuilt.lock().unwrap_or_else(|e| e.into_inner()) = listed(&list, &tag);
+            }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -474,6 +493,8 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    prebuilt: Mutex::new(HashSet::new()),
+                    prebuilt_changed: AtomicBool::new(false),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -490,7 +511,92 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        prebuilt: Mutex::new(HashSet::new()),
+        prebuilt_changed: AtomicBool::new(false),
     })
+}
+
+/// What the pre-build's list holds for: the library's bytes, and what
+/// names its pipelines (the translation, as the shader cache keys it; the
+/// host descriptions).
+fn tag(blob: &[u8]) -> String {
+    let limit = victory_shader::emit::loop_limit().to_le_bytes();
+    let translator = victory_shader::SOURCE_HASH.as_bytes();
+    let settings = crate::shader_cache::settings();
+    let mut h = blake3::Hasher::new();
+    for part in [
+        blob,
+        translator,
+        include_bytes!("../shader_cache.rs"),
+        &limit,
+        &settings,
+        include_bytes!("host.rs"),
+        include_bytes!("library.rs"),
+    ] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// The pre-build's list as saved: the tag it holds for, then its keys.
+fn list(tag: &str, keys: &HashSet<String>) -> String {
+    let keys = keys.iter().map(String::as_str);
+    std::iter::once(tag).chain(keys).collect::<Vec<_>>().join("\n")
+}
+
+/// The keys of a saved list, if it holds for `tag` (else none).
+fn listed(list: &[u8], tag: &str) -> HashSet<String> {
+    let list = String::from_utf8_lossy(list);
+    let mut lines = list.lines();
+    match lines.next() == Some(tag) {
+        true => lines.map(str::to_owned).collect(),
+        false => HashSet::new(),
+    }
+}
+
+/// Whether the pre-build has the title pipeline `key` in the library.
+pub(crate) fn prebuilt(key: &str) -> bool {
+    library().is_some_and(|l| l.prebuilt.lock().unwrap_or_else(|e| e.into_inner()).contains(key))
+}
+
+/// The pre-build has the title pipeline `key` in the library now.
+pub(crate) fn note_prebuilt(key: String) {
+    if let Some(l) = library()
+        && l.prebuilt.lock().unwrap_or_else(|e| e.into_inner()).insert(key)
+    {
+        l.prebuilt_changed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What of a library's bytes [`tag`] hashes: their length and the first
+/// and last `SAMPLE` bytes. All of them would be 1.3 GB read at each save,
+/// which writes them to a file through a mapping and holds no copy.
+const SAMPLE: usize = 1 << 20;
+
+fn sample(bytes: &[u8]) -> Vec<u8> {
+    let mut s = (bytes.len() as u64).to_le_bytes().to_vec();
+    s.extend_from_slice(&bytes[..bytes.len().min(SAMPLE)]);
+    s.extend_from_slice(&bytes[bytes.len().saturating_sub(SAMPLE).max(bytes.len().min(SAMPLE))..]);
+    s
+}
+
+/// [`sample`] of the file at `path`.
+fn sample_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    let head = len.min(SAMPLE);
+    let from = len.saturating_sub(SAMPLE).max(head);
+    let mut s = (len as u64).to_le_bytes().to_vec();
+    let mut part = vec![0; head];
+    file.read_exact(&mut part)?;
+    s.extend_from_slice(&part);
+    part.resize(len - from, 0);
+    file.seek(SeekFrom::Start(from as u64))?;
+    file.read_exact(&mut part)?;
+    s.extend_from_slice(&part);
+    Ok(s)
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -512,6 +618,8 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    #[cfg(feature = "diagnostics")]
+    LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
@@ -538,6 +646,8 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    #[cfg(feature = "diagnostics")]
+    LAST.set(Some((name.to_owned(), false)));
     let pso = {
         let _call = call("make", name);
         create()?
@@ -559,6 +669,14 @@ pub(crate) fn pipeline(
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// This thread's last pipeline: its name, and whether it was loaded
+    /// (else made), for the pipeline log (diagnostics).
+    pub(crate) static LAST: std::cell::Cell<Option<(String, bool)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -588,7 +706,7 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 && !library.prebuilt_changed.load(Ordering::Relaxed) {
             return;
         }
         if added == 0 {
@@ -623,8 +741,23 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
+    // The pre-build's list, kept beside the library bytes it holds for
+    // (also when a run adds pipelines): those the next start loads.
+    let prebuilt = {
+        let keys = library.prebuilt.lock().unwrap_or_else(|e| e.into_inner());
+        library.prebuilt_changed.store(false, Ordering::Relaxed);
+        let file = [NEXT_FILE, LIBRARY_FILE].map(|f| dir.join(f)).into_iter().find(|p| p.exists());
+        match file.and_then(|p| sample_file(&p).ok()) {
+            Some(s) if !keys.is_empty() => Some(list(&tag(&s), &keys)),
+            _ => None,
+        }
+    };
     let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| match &prebuilt {
+            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
+            None => Ok(()),
+        });
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -693,6 +826,12 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     used
 }
 
+/// Reads the early list now if not yet, so a save keeps it (a pre-build
+/// asks for no title pipeline).
+pub(crate) fn keep_early_list() {
+    drop(used());
+}
+
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
@@ -721,6 +860,29 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// The pre-build's list holds only for the library bytes it was
+    /// saved with.
+    #[test]
+    fn the_prebuilt_list_holds_for_its_library_only() {
+        let keys: HashSet<String> = ["a".repeat(32), "b".repeat(32)].into();
+        let saved = list(&tag(b"library"), &keys);
+        assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
+        assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
+        assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    /// A library's sample is the same read from its bytes and from its file.
+    #[test]
+    fn a_library_file_samples_as_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [0, 10, SAMPLE + 3, 2 * SAMPLE + 5] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + i / 251) as u8).collect();
+            let path = dir.path().join("library");
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(sample_file(&path).unwrap(), sample(&bytes), "{len} bytes");
+        }
     }
 
     #[test]
