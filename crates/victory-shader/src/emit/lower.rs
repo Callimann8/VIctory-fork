@@ -7373,6 +7373,14 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        if !typed {
+            // Dword accesses ignore the address's low two bits on the
+            // console; a raw access at an unaligned byte offset is a
+            // Misaligned Address Error on NVIDIA (Aftermath: compute
+            // 1c4b3c0547e3e6fa).
+            let not3 = self.s.m.i32(!3);
+            off = self.s.m.bin(c, Bin::And, off, not3);
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
