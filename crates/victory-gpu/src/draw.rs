@@ -1065,6 +1065,22 @@ impl State {
             },
             None => None,
         };
+        // A rectangle list draws one record, its vertex count and first
+        // vertex as the title's memory holds them now (the instance count may
+        // still be written by the GPU): those vertices are expanded into
+        // triangles like a direct draw's, and the record is patched for the
+        // execution to draw them, then put back.
+        let rects = if kind == DRAW && self.topology == RECTANGLES {
+            if max != 1 || counter.is_some() || stride < 16 {
+                why("rectangles: more than one record");
+                return false;
+            }
+            // SAFETY: the record lies in a title buffer (found above).
+            let r = unsafe { std::slice::from_raw_parts(arguments as *const u32, 3) };
+            Some((r[0], r[2]))
+        } else {
+            None
+        };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1084,7 +1100,11 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED => {
+                (self.topology != RECTANGLES || rects.is_some())
+                    && self.prepare(list, kind == INDEXED)
+                    && rects.is_none_or(|(count, first)| self.rectangles(list, count, first))
+            }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
@@ -1111,6 +1131,9 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        if let Some((count, _)) = rects {
+            patch_record(list, &args.buffer, args.gpu(arguments), [count / 3 * 6, 0]);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1123,6 +1146,9 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if let Some((count, first)) = rects {
+            patch_record(list, &args.buffer, args.gpu(arguments), [count, first]);
+        }
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1265,6 +1291,38 @@ fn describe(view: Option<&View>) -> String {
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
+
+/// Writes a draw record's vertex count and first vertex (`values`) at host
+/// address `gpu` in `buffer`, which is in the indirect argument state and
+/// stays there.
+///
+/// shortcut: the written count replaces the clamp's, so a rectangle list
+/// past the list's budget still draws.
+fn patch_record(list: &HostList, buffer: &ID3D12Resource, gpu: u64, values: [u32; 2]) {
+    let Ok(l2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
+        once!("no ID3D12GraphicsCommandList2: rectangle records not patched");
+        return;
+    };
+    let params = [
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu, Value: values[0] },
+        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: gpu + 8, Value: values[1] },
+    ];
+    // SAFETY: an open list and a live buffer the list holds; the
+    // parameters outlive the call.
+    unsafe {
+        l2.ResourceBarrier(&[crate::host::transition(
+            buffer,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        l2.WriteBufferImmediate(2, params.as_ptr(), None);
+        l2.ResourceBarrier(&[crate::host::transition(
+            buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
+    }
+}
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
