@@ -123,6 +123,7 @@ fn emit(native: &crate::NativeProgram, target: super::Target) -> super::HostShad
         digest: [0; 16],
         version: (1, 0),
         parts: vec![],
+        total_size: 0,
     };
     let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
     let st = crate::structure::structure(&p).unwrap();

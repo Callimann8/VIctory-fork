@@ -1368,6 +1368,7 @@ mod barycentric_tests {
             mesh_stride: 0,
             target: Target::ANY,
             console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         assert!(l.stride_table);

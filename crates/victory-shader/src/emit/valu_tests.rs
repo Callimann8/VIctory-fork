@@ -1019,6 +1019,7 @@ fn root_view_reads_stop_at_the_bound_size() {
         mesh_stride: 0,
         target: super::Target::ANY,
         console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
     let shader = HostShader {
