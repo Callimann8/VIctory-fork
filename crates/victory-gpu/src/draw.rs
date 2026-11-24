@@ -742,8 +742,12 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if size == 0 || address == 0 {
+                            host.null_constant(index);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                            host.null_constant(index);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);

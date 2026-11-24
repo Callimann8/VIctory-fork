@@ -311,6 +311,12 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
+        if size == 0 {
+            // An empty constant buffer (the title's null CBV): a view of
+            // size 0 is invalid, and NVIDIA faults reading it.
+            self.null_constant(index);
+            return;
+        }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: size.next_multiple_of(256),
@@ -320,6 +326,16 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+    }
+
+    /// Makes slot `index` a null constant buffer view: a slot read as a
+    /// constant buffer must hold one (a null texture view there is a shader
+    /// instruction error on NVIDIA).
+    pub(crate) fn null_constant(&self, index: u32) {
+        self.keep(index, None);
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap; no description makes a null view.
+        unsafe { host.device.CreateConstantBufferView(None, self.cpu(index)) };
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
