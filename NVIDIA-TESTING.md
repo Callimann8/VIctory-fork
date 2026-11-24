@@ -12,6 +12,7 @@ clean mirror of upstream (Marvisak/VIctory).
 |----|------|----------------------|
 | [#609](https://github.com/Marvisak/VIctory/pull/609) | Retain released textures, staging, shadow buffers and descriptor resources across submissions | With the retention raised from 3 to 2000 submissions (own commit): no more freed-texture page faults (Aftermath named a destroyed 1024x1024 BC7 texture, upstream #557). |
 | [#650](https://github.com/Marvisak/VIctory/pull/650) | Bound root view accesses by the size the host binds | Together with #609: 15 minutes in the world without a GPU fault. Its new test adapted to the current `resource::track`. |
+| [#490](https://github.com/Marvisak/VIctory/pull/490) | Ask whether guarded memory is a view once per block (includes #464) | World frame time 2,656 -> 2,285 ms (-14%); upload copies 520 -> 142 ms. Hand-merged (watch.rs). |
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
 ## Own additions
@@ -40,7 +41,7 @@ clean mirror of upstream (Marvisak/VIctory).
 
 ## Tested, not included (no effect on the NVIDIA world hang)
 #542, #334, #587 (alone, in pairs, with #650), #693, #581, #483, #431
-(conflicts with #609).
+(conflicts with #609). Speed: #436 and #393 (no measurable gain).
 #550 is already in main. #595 no longer merges cleanly.
 
 ## Warm up the shader cache
@@ -53,7 +54,8 @@ target\release\victory.exe translate --write-cache   # uses game_dir from victor
 With everything above and `VICTORY_SHADER_LOOP_LIMIT=4096` (diagnostics
 build): boots into the world and reaches **player control** (the first
 tutorial hint, "L Move / R Move camera", reacts to input). 15 minutes in the
-world without a GPU fault at about 0.4-1.5 fps. Much of the scene is still
+world without a GPU fault at about 0.4-1.5 fps (about 2.3 s per frame in
+the world after #490). Much of the scene is still
 dark (untranslated shaders drop draws).
 
 Upstream main alone freezes the GPU 25-45 s into the world.
