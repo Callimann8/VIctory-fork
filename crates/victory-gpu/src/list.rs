@@ -1540,7 +1540,13 @@ mod state {
     ) {
         clear_unordered(this, cpu, values, true, items(rects, count));
     }
+    /// `VICTORY_UAV_CLEAR=0`: unordered access clears are ignored, as
+    /// before upstream 0b35b7f.
     fn clear_unordered(this: This, cpu: u64, values: *const [u32; 4], float: bool, rects: &[RECT]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_UAV_CLEAR").is_none_or(|v| v != "0")) {
+            return;
+        }
         // SAFETY: the title passes four values (null is tolerated).
         let Some(&values) = (unsafe { values.as_ref() }) else {
             return;

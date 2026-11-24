@@ -282,6 +282,10 @@ extern "system" fn check_feature_support(
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        SHADER_MODEL | OPTIONS1 | OPTIONS4 if !answers_upscaler_queries() => {
+            tracing::warn!(feature, size, "device feature query not answered (VICTORY_UPSCALER_QUERIES=0)");
+            return E_NOTIMPL;
+        }
         SHADER_MODEL => 4,
         OPTIONS1 => 24,
         OPTIONS4 => 12,
@@ -485,6 +489,15 @@ static FUNCTIONS: Table<160> = {
     f[133] = resource::create_at_address as *const (); // 0x428
     Table(f)
 };
+
+/// Whether the shader model, wave and 16-bit queries (the AMD upscaler's)
+/// are answered. They went unanswered before upstream 0b35b7f, and an
+/// answer can change the paths a title picks.
+/// `VICTORY_UPSCALER_QUERIES=0`: unanswered, as before.
+fn answers_upscaler_queries() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPSCALER_QUERIES").is_none_or(|v| v != "0"))
+}
 
 #[cfg(test)]
 mod tests {
