@@ -1319,16 +1319,28 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        let (d, s, len) = (dst as usize, src as usize, len as usize);
+        if d < s.saturating_add(len) && s < d.saturating_add(len) {
+            // Overlapping: a move, as before.
+            list.defer(move || {
+                if crate::texture::committed(s as *const u8, len)
+                    && crate::texture::committed(d as *const u8, len)
+                {
+                    crate::watch::writing(d, len);
+                    // SAFETY: both ranges are committed title memory;
+                    // `ptr::copy` moves overlapping bytes.
+                    unsafe { std::ptr::copy(s as *const u8, d as *mut u8, len) };
+                }
+            });
+        } else {
+            // As a buffer copy: no `VirtualQuery` of both ranges first
+            // (milliseconds each in the title's big pools), and only what
+            // the copy writes is checked again, not every refresh of the
+            // list (upstream #1661).
+            list.defer_copy(d as *mut u8, s as *const u8, len);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
