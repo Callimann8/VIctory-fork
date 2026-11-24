@@ -83,6 +83,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_read_loop_tests;
 mod lower;
 mod sampler;
 mod shader;
@@ -233,6 +235,13 @@ impl Default for Target {
     }
 }
 
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, for any host ([`Target::ANY`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -347,13 +356,36 @@ pub fn emit(
         mesh_stride,
         target,
         console_cf: false,
+        per_lane_only: false,
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-            let console = structure::structure_console(p)?;
-            parts.st = &console;
-            parts.console_cf = true;
-            lower::lower(&parts)?
+            let console = structure::structure_console(p);
+            let lowered = match &console {
+                Ok(console) => {
+                    parts.st = console;
+                    parts.console_cf = true;
+                    lower::lower(&parts)
+                }
+                Err(e) => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: match e {
+                        ShaderError::Unsupported { what, .. } => what,
+                        _ => "a program the console structure cannot hold",
+                    },
+                }),
+            };
+            match lowered {
+                Ok(l) => l,
+                // What the console flow cannot lower keeps the per-lane form
+                // where that translates; else the console flow's reason.
+                Err(e) => {
+                    parts.st = st;
+                    parts.console_cf = false;
+                    parts.per_lane_only = true;
+                    lower::lower(&parts).map_err(|_| e)?
+                }
+            }
         }
         l => l?,
     };
@@ -852,9 +884,10 @@ mod tests {
             total_size: 0,
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
-        let st = crate::structure::structure(&p)?;
-        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let st = crate::structure::structure(&p);
+        let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = crate::io::raise(&p, native)?;
+        let st = st?;
         super::emit(&c, native, &p, &st, &io, &res, target)
     }
 
@@ -887,7 +920,7 @@ mod tests {
             emit_for(&two, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
+                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
         // The same code in waves of 32 runs on either.
