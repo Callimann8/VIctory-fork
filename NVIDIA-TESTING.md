@@ -45,6 +45,10 @@ clean mirror of upstream (Marvisak/VIctory).
      through a real constant buffer view; a size-0 view or a null view still
      faulted (fixed vertex `8157a974717876a9`, "Shader Instruction Error").
 
+  4. A capped view heap (NVIDIA: 1,000,000) keeps 262,144 dynamic slots
+     instead of 65,536: the game's per-draw tables past the cap ran them out
+     and about 450 draws a frame were dropped. Draws per frame 1,547 -> 3,568.
+
 ## Tested, not included (no effect on the NVIDIA world hang)
 #542, #334, #587 (alone, in pairs, with #650), #693, #581, #483, #431
 (conflicts with #609). Speed: #436 and #393 (no measurable gain).
