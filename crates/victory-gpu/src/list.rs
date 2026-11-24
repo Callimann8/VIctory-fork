@@ -853,6 +853,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            // Host copies made with different mips dropped differ in shape.
+            if crate::resource::mip_mapping(dst, to).1 != crate::resource::mip_mapping(src, from).1 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?dst, ?src, "copy between textures with different mips dropped skipped"));
+                return;
+            }
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
@@ -928,6 +934,16 @@ extern "system" fn copy_texture_region(
             // before.
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let mut src = src;
+            if src.kind != FOOTPRINT
+                && let Some(texture) = crate::resource::host_resource(src.resource)
+            {
+                let Some(sub) = crate::resource::host_sub(src.resource, texture, src.footprint.offset as u32)
+                else {
+                    return; // a mip the host copy was made without
+                };
+                src.footprint.offset = u64::from(sub);
+            }
             let made = read_back(list, dst, x, y, z, src, source_box);
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -989,6 +1005,10 @@ extern "system" fn copy_texture_region(
                 crate::texture::upload(list, src.resource, texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
+            let Some(sub) = crate::resource::host_sub(src.resource, texture, src.footprint.offset as u32) else {
+                return; // a mip the host copy was made without
+            };
+            from.footprint.offset = u64::from(sub);
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
@@ -997,6 +1017,12 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
+        if dst.kind != FOOTPRINT {
+            let Some(sub) = crate::resource::host_sub(dst.resource, to, dst.footprint.offset as u32) else {
+                return; // a mip the host copy was made without
+            };
+            to_location.footprint.offset = u64::from(sub);
+        }
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
