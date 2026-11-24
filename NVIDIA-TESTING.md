@@ -10,6 +10,8 @@ clean mirror of upstream (Marvisak/VIctory).
 ## Included upstream PRs
 | PR | What | Effect measured here |
 |----|------|----------------------|
+| [#609](https://github.com/Marvisak/VIctory/pull/609) | Retain released textures, staging, shadow buffers and descriptor resources across submissions | With the retention raised from 3 to 2000 submissions (own commit): no more freed-texture page faults (Aftermath named a destroyed 1024x1024 BC7 texture, upstream #557). |
+| [#650](https://github.com/Marvisak/VIctory/pull/650) | Bound root view accesses by the size the host binds | Together with #609: 15 minutes in the world without a GPU fault. Its new test adapted to the current `resource::track`. |
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
 ## Own additions
@@ -32,12 +34,13 @@ clean mirror of upstream (Marvisak/VIctory).
      the host makes structured views raw where they start on 16 bytes
      (fixed "Misaligned Address Error" in compute `8080af82aaac33df` and
      siblings).
-  3. Empty constant buffers (size 0) and failed scratch copies get a null
-     constant buffer view instead of an invalid one (fixed vertex
-     `8157a974717876a9`, "Shader Instruction Error").
+  3. Empty constant buffers (size 0 or address 0) read 256 zero bytes
+     through a real constant buffer view; a size-0 view or a null view still
+     faulted (fixed vertex `8157a974717876a9`, "Shader Instruction Error").
 
 ## Tested, not included (no effect on the NVIDIA world hang)
-#542, #334, #587, #650 (alone, in pairs, all three), #693, #581, #483.
+#542, #334, #587 (alone, in pairs, with #650), #693, #581, #483, #431
+(conflicts with #609).
 #550 is already in main. #595 no longer merges cleanly.
 
 ## Warm up the shader cache
@@ -47,10 +50,20 @@ target\release\victory.exe translate --write-cache   # uses game_dir from victor
 ```
 
 ## Known state on RTX 4070
-Boots through all menus into the world. Upstream main freezes the GPU about
-25-45 s into the world. With the fixes above, the world runs for about
-80-100 s and shows some geometry and lighting. Remaining blockers:
-- Pixel shader `1af4a50c7fb40c97` can run long enough to time out the GPU;
-  `VICTORY_SHADER_LOOP_LIMIT=4096` (diagnostics) gets past it.
-- Then an MMU page fault (read of an unmapped address) in mesh shader
-  `c962201cddbdd7dd`, likely a freed resource.
+With everything above and `VICTORY_SHADER_LOOP_LIMIT=4096` (diagnostics
+build): boots into the world and reaches **player control** (the first
+tutorial hint, "L Move / R Move camera", reacts to input). 15 minutes in the
+world without a GPU fault at about 0.4-1.5 fps. Much of the scene is still
+dark (untranslated shaders drop draws).
+
+Upstream main alone freezes the GPU 25-45 s into the world.
+
+Remaining: pixel shader `1af4a50c7fb40c97` needs the loop limit (it runs long
+enough to time out the GPU otherwise); speed; missing draws.
+
+## Run it
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+$env:VICTORY_SHADER_LOOP_LIMIT = "4096"
+target\diagictory.exe run "<game dir>\game_scarlett_master.exe" --execute
+```
