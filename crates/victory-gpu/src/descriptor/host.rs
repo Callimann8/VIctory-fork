@@ -205,10 +205,17 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                    // The larger dynamic range here too, at the cost of
+                    // mirrored title slots: the title's per-draw tables sit
+                    // past the cap and are all made afresh, and with
+                    // MIN_DYNAMIC the dynamic slots ran out seconds into the
+                    // world (on an RTX 4070 about 450 draws a frame dropped;
+                    // with DYNAMIC none, and twice the draws drawn).
+                    let dynamic = DYNAMIC;
                     (
                         make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - MIN_DYNAMIC - aliases,
-                        MIN_DYNAMIC,
+                        PORTABLE_VIEWS - dynamic - aliases,
+                        dynamic,
                     )
                 }
                 Err(e) => {
