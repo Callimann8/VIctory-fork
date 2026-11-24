@@ -1526,12 +1526,31 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtWriteVirtualMemory(
+            process: isize,
+            at: *mut std::ffi::c_void,
+            from: *const std::ffi::c_void,
+            len: usize,
+            done: *mut usize,
+        ) -> i32;
+    }
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
+        // The native call first: WriteProcessMemory also queries the pages
+        // and flushes the instruction cache on every call (~1 ms per 64 KiB
+        // piece in the world, 0.5-0.7 s a frame). It refuses pages that are
+        // not writable, which WriteProcessMemory makes writable for the
+        // write as before.
         // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        // destination (-1: this process).
+        unsafe {
+            NtWriteVirtualMemory(-1, at as _, from.cast(), n, &mut done) >= 0
+                || WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done)
+                    != 0
+        }
     };
     if len == 0 || write(dst as usize, len) {
         return;
