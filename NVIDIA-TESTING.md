@@ -83,6 +83,23 @@ Upstream main alone freezes the GPU 25-45 s into the world.
 Remaining: pixel shader `1af4a50c7fb40c97` needs the loop limit (it runs long
 enough to time out the GPU otherwise); speed; missing draws.
 
+## Tried and not kept (local branches only)
+- **#294 (root UAVs)**, branch `draw/294`: merges with 28 conflicts; one
+  needed fix is that shader root-view bounds use #294's per-kind caps (CBV
+  64 KiB, SRV 4 MiB, UAV 2 MiB). Stable for 6 minutes, but barely more draws
+  (about 790 vs 850 dropped per frame) and slower frames (copy-back of root
+  UAV ranges on every submission roughly doubles).
+- **Indirect rectangle lists**, branch `draw/rect-indirect`: the 256 draws
+  per frame that failed with "indirect kind 0: prepare failed" are
+  rectangle-list `ExecuteIndirect` draws with one record and no count buffer
+  (190 per frame with 240 rectangles, 62 with 1). The fix expands the
+  record's vertices like a direct draw and patches the record's vertex count
+  and first vertex with `WriteBufferImmediate` around the execution.
+  Stable in two 6-minute runs, those drops are gone, and about 650-950 more
+  draws per frame run, but frames got slower in both runs (5.8 and 6.8 s
+  vs 4.0 s for this branch on the same day, mostly unexplained "other"
+  time, GPU time unchanged). Not merged until the slowdown is understood.
+
 ## Run it
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
