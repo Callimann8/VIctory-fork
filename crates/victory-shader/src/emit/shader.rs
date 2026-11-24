@@ -233,7 +233,9 @@ impl Shader {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        // One dword more than the program allocates: the sink that
+        // out-of-bounds accesses are clamped to (see `lower`'s LDS access).
+        let arr = self.m.array(self.lds_dwords + 1, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g

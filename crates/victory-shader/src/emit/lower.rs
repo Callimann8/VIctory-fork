@@ -2761,14 +2761,19 @@ impl<'a> Lower<'a> {
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
+        // shortcut: LDS addresses are taken as dword-aligned. An index past
+        // what the program allocates goes to one sink dword after it: the
+        // console reads 0 there and drops writes, and some hosts (NVIDIA)
+        // fault on an out-of-range shared memory address.
         let dword = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let sink = l.s.m.i32(l.s.lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, sink);
+            let index = l.s.m.select(c, inside, index, sink);
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };
