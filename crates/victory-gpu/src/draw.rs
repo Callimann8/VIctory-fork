@@ -683,7 +683,10 @@ impl State {
         }
         let mut made = Vec::new();
         for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            let root = self.roots_ref(compute).get(usize::from(slot));
+            let Some(&Root::Table(table)) = root else {
+                let kind = root.map(|r| format!("{r:?}")).unwrap_or_default();
+                once!(slot, kind, "fresh table skipped: root is not a table");
                 continue;
             };
             let entries: Vec<&UsedResource> = used
@@ -692,9 +695,11 @@ impl State {
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
+                once!(slot, table = format_args!("{table:#x}"), "fresh table skipped: no heap");
                 continue;
             };
             let Some(host) = heap.host() else {
+                once!(slot, "fresh table skipped: no host heap");
                 continue;
             };
             let n = entries
@@ -743,7 +748,16 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         if size == 0 || address == 0 {
-                            host.null_constant(index);
+                            // An empty constant buffer: 256 zero bytes, a
+                            // real view (a null one still faults on NVIDIA).
+                            match list.scratch(256) {
+                                Some((gpu, to)) => {
+                                    // SAFETY: 256 bytes of mapped scratch the list owns.
+                                    unsafe { std::ptr::write_bytes(to, 0, 256) };
+                                    host.constant_at(index, gpu, 256);
+                                }
+                                None => host.null_constant(index),
+                            }
                             continue;
                         }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
