@@ -2850,7 +2850,14 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        // A descriptor loaded at a data-computed address (a heap index the
+        // program read from memory) is whatever view the title wrote there,
+        // not a constant buffer view the host made for a table: read it as
+        // raw bytes. A constant buffer read of a non-constant-buffer
+        // descriptor is a shader instruction error on NVIDIA (world hang).
+        let computed = matches!(src, Source::Loaded { load, .. }
+            if self.scalar.get(load).is_some_and(|a| a.dynamic.is_some()));
+        if computed || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
