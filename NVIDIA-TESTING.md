@@ -13,6 +13,9 @@ clean mirror of upstream (Marvisak/VIctory).
 | [#609](https://github.com/Marvisak/VIctory/pull/609) | Retain released textures, staging, shadow buffers and descriptor resources across submissions | With the retention raised from 3 to 2000 submissions (own commit): no more freed-texture page faults (Aftermath named a destroyed 1024x1024 BC7 texture, upstream #557). |
 | [#650](https://github.com/Marvisak/VIctory/pull/650) | Bound root view accesses by the size the host binds | Together with #609: 15 minutes in the world without a GPU fault. Its new test adapted to the current `resource::track`. |
 | [#490](https://github.com/Marvisak/VIctory/pull/490) | Ask whether guarded memory is a view once per block (includes #464) | World frame time 2,656 -> 2,285 ms (-14%); upload copies 520 -> 142 ms. Hand-merged (watch.rs). |
+| [#489](https://github.com/Marvisak/VIctory/pull/489) (+ #302) | Read root arguments the console spills to memory | Together with #953 and #539: dropped draws 1,698 -> 1,627 per frame, untranslatable shaders 446 -> 418; stable. |
+| [#953](https://github.com/Marvisak/VIctory/pull/953) | s_buffer_load SMEM uses in descriptor_data | (see #489) |
+| [#539](https://github.com/Marvisak/VIctory/pull/539) | 64-bit image atomics | (see #489) |
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
 ## Own additions
