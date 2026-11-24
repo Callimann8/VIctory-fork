@@ -12,9 +12,18 @@ upstream (Marvisak/VIctory).
 |----|------|----------------------|
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
+## Own additions
+- **Nsight Aftermath GPU crash dumps** (diagnostics builds only):
+  `VICTORY_AFTERMATH=<path to GFSDK_Aftermath_Lib.x64.dll>` loads NVIDIA's
+  library at run time (nothing linked or shipped), and
+  `VICTORY_AFTERMATH_DIR=<dir>` sets where the `.nv-gpudmp`, its decoded
+  `.json`, shader debug info, and each shader's console container and DXIL
+  (`shaders/<hash>.*`) go. The log line `aftermath shader hash` maps the
+  dump's "Shader hash" to VIctory's shader hash.
+
 ## Tested, not included (no effect on the NVIDIA world hang)
-#542, #334, #587, #650 (alone, in pairs, all three), #693. #595 no longer
-merges cleanly.
+#542, #334, #587, #650 (alone, in pairs, all three), #693, #581, #483.
+#550 is already in main. #595 no longer merges cleanly.
 
 ## Warm up the shader cache
 ```powershell
@@ -25,3 +34,11 @@ target\release\victory.exe translate --write-cache   # uses game_dir from victor
 ## Known state on RTX 4070
 Boots through all menus into the world (title card), then the GPU freezes
 about 25-45 s in (see upstream #71, #97).
+
+Aftermath (5 dumps): every freeze is a "Shader Instruction Error" in compute
+shader `0e45e59e93b736e4` at DXIL instruction 46, a `GetDimensions` on the
+`RWByteAddressBuffer` the shader takes from the descriptor heap at its table
+offset 1152. Skipping that shader moves the same fault to
+`b2b782b5d732607d`, which has the same opening code (there a
+`StructuredBuffer<stride=48>` at table offset 32). The other 46 warps of the
+dispatch are stuck behind it.
