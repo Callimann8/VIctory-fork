@@ -936,6 +936,8 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
 /// MUBUF `buffer_load_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
 const fn buffer_load_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [
