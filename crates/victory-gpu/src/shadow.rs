@@ -65,14 +65,20 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Most bytes of snapshot memory the pool keeps.
+const POOL_BYTES: usize = 2 << 30;
+
+/// Returns a snapshot buffer to the pool, which keeps the largest up to
+/// [POOL_BYTES] in all (a submission snapshots a dozen or more copies).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut kept = 0;
+    pool.retain(|v| {
+        kept += v.capacity();
+        kept <= POOL_BYTES
+    });
 }
 
 const NOT_WATCHED: u8 = 2;
