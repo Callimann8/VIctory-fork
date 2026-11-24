@@ -17,6 +17,7 @@ clean mirror of upstream (Marvisak/VIctory).
 | [#953](https://github.com/Marvisak/VIctory/pull/953) | s_buffer_load SMEM uses in descriptor_data | (see #489) |
 | [#539](https://github.com/Marvisak/VIctory/pull/539) | 64-bit image atomics | (see #489) |
 | [#233](https://github.com/Marvisak/VIctory/pull/233) | Wave64 compute on 32-lane hosts (in halves and in the console flow) | No compute pipeline refused any more on the RTX 4070; much more of the night skyline lights up (some post effects still smear). About 2.8 s per frame (more shader writes to copy back). Merged with #254: the wave size is part of the cache key. |
+| [#453](https://github.com/Marvisak/VIctory/pull/453) | Pixel barycentrics through SV_Barycentrics | 35 fewer untranslatable shaders (582 -> 547); stable. |
 | [#254](https://github.com/Marvisak/VIctory/pull/254) | Stable shader cache key (survives rebuilds), in-flight dedup, `victory translate --write-cache` warm-up | Warm-up 85 s, 21,898 of 26,148 shaders cached (606 MB). Next run: 1,553 cache hits, 0 misses; world loading starts at 36 s instead of 47 s. Merge conflicts in `shader_cache.rs` and `pipeline/src/cache.rs` resolved in favour of the PR. |
 
 ## Own additions
