@@ -451,15 +451,103 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Where a host-written texture's title memory stood at the host's write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostWrite {
+    /// Write-watched memory: the write-watch asking at the host's write.
+    Watched { start: usize, end: usize, asked: u64 },
+    /// Memory without a write-watch (physical-page views): its hash at the
+    /// host's write, and the frame it was last hashed.
+    Hashed {
+        memory: usize,
+        size: usize,
+        hash: Option<blake3::Hash>,
+        at: u64,
+    },
+    /// Layout unknown, or a texture the host renders to: keeps the host's
+    /// contents until it is released.
+    Fixed,
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// the host until the title writes their memory again (streamed mips, for
+/// example; upstream #1210, issue #758).
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, HostWrite>>> = Mutex::new(None);
+
+/// A hash of title memory, read through the kernel (not in place: see
+/// `with_title`); None if nothing of it is mapped.
+fn title_hash(memory: *const u8, size: usize) -> Option<blake3::Hash> {
+    committed(memory, size).then(|| with_title(memory, size, blake3::hash))
+}
+
+fn host_write_state(memory: *const u8, size: usize) -> HostWrite {
+    let start = memory as usize;
+    if let Some((now, _)) = crate::watch::writes(start, start + size, false) {
+        return HostWrite::Watched { start, end: start + size, asked: now };
+    }
+    HostWrite::Hashed { memory: start, size, hash: title_hash(memory, size), at: crate::frame::current() }
+}
+
+/// Whether `resource`'s host copy is still newer than its title memory.
+/// Memory without a write-watch is hashed again at most every 30 frames
+/// (as partly mapped textures are read), so a mip the title writes there
+/// shows up to 30 frames late.
+fn still_host_written(resource: usize) -> bool {
+    let state = HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&resource).copied());
+    let Some(state) = state else {
+        return false;
+    };
+    let unchanged = match state {
+        HostWrite::Fixed => true,
+        HostWrite::Watched { start, end, asked } => crate::watch::writes(start, end, false)
+            .is_none_or(|(_, written)| written.iter().all(|&(_, w)| w <= asked)),
+        HostWrite::Hashed { memory, size, hash, at } => {
+            let frame = crate::frame::current();
+            if frame < at + 30 {
+                true
+            } else {
+                let now = title_hash(memory as *const u8, size);
+                let unchanged = now.is_none() || now == hash;
+                if unchanged {
+                    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = map.as_mut().and_then(|map| map.get_mut(&resource))
+                        && *entry == state
+                    {
+                        *entry = HostWrite::Hashed { memory, size, hash, at: frame };
+                    }
+                }
+                unchanged
+            }
+        }
+    };
+    if !unchanged {
+        let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut()
+            && map.get(&resource) == Some(&state)
+        {
+            map.remove(&resource);
+        }
+    }
+    unchanged
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let title = crate::resource::host_resource(resource).is_none_or(title_written);
+    let state = title
+        .then(|| {
+            let (memory, desc) = crate::resource::texture_memory(resource)?;
+            let layout = crate::resource::texture_layout(&desc)?.planes[0].layout.clone();
+            (!layout.desc.swizzle.xor()).then(|| host_write_state(memory, layout.size as usize))
+        })
+        .flatten()
+        .unwrap_or(HostWrite::Fixed);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new).insert(resource as usize, state);
 }
 
 /// Whether the host GPU wrote `resource` by a copy or resolve
@@ -470,7 +558,7 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+        .is_some_and(|map| map.contains_key(&resource))
 }
 
 /// The title released a resource.
@@ -502,14 +590,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if !list.first_use(resource as usize) || still_host_written(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -1169,5 +1250,48 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod host_written_tests {
+    use super::*;
+
+    #[test]
+    fn host_written_clears_after_write_watched_memory_is_written() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = crate::watch::PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let ptr = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as *mut u8;
+        assert!(!ptr.is_null());
+        let key = ptr as usize;
+        let state = host_write_state(ptr, len);
+        assert!(matches!(state, HostWrite::Watched { .. }));
+        HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, state);
+        assert!(still_host_written(key), "untouched memory stays host-written");
+        // SAFETY: a committed page of ours.
+        unsafe { ptr.write(0x42) };
+        assert!(!still_host_written(key), "writing title memory clears host-written state");
+        assert!(!host_wrote(key));
+        forget(key);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn host_written_memory_without_a_watch_is_hashed() {
+        let buf = vec![0x11u8; 256];
+        let key = buf.as_ptr() as usize;
+        let state = host_write_state(buf.as_ptr(), buf.len());
+        assert!(matches!(state, HostWrite::Hashed { hash: Some(_), .. }));
+        HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, state);
+        assert!(still_host_written(key), "unchanged bytes stay host-written");
+        forget(key);
+        assert!(!still_host_written(key));
     }
 }
