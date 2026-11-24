@@ -299,7 +299,7 @@ mod tests {
         {
             let q = RETIREMENT_QUEUE.lock().unwrap();
             assert!(!q.is_empty());
-            let (retire_at, _) = q.last().unwrap();
+            let (retire_at, _) = q.back().unwrap();
             assert_eq!(*retire_at, sub + RETAIN_SUBMISSIONS);
         }
         let list = host.new_list().unwrap();
@@ -454,7 +454,14 @@ struct Deferred {
 /// value at release time has completed on the GPU), ensuring that command lists
 /// in multi-list submissions or subsequent frame lists never page fault on
 /// freed GPU memory.
-static RETIREMENT_QUEUE: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+/// In retirement order: entries are pushed with non-decreasing points.
+static RETIREMENT_QUEUE: Mutex<std::collections::VecDeque<(u64, ID3D12Resource)>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The submission counter for readers outside the submission, which holds
+/// [Host::submitted] from preparation to copy-back (hundreds of ms in the
+/// world): title threads releasing resources must not wait for that.
+static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Submissions to retain released resources past their release point. GTA VI
 /// streams textures out while later submissions still read them (upstream
@@ -468,14 +475,12 @@ pub(crate) fn release_late(resource: ID3D12Resource) {
     RETIREMENT_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((retire_at, resource));
+        .push_back((retire_at, resource));
 }
 
 /// The latest submission counter so far.
 pub(crate) fn current_submission() -> u64 {
-    host()
-        .and_then(|h| h.submitted.lock().ok().map(|s| *s))
-        .unwrap_or(0)
+    SUBMITTED.load(Ordering::Relaxed)
 }
 
 impl Host {
@@ -632,6 +637,7 @@ impl Host {
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            SUBMITTED.store(*submitted, Ordering::Relaxed);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -732,11 +738,10 @@ impl Host {
         let completed = *submitted;
         let to_drop: Vec<ID3D12Resource> = {
             let mut q = RETIREMENT_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            let (ready, pending): (Vec<_>, Vec<_>) = q
-                .drain(..)
-                .partition(|(retire_at, _)| *retire_at <= completed);
-            *q = pending;
-            ready.into_iter().map(|(_, r)| r).collect()
+            // From the front only: threads releasing at once may push a point
+            // one lower after a higher one, which then waits a little longer.
+            let ready = q.iter().take_while(|(retire_at, _)| *retire_at <= completed).count();
+            q.drain(..ready).map(|(_, r)| r).collect()
         };
         drop(to_drop);
     }
@@ -1720,6 +1725,13 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                let f5 = self.copy_stats_frames.max(1) as f64;
+                let (n, ms) = crate::list::take_recording();
+                tracing::info!(
+                    "recording: {:.0} commands/frame, {:.1} ms/frame",
+                    n as f64 / f5,
+                    ms / f5
+                );
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

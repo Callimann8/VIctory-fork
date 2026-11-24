@@ -130,7 +130,29 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    {
+        RECORDING[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RECORDING[1].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Diagnostics: list commands recorded through [`with_state`] and the
+/// nanoseconds they took.
+#[cfg(feature = "diagnostics")]
+static RECORDING: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Diagnostics: (commands, ms) recorded since the last call.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_recording() -> (u64, f64) {
+    (
+        RECORDING[0].swap(0, std::sync::atomic::Ordering::Relaxed),
+        RECORDING[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+    )
 }
 
 /// The host list behind a title list, if there is a host GPU.
