@@ -1,7 +1,7 @@
 # nvidia-testing branch
 
 Test branch on this fork: upstream `main` plus open upstream PRs that help on
-an NVIDIA RTX 4070 Laptop. `main` on this fork stays a clean mirror of
+an NVIDIA RTX 4070 (desktop card). `main` on this fork stays a clean mirror of
 upstream (Marvisak/VIctory).
 
 ## Base
