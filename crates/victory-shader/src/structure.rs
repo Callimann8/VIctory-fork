@@ -11,6 +11,14 @@
 //! lane that reaches it; what it cannot prove stays as the instruction's
 //! guard, a per-lane `if` around it.
 //!
+//! A pixel's discard (`s_andn2 live, live, exec`, then "no lane is left":
+//! the exit) is the exception: on the console a discarded lane whose quad
+//! has a live lane stays in EXEC (`s_wqm` of the live mask), a helper of
+//! the quad's derivatives, and no lane takes the exit while its wave has a
+//! live lane. Here it runs on as a live lane and is discarded at that point
+//! ([`Structured::discards`]): the host's `discard` keeps it as a helper
+//! (derivatives read it) and drops its outputs and stores.
+//!
 //! The control-flow graph keeps its shape and must be reducible (DXIL's
 //! only requirement). Helper lanes of a pixel shader count as live: on PC
 //! their side effects are dropped too, and what they compute is only read
