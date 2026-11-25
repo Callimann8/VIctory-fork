@@ -2652,6 +2652,33 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// With [`copy_queue_fetch`]: a copy queue of the fetch's own, with its
+    /// allocator and list.
+    copy: Option<(ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+}
+
+/// Whether the relay's fetch of what shaders wrote to copies in the card's
+/// memory runs on a copy queue of its own (`VICTORY_COPY_QUEUE_FETCH=1`;
+/// off by default, and only with [`relay`]).
+///
+/// The fetch went to the host's one queue, behind every flight the
+/// submitting thread sent meanwhile, and the thread that lands flights
+/// waited for all of them: 182 ms a frame in the profile of 210554e
+/// (RTX 4070), while the submitting thread waited ~138 ms a frame on that
+/// thread. The flights being landed have already run (their fence was
+/// reached), so their bytes are on the card: a copy queue takes them at
+/// once, beside the flights that follow, on the card's copy engine.
+///
+/// What the fetch may then also see: bytes of later flights' shaders (as
+/// the console's CPU would, which shares the GPU's memory), and title
+/// bytes of later sends, or not. So the merge's "fetched after" is the
+/// landed plans' highest send (`CardPlan::sent_as`), not the queue's count:
+/// stretches sent up after it are left out of the merge
+/// (`Shadow::card_merge_relay`), as with [`inflight_fetch`], and the
+/// notes of sends are kept from there on (`fallback_fetched_mark`).
+fn copy_queue_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && !inflight_fetch() && std::env::var_os("VICTORY_COPY_QUEUE_FETCH").is_some_and(|v| v == "1"))
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3710,12 +3737,38 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            let copy = if copy_queue_fetch() {
+                let made = (|| -> windows::core::Result<_> {
+                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })?;
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((queue, allocator, list))
+                })();
+                match made {
+                    Ok(copy) => {
+                        tracing::info!("what shaders wrote to copies in the card's memory is fetched on a copy queue (VICTORY_COPY_QUEUE_FETCH=1)");
+                        Some(copy)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no copy queue for the relay's fetch: it goes to the host's queue");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             Some(RelayFetch {
                 list,
                 fence,
                 event,
                 sent: 0,
                 buffer: None,
+                copy,
             })
         }
     }
@@ -3792,6 +3845,14 @@ impl Host {
                 }
                 return;
             }
+            if copy_queue_fetch() {
+                // Later fetches merge with their own plans' sends, which
+                // may be below the queue's count now.
+                if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
+                    crate::shadow::relay_fetched(last);
+                }
+                return;
+            }
             // Nothing to fetch: every send so far is older than the next fetch.
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
             return;
@@ -3814,11 +3875,34 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let landed = plans.iter().map(|p| p.sent_as).max();
+        let on_copy = f.copy.clone().filter(|_| landed.is_some());
         let waiting = std::time::Instant::now();
+        let ran = if let Some((queue, allocator, list)) = on_copy {
+            // SAFETY: as below, on the fetch's own copy queue. The landed
+            // flights have run; what later ones write meanwhile may be seen
+            // (see `copy_queue_fetch`).
+            unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in &pieces {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(landed.unwrap_or(0))
+                })()
+            }
+        } else {
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
-        let ran = unsafe {
+        unsafe {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
@@ -3839,6 +3923,7 @@ impl Host {
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
+        }
         };
         let after = match ran {
             Ok(after) => after,
@@ -3878,8 +3963,7 @@ impl Host {
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
         // (`fallback_fetched_mark`).
-        let landed = plans.iter().map(|p| p.sent_as).max();
-        crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch(), after, landed));
+        crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch() || copy_queue_fetch(), after, landed));
     }
 
     /// [`Host::relay_card_back`] with [`inflight_fetch`]: the pieces these
