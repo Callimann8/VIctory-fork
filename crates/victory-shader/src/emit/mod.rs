@@ -596,7 +596,16 @@ fn widen(
             return Err(ShaderError::Unsupported { offset: 0, what });
         }
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        // Which descriptor a lane holds does not depend on how the host runs the branches:
+        // where the wave-wide paths lose a fact the tracking needs (which edge into a join
+        // lanes can have taken), the lanes' own paths give it.
+        let res = match resource::track(p, &native.layout, native.stage, Some(&st)) {
+            Ok(res) => res,
+            Err(e) => match structure::structure(p) {
+                Ok(own) => resource::track(p, &native.layout, native.stage, Some(&own)).map_err(|_| e)?,
+                Err(_) => return Err(e),
+            },
+        };
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
