@@ -1775,7 +1775,13 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+        self.constant_in(index, gpu, size, None);
+    }
+
+    /// [`HostHeap::constant_at`] of a host copy's buffer (`resource`), kept
+    /// alive by the slot as [`make`] keeps the ones it views.
+    pub(crate) fn constant_in(&self, index: u32, gpu: u64, size: u32, resource: Option<ID3D12Resource>) {
+        self.keep(index, resource);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
