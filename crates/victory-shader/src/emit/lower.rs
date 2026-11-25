@@ -558,9 +558,17 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<GroupJoin
             .filter(|&j| !seen[j])
             .collect();
         for j in joins {
+            // (a loop back to the branch: what a finished wave carries round it with no lane
+            // matters only where the loop is left)
+            if looped && j == d {
+                continue;
+            }
             for phi in &p.blocks[j].phis {
+                // a lane mask (a saved EXEC, a loop's lanes left): each lane's bit, as the
+                // lanes' paths give it
+                let mask = |v: &Value| st.masks.contains_key(v) || st.highs.contains_key(v) || st.phi_masks.contains_key(v);
                 let lane_mask = match phi.reg {
-                    Reg::S(c) => c == EXEC || c == EXEC + 1 || st.phi_masks.contains_key(&phi.value),
+                    Reg::S(c) => c == EXEC || c == EXEC + 1 || mask(&phi.value) || phi.args.iter().all(mask),
                     Reg::Scc => st.phi_masks.contains_key(&phi.value),
                     _ => true,
                 };
