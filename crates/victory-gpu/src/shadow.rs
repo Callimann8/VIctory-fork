@@ -2791,6 +2791,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_REFUSED[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -2803,6 +2804,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_REFUSED[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2838,6 +2840,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        MERGE_REFUSED[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2849,6 +2852,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_REFUSED[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3996,4 +4000,14 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Since the last frame line: why [`Shadow::merge_under_writes`] asked for
+/// a settle: memory not write-watched, no answer about its writes, more
+/// changed runs than the submission may send up, no snapshot.
+static MERGE_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_REFUSED`], taken, per frame.
+pub(crate) fn merge_refusals(frames: f64) -> [f64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_REFUSED[i].swap(0, Ordering::Relaxed) as f64 / frames)
 }

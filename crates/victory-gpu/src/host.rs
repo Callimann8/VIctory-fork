@@ -1791,8 +1791,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory; the last
+    /// field says what for (`FILL_ROOT`, `FILL_TABLE`, `FILL_TEXTURE`).
+    Fill(usize, usize, usize, u8),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -2311,6 +2312,17 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// What a fill of upload memory is for ([`Step::Fill`]): a root constant
+/// view not aligned for the host, a constant view in a draw's table, a
+/// texture copy's buffer source.
+pub(crate) const FILL_ROOT: u8 = 0;
+pub(crate) const FILL_TABLE: u8 = 1;
+pub(crate) const FILL_TEXTURE: u8 = 2;
+
+/// Since the last frame-rate line: the settles for title memory read by a
+/// fill of upload memory, by the fill's kind (the `FILL_` places).
+static FILLS_READ: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
@@ -2382,10 +2394,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(_, src, len, what) => {
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            FILLS_READ[usize::from(what).min(2)].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
                     }
@@ -2434,10 +2447,26 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        let mut runs_left = merge_runs();
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+}
+
+/// With [`late_exact`]: the most changed runs one submission sends up to
+/// copies in the card's memory in place of a settle
+/// (`VICTORY_MERGE_RUNS`; 512 by default). Each run is a copy of its own
+/// on the card, a few microseconds; past the limit the flights are
+/// settled, which waits for the card's whole frame (0.4 times a frame and
+/// 48 ms of waiting in the cell, profile of 43d375b).
+fn merge_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512)
+    })
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -2826,6 +2855,27 @@ fn late_line(frames: f64) {
         s[13],
         s[14],
     );
+    {
+        let f: Vec<f64> = FILLS_READ.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let c: Vec<f64> = crate::draw::CBV_TABLE.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let m = crate::shadow::merge_refusals(frames);
+        tracing::info!(
+            "settles for title memory read by a fill, per frame, by fill: a root constant view {:.1}, a table constant view {:.1}, \
+             a texture copy's source {:.1}; table constant views per frame on the host copy (VICTORY_CBV_DIRECT=1) {:.0}, copied {:.0}; \
+             title memory changed under shader writes not merged, per frame: not write-watched {:.1}, no answer {:.1}, \
+             more changed runs than {} {:.1}, no snapshot {:.1}",
+            f[0],
+            f[1],
+            f[2],
+            c[0],
+            c[1],
+            m[0],
+            m[1],
+            merge_runs(),
+            m[2],
+            m[3],
+        );
+    }
     {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
@@ -5648,11 +5698,12 @@ impl HostList {
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
-    pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+    /// memory at `dst` when the list is submitted; `what` is one of the
+    /// `FILL_` kinds.
+    pub(crate) fn defer_fill_from(&self, dst: *mut u8, src: *const u8, len: usize, what: u8) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, what));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -5868,7 +5919,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);

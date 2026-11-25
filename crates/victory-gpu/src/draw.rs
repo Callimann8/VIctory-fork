@@ -118,6 +118,27 @@ pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), Ato
 /// GB a frame in 31 submissions, 0.49 s of snapshots and 0.28 s of
 /// comparing (run 28). On by default; `VICTORY_WRITE_SKIP=0` declares
 /// every such range, as before.
+/// Whether constant buffer views in the tables a draw's slots are made
+/// for (`dynamic` slots) view the buffer's host copy itself, brought up to
+/// date by the submission like other views of it (`VICTORY_CBV_DIRECT=1`;
+/// off by default). Without it each is copied from title memory into the
+/// list's upload memory when the list is submitted, on the CPU: a constant
+/// buffer the shaders of a flight still in the air write (the title's
+/// GPU-made constants) then holds the next submission's preparing until
+/// that flight has landed, 1.0 times a frame and 60-70 ms each in the cell
+/// (profile of 43d375b: "title memory read ... a fill of upload memory").
+/// On the host copy the card reads it after the flight's writes, in queue
+/// order, as the slots of the title's own heaps (`make`) and root views
+/// already do. Views not 256-byte aligned in their copy are still copied.
+fn cbv_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_DIRECT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: table constant views made on the host copy
+/// ([`cbv_direct`]) and copied to upload memory.
+pub(crate) static CBV_TABLE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 fn write_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
@@ -481,7 +502,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_fill_from(to, address as *const u8, len as usize, crate::host::FILL_ROOT);
     Some(gpu)
 }
 
@@ -2617,11 +2638,25 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // `VICTORY_CBV_DIRECT=1`: on the host copy itself,
+                        // brought up to date like any view of it, where it
+                        // is aligned as the host needs (see `cbv_direct`).
+                        if cbv_direct()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(size).next_multiple_of(256)
+                        {
+                            CBV_TABLE[0].fetch_add(1, Ordering::Relaxed);
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_in(index, shadow.gpu(address), size, Some(shadow.buffer.clone()));
+                            continue;
+                        }
+                        CBV_TABLE[1].fetch_add(1, Ordering::Relaxed);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        list.defer_fill_from(to, address as *const u8, size as usize, crate::host::FILL_TABLE);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
