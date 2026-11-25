@@ -57,6 +57,23 @@ use crate::shadow::Shadow;
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
+
+/// The copies that can be numbered: [`COPIES`], or `VICTORY_MEMORY_COPIES`
+/// (at most 65535). The structure builder ran out of the 1023 within a
+/// second of its first frame (16,424 pages refused in 80 s, its reads of
+/// them zeros, the title then crashing on the empty boxes it built).
+/// shortcut: every dispatch brings all numbered copies up to date and may
+/// declare all of them written, so more copies cost more per frame.
+fn copies() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_COPIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map_or(COPIES, |n| n.min(65535))
+    })
+}
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -174,7 +191,7 @@ impl Memory {
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            None if self.copies.len() < copies() as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -200,7 +217,7 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!(copies = copies(), "title memory by address: no number left for another copy; its pages read zeros")
                 });
                 return Some(Unmapped::Full);
             }
@@ -322,7 +339,7 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let base = heap.dynamic(copies() + 1)?;
             heap.null_raw_uav_at(base);
             (base, 0)
         }
