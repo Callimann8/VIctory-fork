@@ -203,6 +203,38 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // `VICTORY_WIDE_HEAP_SYNC=1`: the pages on several threads.
+        if wide_heap_sync() {
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            for (range_from, range_end) in written.take(start as usize, end as usize) {
+                let mut page = range_from & !(crate::watch::PAGE - 1);
+                while page < range_end {
+                    let from = page.max(range_from);
+                    let to = (page + crate::watch::PAGE).min(range_end);
+                    jobs.push(Box::new(move || {
+                        // SAFETY: the heap is live while `SHADER_HEAPS` is
+                        // read-locked, which this pass holds until every
+                        // job is done (`wide_run` returns after them).
+                        let heap = unsafe { &*(at as *const Heap) };
+                        let Some(Some(host)) = heap.host.get() else {
+                            return;
+                        };
+                        let mut bytes = vec![0u8; to - from];
+                        if !crate::host::read_into(from as *const u8, &mut bytes) {
+                            return;
+                        }
+                        let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &bytes);
+                        WIDE_SYNCED[0].fetch_add(1, Relaxed);
+                        WIDE_SYNCED[1].fetch_add(seen, Relaxed);
+                        WIDE_SYNCED[2].fetch_add(made, Relaxed);
+                    }));
+                    page += crate::watch::PAGE;
+                }
+            }
+            crate::shadow::wide_run(jobs);
+            continue;
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -249,6 +281,9 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
+    pages += WIDE_SYNCED[0].swap(0, Relaxed);
+    looked += WIDE_SYNCED[1].swap(0, Relaxed);
+    mirrored += WIDE_SYNCED[2].swap(0, Relaxed);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
@@ -288,6 +323,24 @@ fn page_at_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_PAGE").is_none_or(|v| v != "0"))
 }
+
+/// Whether [`sync_heaps`] looks at the changed pages on several threads, a
+/// page to a job (`VICTORY_WIDE_HEAP_SYNC=1`; off by default). The pass
+/// runs on the submitting thread before every submission is prepared, 18-23
+/// ms a frame in the busy area of the GTA 6 build (~280 pages, ~19,000
+/// records mirrored): the "waiting for the submission lock" of the
+/// submitting thread's line holds it. A page's records are its own slots;
+/// the host heap's notes are behind their lock and `mirror` is called from
+/// the recording threads at any time already.
+#[cfg(windows)]
+fn wide_heap_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_HEAP_SYNC").is_some_and(|v| v == "1"))
+}
+
+/// [`sync_heaps`]' counts from the jobs of [`wide_heap_sync`].
+#[cfg(windows)]
+static WIDE_SYNCED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
