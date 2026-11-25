@@ -100,6 +100,18 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// The last frame in which shaders touched pages that had no copy.
+static LAST_FAULT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `frames` frames have gone by since shaders last touched a page
+/// that had no copy (and since `since`). The structure builder's first
+/// frames read zeros where the pages it reaches through pointers have no
+/// copy yet; what it builds from them must not reach the title.
+pub(crate) fn settled(since: u64, frames: u64) -> bool {
+    let last = LAST_FAULT.load(std::sync::atomic::Ordering::Relaxed).max(since);
+    crate::frame::current() >= last + frames
+}
+
 /// Why a page of title memory gets no copy ([`Memory::map`]); a shader's
 /// access to it reads 0 or is dropped, every time.
 #[derive(Clone, Copy)]
@@ -250,6 +262,7 @@ impl Memory {
         if pages.is_empty() {
             return;
         }
+        LAST_FAULT.store(self.frame, std::sync::atomic::Ordering::Relaxed);
         // Each is an access that read 0 or was dropped. Why a page still has
         // no copy after this: per reason, how many and the first one.
         let mut why = [(0u32, 0u64); Unmapped::COUNT];

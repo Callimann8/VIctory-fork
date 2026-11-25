@@ -259,8 +259,43 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    is_builder(this) && quarantine()
+    is_builder(this) && holding()
 }
+
+/// Whether the builder's stores are held back now: with
+/// `VICTORY_BVH_QUARANTINE=1` always, otherwise until the builder has run
+/// `VICTORY_BVH_SETTLE_FRAMES` frames (default 30) with no shader touching
+/// a page of title memory that had no copy. Run B (2026-11-25): the
+/// builder's first frames read zeros on pages that had no copy yet, and the
+/// title crashed on the empty boxes within 7 s.
+/// shortcut: what the builder makes while held back stays in the host's
+/// copies, which other shaders on the card read too.
+#[cfg(windows)]
+pub(crate) fn holding() -> bool {
+    static SETTLE: OnceLock<u64> = OnceLock::new();
+    if quarantine() {
+        return true;
+    }
+    let started = STARTED.load(std::sync::atomic::Ordering::Relaxed);
+    if started == 0 {
+        return false;
+    }
+    let frames = *SETTLE.get_or_init(|| {
+        std::env::var("VICTORY_BVH_SETTLE_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(30)
+    });
+    if !crate::memory::settled(started, frames) {
+        return true;
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(frames, started, "the ray-tracing structure builder's stores now reach title memory: no page faults for that many frames");
+    });
+    false
+}
+
+/// The frame the builder first ran in (0: not yet).
+#[cfg(windows)]
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether `VICTORY_BVH_QUARANTINE=1` is set. While it is, no shader that
 /// reaches title memory by address declares the numbered copies written:
@@ -321,6 +356,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    STARTED.store(crate::frame::current().max(1), std::sync::atomic::Ordering::Relaxed);
     true
 }
 
