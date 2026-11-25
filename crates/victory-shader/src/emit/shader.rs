@@ -54,6 +54,14 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 /// or atomic through the directory).
 pub const MEMORY_FAULTS: u32 = 4096;
 
+/// `VICTORY_MEMORY_READ_MARKS=1`: loads through the directory mark their
+/// page as well, in a dword per page after the store marks (the host lets
+/// go only of windows nothing read lately).
+pub fn memory_read_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_READ_MARKS").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_MEMORY_MARKS=0`: stores through the directory mark no pages
 /// (the host then copies back every page a storing shader can reach).
 pub fn memory_marks() -> bool {

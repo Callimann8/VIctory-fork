@@ -487,7 +487,7 @@ impl Memory {
             // are marked): copied back from now on.
             let mut new = 0u64;
             let mapped: Vec<(u64, usize)> = self.pages.iter().map(|(&p, &n)| (p, n)).collect();
-            for (page, owner) in mapped {
+            for &(page, owner) in &mapped {
                 // SAFETY: inside the faults' mapping (`fault_dwords`).
                 let at = unsafe { self.faults.1.add((MEMORY_FAULTS as u64 + page) as usize) };
                 // SAFETY: as above; the GPU may be writing a 1 meanwhile.
@@ -498,6 +498,18 @@ impl Memory {
                     if self.written.insert(page) {
                         self.recalculate.insert(owner);
                         new += 1;
+                    }
+                }
+            }
+            if victory_shader::emit::memory_read_marks() {
+                for &(page, owner) in &mapped {
+                    // SAFETY: inside the faults' mapping (`fault_dwords`).
+                    let at = unsafe { self.faults.1.add((MEMORY_FAULTS as u64 + u64::from(MEMORY_PAGES) + page) as usize) };
+                    // SAFETY: as above.
+                    if unsafe { at.read_volatile() } != 0 {
+                        // SAFETY: as above.
+                        unsafe { at.write_volatile(0) };
+                        self.touched[owner] = self.frame;
                     }
                 }
             }
@@ -555,7 +567,14 @@ fn next_cell() -> bool {
 
 /// The faults buffer: fault notes, then (`memory_marks`) a dword per page.
 fn fault_dwords() -> u64 {
-    let marks = if victory_shader::emit::memory_marks() { MEMORY_PAGES } else { 0 };
+    // (read marks sit a whole page table after the fault notes either way)
+    let marks = if victory_shader::emit::memory_read_marks() {
+        2 * MEMORY_PAGES
+    } else if victory_shader::emit::memory_marks() {
+        MEMORY_PAGES
+    } else {
+        0
+    };
     u64::from(MEMORY_FAULTS) + u64::from(marks)
 }
 

@@ -2933,6 +2933,36 @@ impl<'a> Lower<'a> {
                 &[faults, slot, iu, one, iu, iu, iu, mask, align],
             );
         }
+        if !write && super::shader::memory_read_marks() {
+            // A load marks its page too (dwords after the store marks), so
+            // the host sees which windows are still read through pointers
+            // it never sees. Once per page a wave reaches: lanes on the
+            // wave's first lane's page leave it to that lane.
+            let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
+            let marks = match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, mapped, g),
+                None => mapped,
+            };
+            let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[page]);
+            let lead = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, self.s.t.i1, 110, &[]);
+            self.s.flags |= flags::WAVE_OPS;
+            let other = self.s.m.cmp(c, pred::NE, page, first);
+            let own = self.s.m.bin(c, Bin::Or, other, lead);
+            let marks = self.s.m.bin(c, Bin::And, marks, own);
+            let first = k(self, MEMORY_FAULTS + MEMORY_PAGES);
+            let slot = self.s.m.bin(c, Bin::Add, page, first);
+            let slot = self.s.m.bin(c, Bin::Shl, slot, k2);
+            let slot = self.s.m.select(c, marks, slot, zero);
+            let one = k(self, 1);
+            self.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[faults, slot, iu, one, iu, iu, iu, mask, align],
+            );
+        }
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
