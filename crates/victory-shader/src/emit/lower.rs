@@ -434,9 +434,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// branch taken wave-wide ([`Structured::wide`]) can be taken by the whole group together
 /// instead (`Lower::wave_wide`), so that group barriers inside stay ones every thread meets.
 /// A console wave with no lane for the region then runs it with no lane active, which only
-/// holds where the console's skip and the region leave the same scalar state behind: no
-/// loop, no end of the program and no scalar store inside, and the joins after it bring the
-/// same scalar values (lane masks aside) either way.
+/// holds where the console's skip and the region leave the same scalar state behind: no end
+/// of the program and no scalar store inside, and the joins after it bring the same scalar
+/// values (lane masks aside, and values nothing reads) either way. A region holding a loop
+/// back to the branch (a loop the wave leaves together) is run on by a finished wave with no
+/// lane until the group leaves; the joins after the loop are held to the same rule.
+/// `VICTORY_WAVE_WIDE_GROUP=strict` refuses such loops.
 pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'static str> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -485,13 +488,27 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'sta
         }
     }
     let post = |d: usize, b: usize| pdom[d][b / 64] >> (b % 64) & 1 == 1;
+    let strict = std::env::var_os("VICTORY_WAVE_WIDE_GROUP").is_some_and(|v| v == "strict");
+    // values something reads: an instruction, or a phi that is read itself
+    let mut live: HashSet<Value> = p.blocks.iter().flat_map(|b| &b.insts).flat_map(|i| i.reads.iter().map(|r| r.1)).collect();
+    loop {
+        let before = live.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if live.contains(&phi.value) {
+                live.extend(phi.args.iter().copied());
+            }
+        }
+        if live.len() == before {
+            break;
+        }
+    }
     let mut wide: Vec<usize> = st.wide.iter().copied().collect();
     wide.sort_unstable();
     for d in wide {
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if b == d {
+            if b == d && strict {
                 return Err("a group-wide branch around a loop");
             }
             if seen[b] || post(d, b) {
@@ -524,7 +541,7 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'sta
                     Reg::Scc => st.phi_masks.contains_key(&phi.value),
                     _ => true,
                 };
-                if !lane_mask && phi.args.iter().any(|&a| a != phi.args[0]) {
+                if !lane_mask && live.contains(&phi.value) && phi.args.iter().any(|&a| a != phi.args[0]) {
                     return Err("a group-wide branch with scalar values joined after it");
                 }
             }
