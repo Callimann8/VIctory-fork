@@ -108,6 +108,10 @@ struct Memory {
     ranges: Vec<Vec<(u64, u64)>>,
     /// Copies whose runs need working out again.
     recalculate: BTreeSet<usize>,
+    /// What is naming memory now ([`Source`]) and, per source, how many
+    /// copies it got numbered (diagnostics in the log).
+    source: usize,
+    numbered_by: [u64; 5],
     /// Pages a shader marked as stored to (`memory_marks`), for the run.
     written: BTreeSet<u64>,
     /// Per copy: the runs of its pages in `written`, all that is copied
@@ -167,6 +171,8 @@ impl Memory {
             recalculate: BTreeSet::new(),
             written: BTreeSet::new(),
             written_ranges: Vec::new(),
+            source: 0,
+            numbered_by: [0; 5],
             generation: GENERATION.load(Ordering::Acquire),
             revision: 0,
             frame: u64::MAX,
@@ -212,6 +218,15 @@ impl Memory {
         }
         self.numbers.insert(shadow.id(), self.copies.len());
         self.copies.push(shadow.clone());
+        self.numbered_by[self.source] += 1;
+        if self.copies.len() % 256 == 0 {
+            let [view, pair, unit, fault, inside] = self.numbered_by;
+            tracing::info!(
+                copies = self.copies.len(),
+                view, pair, unit, fault, inside,
+                "title memory by address: copies numbered by source (root view, address in two constants, constant in 256-byte units, fault note, page of a copy numbered for another)"
+            );
+        }
         self.owned.push(0);
         self.ranges.push(Vec::new());
         self.written_ranges.push(Vec::new());
@@ -363,6 +378,7 @@ impl Memory {
         // inside it with a copy of its own gets that one.
         let (first, len) = shadow.span();
         let end = ((first + len) / PAGE).min(u64::from(MEMORY_PAGES) - 1);
+        let source = std::mem::replace(&mut self.source, Source::INSIDE);
         for p in first.div_ceil(PAGE)..end {
             if p == page || self.pages.contains_key(&p) {
                 continue;
@@ -373,6 +389,7 @@ impl Memory {
                 self.set_page(p, Some((number, off)));
             }
         }
+        self.source = source;
     }
 
     /// The pages shaders found empty since the last frame.
@@ -401,6 +418,7 @@ impl Memory {
                 );
             }
         }
+        self.source = Source::FAULT;
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }
@@ -435,8 +453,35 @@ impl Memory {
     /// after it.
     fn name(&mut self, address: u64) {
         self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+        if next_cell() {
+            self.map((address & !(CELL - 1)) + CELL);
+        }
     }
+}
+
+/// Indices of `Memory::numbered_by`.
+struct Source;
+impl Source {
+    const VIEW: usize = 0;
+    const PAIR: usize = 1;
+    const UNIT: usize = 2;
+    const FAULT: usize = 3;
+    const INSIDE: usize = 4;
+}
+
+/// `VICTORY_MEMORY_UNIT_CONSTANTS=0`: a root constant read as an address
+/// in 256-byte units names nothing (pages it alone would reach come from
+/// fault notes, a frame later).
+fn unit_constants() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_UNIT_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_MEMORY_NEXT_CELL=0`: a named address does not also name the
+/// 4 MiB after it.
+fn next_cell() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NEXT_CELL").is_none_or(|v| v != "0"))
 }
 
 /// The faults buffer: fault notes, then (`memory_marks`) a dword per page.
@@ -479,6 +524,7 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    m.source = Source::VIEW;
     for &address in addresses {
         m.name(address);
     }
@@ -490,9 +536,11 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
+            m.source = Source::PAIR;
             m.name(u64::from(c) | u64::from(high) << 32);
         }
-        if c >= 0x0100_0000 {
+        if c >= 0x0100_0000 && unit_constants() {
+            m.source = Source::UNIT;
             m.name(u64::from(c) << 8);
         }
     }
