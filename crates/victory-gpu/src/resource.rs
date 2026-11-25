@@ -1759,7 +1759,21 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video_memory = crate::host::host().and_then(|h| h.video_memory());
+    // `VICTORY_TEXTURE_SWEEP_PCT=<n>`: copies are let go only while the
+    // card uses at least n % of its budget (0, the default: always). With
+    // mip drop most textures fit, and letting go copies idle for a second
+    // made the next use make and upload them again (49,695 let go and
+    // 13,189 made again in a 4-minute run, 0.85-1.65 s of texture
+    // preparing at scene changes).
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let pct = *PCT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SWEEP_PCT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    if !sweep_due(video_memory, pct) {
+        return;
+    }
+    let idle_ms = crate::host::vram_idle_ms(video_memory);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1807,6 +1821,18 @@ pub(crate) fn let_go_idle() {
                 first.unwrap_or(0)
             )
         });
+    }
+}
+
+/// Whether [`let_go_idle`] runs: always for `pct` 0, else while the card
+/// uses at least `pct` % of its budget (`[budget, used, ..]`; no numbers:
+/// it runs).
+fn sweep_due(video_memory: Option<[u64; 4]>, pct: u64) -> bool {
+    match video_memory {
+        Some([budget, used, ..]) if pct > 0 && budget > 0 => {
+            u128::from(used) * 100 >= u128::from(budget) * u128::from(pct)
+        }
+        _ => true,
     }
 }
 
@@ -2989,6 +3015,18 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// The sweep waits for a full enough card when asked to.
+    #[test]
+    fn sweep_runs_only_when_the_card_is_full_enough() {
+        let gib = 1u64 << 30;
+        assert!(sweep_due(Some([10 * gib, gib, 0, 0]), 0));
+        assert!(sweep_due(None, 95));
+        assert!(sweep_due(Some([0, gib, 0, 0]), 95));
+        assert!(!sweep_due(Some([100, 94, 0, 0]), 95));
+        assert!(sweep_due(Some([100, 95, 0, 0]), 95));
+        assert!(sweep_due(Some([10 * gib, 11 * gib, 0, 0]), 95));
     }
 
     /// The mip drop rule (from upstream PR #1296's test): only big sampled
