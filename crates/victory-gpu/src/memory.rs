@@ -83,6 +83,26 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+/// Why a page of title memory gets no copy ([`Memory::map`]); a shader's
+/// access to it reads 0 or is dropped, every time.
+#[derive(Clone, Copy)]
+enum Unmapped {
+    /// Not memory the title has committed (a pointer that is not one).
+    NotTitle,
+    /// The title's, but no host copy holds the whole page.
+    NoCopy,
+    /// The copy that holds it cannot be written by shaders.
+    NotWritable,
+    /// No number left for another copy.
+    Full,
+    /// Past the directory.
+    Beyond,
+}
+
+impl Unmapped {
+    const COUNT: usize = 5;
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -115,28 +135,28 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's; otherwise why it has none (`None`: it has one).
+    fn map(&mut self, address: u64) -> Option<Unmapped> {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return Some(Unmapped::Beyond);
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
         if unsafe { entry.read() } != 0 {
-            return;
+            return None;
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return Some(Unmapped::NotTitle);
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return Some(Unmapped::NotTitle);
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
@@ -145,12 +165,12 @@ impl Memory {
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
         else {
-            return;
+            return Some(Unmapped::NoCopy);
         };
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return Some(Unmapped::NotWritable);
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
@@ -182,7 +202,7 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return Some(Unmapped::Full);
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -192,6 +212,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        None
     }
 
     /// The pages shaders found empty since the last frame.
@@ -209,19 +230,40 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
-        if !pages.is_empty() {
-            // Each is an access that read 0 or was dropped.
-            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-                tracing::warn!(
-                    pages = pages.len(),
-                    first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
-                    "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
-                );
+        if pages.is_empty() {
+            return;
+        }
+        // Each is an access that read 0 or was dropped. Why a page still has
+        // no copy after this: per reason, how many and the first one.
+        let mut why = [(0u32, 0u64); Unmapped::COUNT];
+        let mut made = 0u32;
+        for &page in &pages {
+            let at = u64::from(page) * PAGE;
+            match self.map(at) {
+                None => made += 1,
+                Some(u) => {
+                    let w = &mut why[u as usize];
+                    if w.0 == 0 {
+                        w.1 = at;
+                    }
+                    w.0 += 1;
+                }
             }
         }
-        for page in pages {
-            self.map(u64::from(page) * PAGE);
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+            let f = |w: (u32, u64)| format!("{} (first {:#x})", w.0, w.1);
+            tracing::warn!(
+                pages = pages.len(),
+                first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
+                made,
+                not_title = %f(why[Unmapped::NotTitle as usize]),
+                no_copy = %f(why[Unmapped::NoCopy as usize]),
+                not_writable = %f(why[Unmapped::NotWritable as usize]),
+                full = why[Unmapped::Full as usize].0,
+                beyond = why[Unmapped::Beyond as usize].0,
+                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now where they can be"
+            );
         }
     }
 
