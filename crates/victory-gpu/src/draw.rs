@@ -804,7 +804,8 @@ impl State {
     ) -> u32 {
         use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            // Dword 1: how many copies have views for this bind.
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1041,7 +1042,13 @@ impl State {
             let writes = (t.stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let memory_writes = writes && !crate::pipeline::quarantine();
+                // A traversal can read the scene by address and write its
+                // result to a texture or a separate root UAV: only shaders
+                // that store through the directory declare its copies
+                // written (DexNom bc3cd4b; VICTORY_WRITE_SKIP=0 = all).
+                let memory_writes = !quarantined
+                    && !crate::pipeline::quarantine()
+                    && (t.host.writes_guest_memory || !write_skip());
                 let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
@@ -1177,7 +1184,8 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let writes_slot = writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }

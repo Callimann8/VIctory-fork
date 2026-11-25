@@ -55,6 +55,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2285,6 +2288,8 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs: std::mem::take(&mut self.s.written_root_uavs),
+            writes_guest_memory: self.s.writes_guest_memory,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2794,7 +2799,7 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2828,6 +2833,11 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
+        // A newer command list can number more copies after this one has
+        // recorded: only views prepared for this bind (DexNom 921d8d3).
+        let count = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 1);
+        let in_range = self.s.m.cmp(c, pred::IULE, copy, count);
+        let copy = self.s.m.select(c, in_range, copy, zero);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
@@ -2856,7 +2866,8 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
+        (h, byte, mapped)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -2905,7 +2916,7 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte, _) = self.memory(lo, hi, guard);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2926,7 +2937,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte, _) = self.memory(lo, hi, guard);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -2936,6 +2947,7 @@ impl<'a> Lower<'a> {
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             self.end_guarded(at, &[]);
+            self.s.writes_guest_memory = true;
             return Ok(());
         }
         let Some(op) = name.strip_prefix("global_atomic_") else {
@@ -2953,7 +2965,7 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte, _) = self.memory(lo, hi, guard);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -3040,6 +3052,7 @@ impl<'a> Lower<'a> {
             }
         };
         let was = self.end_guarded(at, &[(was, old)])[0];
+        self.s.writes_guest_memory = true;
         if let Some(reg) = back {
             self.write(inst, Reg::V(reg), was, None);
         }
@@ -3087,7 +3100,7 @@ impl<'a> Lower<'a> {
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
             let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
+            let (h, byte, _) = self.memory(lo, hi, None);
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,

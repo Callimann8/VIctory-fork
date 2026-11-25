@@ -37,9 +37,11 @@
 //! is the extent of the title's allocation around an address, which the
 //! memory module of the layer knows and this one does not ask yet.
 //!
-//! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
+//! shortcut: a copy that is numbered is kept for the rest of the run. Each
+//! view heap's run of slots grows (doubling, from [`FIRST_RUN`]) as more
+//! copies are numbered; older runs stay valid for lists recorded with them,
+//! and a shader only uses the views its bind prepared ([`Ready::count`];
+//! after DexNom 921d8d3). Every dispatch of such a shader brings all numbered copies up to
 //! date and, if it can store, declares all of them written (the bytes are
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
@@ -54,9 +56,10 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// Slots of a heap's first run (its null view and 1023 copies). A listed
+/// frame of the opening cutscene names about 50 windows; with the
+/// ray-tracing builder on, 1023 are used up in the first second.
+const FIRST_RUN: u32 = 1024;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -68,9 +71,9 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Per host view heap (by address): the first slot of its current run,
+    /// the run's length, and how many copies have their view there.
+    heaps: HashMap<usize, (u32, u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -89,6 +92,10 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Copies with a view in that run at this bind: other recording threads
+    /// can number more (the directory is shared), which this bind's shader
+    /// must treat as missing.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -154,7 +161,8 @@ impl Memory {
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
+            // The directory holds a one-based u32 number.
+            None if self.copies.len() < u32::MAX as usize - 1 => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
@@ -180,7 +188,7 @@ impl Memory {
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+                    tracing::warn!("title memory by address: no number left for another copy; its pages read zeros")
                 });
                 return;
             }
@@ -276,20 +284,50 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
+    let needed = u32::try_from(m.copies.len()).unwrap_or(u32::MAX - 1) + 1;
+    let mut run = m.heaps.get(&key).copied();
+    if run.is_none_or(|(_, slots, _)| needed > slots && slots < heap.dynamic_capacity()) {
+        // Held for the heap's life: not given back with a list's slots, as
+        // lists recorded with an older run still use it.
+        let slots = needed
+            .checked_next_power_of_two()
+            .unwrap_or(u32::MAX)
+            .max(FIRST_RUN)
+            .min(heap.dynamic_capacity());
+        let fresh = heap.dynamic(slots).map(|base| (base, slots)).or_else(|| {
+            // A fragmented heap: a first run of what fits.
+            let small = needed.min(FIRST_RUN);
+            (run.is_none() && small < slots).then(|| heap.dynamic(small).map(|b| (b, small))).flatten()
+        });
+        match fresh {
+            Some((base, slots)) => {
+                // Every slot a null view: a slot is only used once filled,
+                // but a stale descriptor is never left for the driver.
+                for i in 0..slots {
+                    heap.null_raw_uav_at(base + i);
+                }
+                if let Some((_, old, _)) = run {
+                    tracing::info!(previous = old, slots, "title memory by address: grew the run of copy views");
+                }
+                run = Some((base, slots, 0));
+            }
+            None if run.is_none() => return None,
+            None => {}
         }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+    }
+    let (base, slots, made) = run?;
+    let count = (needed - 1).min(slots - 1);
+    if count + 1 < needed {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            tracing::warn!(copies = needed - 1, views = count, "title memory by address: the view heap holds no more copy views; the rest read zeros")
+        });
+    }
+    for (n, shadow) in m.copies.iter().enumerate().take(count as usize).skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    m.heaps.insert(key, (base, slots, made.max(count)));
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -298,12 +336,14 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        // (also copies whose view this bind made: a run grew)
+        let fresh = n >= numbered.min(made as usize);
+        if first_read || fresh {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && (first_write || fresh) {
             shadow.gpu_writes(list, start, len);
         }
     }
@@ -315,5 +355,6 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        count,
     })
 }

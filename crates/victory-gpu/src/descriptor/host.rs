@@ -1050,6 +1050,11 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
+    /// How many dynamic slots the heap has in all.
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
