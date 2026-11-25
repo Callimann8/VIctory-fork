@@ -566,8 +566,21 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<GroupJoin
                 };
                 if !lane_mask && live.contains(&phi.value) && phi.args.iter().any(|&a| a != phi.args[0]) {
                     // a skip straight into the join: a wave that skipped takes its value
-                    if looped || !single || !p.blocks[j].preds.contains(&d) {
-                        return Err("a group-wide branch with scalar values joined after it");
+                    let straight = p.blocks[j].preds.contains(&d);
+                    if looped || !single || !straight {
+                        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                            eprintln!(
+                                "WAVE64-GROUP branch at {:#x} (block {d}), join at {:#x} (block {j}), {:?} {:?}: loop {looped}, one way in {single}, skip straight in {straight}",
+                                p.blocks[d].offset, p.blocks[j].offset, phi.reg, phi.value
+                            );
+                        }
+                        return Err(if looped {
+                            "a group-wide branch around a loop with scalar values joined after it"
+                        } else if !single {
+                            "a group-wide branch around a region with another way in"
+                        } else {
+                            "a group-wide branch whose skip does not come straight into the join"
+                        });
                     }
                     let list = out.entry(j).or_default();
                     if !list.iter().any(|(x, _)| *x == d) {
