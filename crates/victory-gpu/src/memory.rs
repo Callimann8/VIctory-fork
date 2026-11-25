@@ -103,6 +103,11 @@ struct Memory {
     /// (its buffer released, the pages another's) is neither brought up to
     /// date nor copied back: its bytes would land on the new owner's.
     owned: Vec<u32>,
+    /// Per copy: the runs of title memory its directory pages cover, all
+    /// that a shader can reach through it (refreshed and copied back).
+    ranges: Vec<Vec<(u64, u64)>>,
+    /// Copies whose runs need working out again.
+    recalculate: BTreeSet<usize>,
     /// The journal generation the directory agrees with.
     generation: u64,
     /// Bumped with each new directory (lists keep each one they bind).
@@ -153,6 +158,8 @@ impl Memory {
             numbers: HashMap::new(),
             pages: BTreeMap::new(),
             owned: Vec::new(),
+            ranges: Vec::new(),
+            recalculate: BTreeSet::new(),
             generation: GENERATION.load(Ordering::Acquire),
             revision: 0,
             frame: u64::MAX,
@@ -199,6 +206,7 @@ impl Memory {
         self.numbers.insert(shadow.id(), self.copies.len());
         self.copies.push(shadow.clone());
         self.owned.push(0);
+        self.ranges.push(Vec::new());
         Some(self.copies.len() - 1)
     }
 
@@ -209,10 +217,12 @@ impl Memory {
         };
         if let Some(old) = old {
             self.owned[old] -= 1;
+            self.recalculate.insert(old);
         }
         let (number, offset) = match mapping {
             Some((n, offset)) => {
                 self.owned[n] += 1;
+                self.recalculate.insert(n);
                 (n as u32 + 1, offset)
             }
             None => (0, 0),
@@ -275,6 +285,29 @@ impl Memory {
         }
         self.refused.clear();
         Some(replaced)
+    }
+
+    fn update_ranges(&mut self) {
+        for index in std::mem::take(&mut self.recalculate) {
+            let (start, len) = self.copies[index].span();
+            let ranges = &mut self.ranges[index];
+            ranges.clear();
+            for (&page, &owner) in self.pages.range(start / PAGE..(start + len).div_ceil(PAGE)) {
+                if owner != index {
+                    continue;
+                }
+                // (the page's part inside the copy)
+                let at = (page * PAGE).max(start);
+                let end = ((page + 1) * PAGE).min(start + len);
+                if let Some((first, bytes)) = ranges.last_mut()
+                    && *first + *bytes == at
+                {
+                    *bytes = end - *first;
+                } else {
+                    ranges.push((at, end - at));
+                }
+            }
+        }
     }
 
     fn table(dwords: u64, what: &str) -> Option<(ID3D12Resource, *mut u32, u64)> {
@@ -479,18 +512,30 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
+    // Copies that got pages since the last bind: brought up to date in
+    // this list too. Only the pages a shader can reach through the
+    // directory, not the whole copy (after DexNom's ranges).
+    let changed = std::mem::take(&mut m.recalculate);
+    m.recalculate.clone_from(&changed);
+    m.update_ranges();
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
         if m.owned[n] == 0 {
             continue;
         }
-        let (start, len) = shadow.span();
         // (also copies whose view this bind made: a run grew)
-        let fresh = remapped || n >= numbered.min(made as usize);
-        if first_read || fresh {
-            shadow.refresh(list, start, len);
+        let fresh = remapped || n >= numbered.min(made as usize) || changed.contains(&n);
+        let read = first_read || fresh;
+        let write = writes && (first_write || fresh);
+        if !(read || write) {
+            continue;
         }
-        if writes && (first_write || fresh) {
-            shadow.gpu_writes(list, start, len);
+        for &(start, len) in &m.ranges[n] {
+            if read {
+                shadow.refresh(list, start, len);
+            }
+            if write {
+                shadow.gpu_writes(list, start, len);
+            }
         }
     }
     if first_read {
