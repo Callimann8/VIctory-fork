@@ -95,6 +95,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 /// With `partial`, threads past a one-dimensional dispatch's thread count
 /// ([`super::USER_DISPATCH_THREADS_X`]) return at once (DexNom bc3cd4b).
+/// `VICTORY_BVH_GUARD_SPLIT=0`: no thread-count guard for console wave64
+/// programs a 32-lane host runs in two halves.
+fn guard_split() -> bool {
+    std::env::var_os("VICTORY_BVH_GUARD_SPLIT").is_none_or(|v| v != "0")
+}
+
 pub(super) fn lower_with_thread_limit(parts: &Parts, partial: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
@@ -1309,8 +1315,11 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            // (Not with a thread limit: its early return would miss the group barriers.)
-            if !partial && wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            // With a thread limit, threads past the count return before the program (the
+            // console has them out of EXEC): on a 32-lane host that relies on returned threads
+            // not holding up group barriers, and on zeroed exchange dwords for a half with no
+            // thread left (`run`). VICTORY_BVH_GUARD_SPLIT=0: not for programs split in halves.
+            if !(partial && !guard_split()) && wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -2216,6 +2225,19 @@ impl<'a> Lower<'a> {
             let unlimited = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
             let active = self.s.m.bin(original, Bin::Or, unlimited, inside);
+            // A console wave in two host waves: a half whose threads all return never writes
+            // its exchange dword, which must then read as no lanes (`exchange_halves`).
+            if let Some((slot, false, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) {
+                let pair = self.exchange_pair(slot);
+                let lds = self.s.lds();
+                let one = self.s.m.i32(1);
+                let second = self.s.m.bin(original, Bin::Add, pair, one);
+                for at in [pair, second] {
+                    let ptr = self.s.m.element(original, lds, at);
+                    self.s.m.store(original, ptr, zero);
+                }
+                self.group_sync(original);
+            }
             let body = self.s.m.new_block();
             let done = self.s.m.new_block();
             self.s.m.terminate(original, Term::CondBr(active, body, done));
