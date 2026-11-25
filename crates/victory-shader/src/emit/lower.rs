@@ -262,6 +262,9 @@ struct Lower<'a> {
     /// the group counts its answers, so the whole group takes them together
     /// ([`group_wide_check`]), and whether the entry zeroed it yet.
     group_slot: Option<(u32, bool)>,
+    /// The program's own LDS fills the host's 32 KiB: the exchange dwords lie over its first
+    /// dwords instead (this many), which each use saves and puts back ([`Self::borrow_save`]).
+    borrow: Option<u32>,
     /// With `group_slot`: the joins where a wave that skipped takes the skip's values
     /// ([`group_wide_check`]), and per such branch the console wave's own answer (true: to
     /// its taken side).
@@ -1461,11 +1464,13 @@ impl<'a> Lower<'a> {
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         let mut group_slot: Option<(u32, bool)> = None;
+        let mut borrow: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            let own_lds = s.lds_dwords;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1600,6 +1605,28 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // Past the host's 32 KiB with the dwords added for two host waves: those lie over
+            // the program's first dwords, saved and put back around each use
+            // (`VICTORY_LDS_BORROW=0`: left past the limit, which the validator refuses).
+            let extra = s.lds_dwords.saturating_sub(own_lds);
+            if !partial
+                && s.lds_dwords > 8192
+                && extra > 0
+                && extra <= own_lds
+                && std::env::var_os("VICTORY_LDS_BORROW").is_none_or(|v| v != "0")
+            {
+                if let Some(e) = exchange.as_mut() {
+                    e.0 -= own_lds;
+                }
+                if let Some(g) = group_slot.as_mut() {
+                    g.0 -= own_lds;
+                }
+                if let Some(h) = halves.as_mut() {
+                    *h -= own_lds;
+                }
+                s.lds_dwords = own_lds;
+                borrow = Some(extra);
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1741,6 +1768,7 @@ impl<'a> Lower<'a> {
             split_lds,
             lds_meet,
             group_slot,
+            borrow,
             group_joins: if group_slot.is_some() { group_wide_check(p, x.st).unwrap_or_default() } else { GroupJoins::new() },
             wave_cond: HashMap::new(),
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2454,6 +2482,14 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if self.borrow.is_some() {
+            // the borrowed dwords' entry uses (the wave base's counter) before any of the
+            // program's own LDS writes in the entry block
+            let _ = self.console_thread();
+            if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
+                let _ = self.exchange_pair(slot);
+            }
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -3965,6 +4001,11 @@ impl<'a> Lower<'a> {
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         self.s.flags |= flags::WAVE_OPS;
+        if self.borrow.is_some() {
+            // the counter lies over the program's LDS: every wave has its base before any
+            // writes there
+            self.group_sync(e);
+        }
         self.wave_base = Some(base);
         Some(base)
     }
@@ -4011,6 +4052,41 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// With `borrow`: the group meets (the program's LDS accesses before are done), each thread
+    /// keeps one of the borrowed dwords (threads past them all keep the last one), and the
+    /// group meets again before the dwords are written. Every thread must run it.
+    fn borrow_save(&mut self, at: usize) -> Option<V> {
+        let n = self.borrow?;
+        self.group_sync(at);
+        let idx = self.borrow_index(at, n);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, idx);
+        let saved = self.s.m.load(at, ptr);
+        self.group_sync(at);
+        Some(saved)
+    }
+
+    /// Puts back what [`Self::borrow_save`] kept (after a use that ends with the group meeting,
+    /// so no thread still reads the borrowed dwords), and the group meets so that the program
+    /// reads its own values again. The threads past the borrowed dwords write the last one's
+    /// value, which they all kept.
+    fn borrow_restore(&mut self, at: usize, saved: Option<V>) {
+        let (Some(saved), Some(n)) = (saved, self.borrow) else { return };
+        let idx = self.borrow_index(at, n);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, idx);
+        self.s.m.store(at, ptr, saved);
+        self.group_sync(at);
+    }
+
+    fn borrow_index(&mut self, at: usize, n: u32) -> V {
+        let i32t = self.s.t.i32;
+        let flat = self.s.op(at, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let last = self.s.m.i32(n - 1);
+        let inside = self.s.m.cmp(at, pred::IULT, flat, last);
+        self.s.m.select(at, inside, flat, last)
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -4033,6 +4109,7 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        let saved = self.borrow_save(at);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4049,6 +4126,7 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
         self.group_sync(at);
+        self.borrow_restore(at, saved);
         (lo, hi)
     }
 
@@ -4141,7 +4219,16 @@ impl<'a> Lower<'a> {
             // after the group met once more, so every share of this one is out by then).
             let lds = self.s.lds();
             let k = self.s.m.i32(slot);
-            if !zeroed {
+            let saved = self.borrow_save(c);
+            if let Some(n) = self.borrow {
+                // (the borrowed dword holds the program's value: every thread clears it, the
+                // group meets)
+                let _ = n;
+                let ptr = self.s.m.element(c, lds, k);
+                let z = self.s.m.i32(0);
+                self.s.m.store(c, ptr, z);
+                self.group_sync(c);
+            } else if !zeroed {
                 let e = self.s.entry;
                 let ptr = self.s.m.element(e, lds, k);
                 let z = self.s.m.i32(0);
@@ -4165,8 +4252,12 @@ impl<'a> Lower<'a> {
             let ptr = self.s.m.element(c, lds, k);
             let count = self.s.m.load(c, ptr);
             self.group_sync(c);
-            let ptr = self.s.m.element(c, lds, k);
-            self.s.m.atomic(c, Rmw::Sub, ptr, some);
+            if saved.is_some() {
+                self.borrow_restore(c, saved);
+            } else {
+                let ptr = self.s.m.element(c, lds, k);
+                self.s.m.atomic(c, Rmw::Sub, ptr, some);
+            }
             let z = self.s.m.i32(0);
             let p = if any { pred::NE } else { pred::EQ };
             if self.group_joins.values().flatten().any(|(d, _)| *d == b) {
@@ -7860,6 +7951,8 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    let c0 = self.cur;
+                    let saved = self.borrow_save(c0);
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -7870,6 +7963,7 @@ impl<'a> Lower<'a> {
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
                     self.group_sync(c2);
+                    self.borrow_restore(c2, saved);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
