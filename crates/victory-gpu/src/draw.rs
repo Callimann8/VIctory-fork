@@ -66,6 +66,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: the stage is the structure
+    /// builder's under `VICTORY_BVH_QUARANTINE=1`, so its stores through
+    /// table views are not copied back either.
+    static QUARANTINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -993,22 +997,25 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            QUARANTINED.set(quarantined);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            QUARANTINED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = (t.stores || !write_skip()) && !quarantined;
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let memory_writes = writes && !crate::pipeline::quarantine();
+                let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -3162,7 +3169,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if QUARANTINED.get() {
+                // `VICTORY_BVH_QUARANTINE=1`: stays in the host's copy.
+            } else if STORES.get() || !write_skip() {
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

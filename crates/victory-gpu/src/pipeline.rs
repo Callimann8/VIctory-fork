@@ -259,8 +259,20 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
+    is_builder(this) && quarantine()
+}
+
+/// Whether `VICTORY_BVH_QUARANTINE=1` is set. While it is, no shader that
+/// reaches title memory by address declares the numbered copies written:
+/// the builder's stores sit in those copies, and any later dispatch that
+/// declared them would copy them back with its own (the copy-back keeps
+/// every byte that differs from title memory, whoever wrote it).
+/// shortcut: a non-builder dispatch whose own views cover a builder
+/// structure still copies the builder's bytes back with its own.
+#[cfg(windows)]
+pub(crate) fn quarantine() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
