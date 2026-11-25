@@ -591,6 +591,14 @@ fn release_frames() -> u64 {
     *N.get_or_init(|| std::env::var("VICTORY_MEMORY_RELEASE_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_MEMORY_REFRESH_IDLE=N` (with `VICTORY_MEMORY_READ_MARKS=1`): numbered windows
+/// no shader named, faulted, marked or read for N frames are not brought up to date (0, the
+/// default: every bind refreshes every window).
+fn refresh_idle() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_MEMORY_REFRESH_IDLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
 /// `VICTORY_MEMORY_BUDGET_MB=N`: numbered windows past N MiB in all are
 /// let go, those reached longest ago first (0, the default: no limit).
 fn budget_bytes() -> u64 {
@@ -759,7 +767,16 @@ pub(crate) fn ready(
         if !(read || write) {
             continue;
         }
-        if read {
+        // A window no shader reached for a while (read marks say so exactly) is left as
+        // it is: a shader that reads it again reads it as it was for that frame, marks it,
+        // and it is brought up to date from then on (`VICTORY_MEMORY_REFRESH_IDLE`).
+        let idle = refresh_idle();
+        let asleep = idle != 0
+            && !fresh
+            && victory_shader::emit::memory_read_marks()
+            && shadow.is_window()
+            && m.frame.saturating_sub(m.touched[n]) > idle;
+        if read && !asleep {
             for &(start, len) in &m.ranges[n] {
                 shadow.refresh(list, start, len);
             }
