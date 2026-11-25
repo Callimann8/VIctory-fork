@@ -332,6 +332,18 @@ fn mesh_kept(pipeline: usize) -> bool {
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// Since the last frame-rate line, of indirect calls: [0] clamped alone,
+/// [1] windows clamped ([`windows`]), [2] drawn from a window with no clamp
+/// of their own, [3] not windowed for a storing shader, [4] for a count
+/// buffer or more than one record, [5] windows ended by another host list,
+/// [6] misses with a window open (another buffer, kind, or step).
+pub(crate) static WINDOW_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// The frame-rate line's counts of [`WINDOW_STATS`], reset.
+pub(crate) fn take_window_stats() -> [u64; 7] {
+    std::array::from_fn(|i| WINDOW_STATS[i].swap(0, Ordering::Relaxed))
+}
+
 /// Draws run on the host so far.
 pub(crate) fn drawn() -> u64 {
     DRAWN.load(Ordering::Relaxed)
@@ -2971,7 +2983,17 @@ impl State {
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
+        if kind != DISPATCH && windows() {
+            if max != 1 || count.is_some() {
+                WINDOW_STATS[4].fetch_add(1, Ordering::Relaxed);
+            } else if !windowed {
+                WINDOW_STATS[3].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if !windowed || list.first_use(WINDOW_USE) {
+            if windowed && self.window.is_some() {
+                WINDOW_STATS[5].fetch_add(1, Ordering::Relaxed);
+            }
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
@@ -2981,6 +3003,11 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        if hit.is_some() {
+            WINDOW_STATS[2].fetch_add(1, Ordering::Relaxed);
+        } else if windowed && self.window.is_some() {
+            WINDOW_STATS[6].fetch_add(1, Ordering::Relaxed);
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -3015,6 +3042,7 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                WINDOW_STATS[usize::from(windowed && records > 1)].fetch_add(1, Ordering::Relaxed);
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {

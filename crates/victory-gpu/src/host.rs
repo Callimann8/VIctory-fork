@@ -6469,6 +6469,13 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         {
+            let w = crate::draw::take_window_stats().map(|n| n as f64 / frames);
+            tracing::info!(
+                "indirect clamps per frame: {:.0} alone, {:.0} windows; {:.0} draws from a window with no clamp; not windowed: {:.0} storing shaders, {:.0} count buffer or several records; windows ended by another list {:.0}, misses with a window open {:.0} (VICTORY_INDIRECT_WINDOW)",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+            );
+        }
+        {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
                 "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
