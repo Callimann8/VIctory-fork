@@ -11,8 +11,9 @@
 //!
 //! - the **directory**: per 64 KiB page of title address space the number
 //!   of the copy that holds the page (0: none) and the page's byte offset
-//!   in it; one buffer for all lists, entries only ever go from empty to
-//!   filled;
+//!   in it; a page whose owner changes (the title released or registered
+//!   a buffer there) gives later binds a new directory, while lists
+//!   recorded with the old one keep it (after DexNom's journal);
 //! - per view heap a run of slots with a raw unordered access view of each
 //!   numbered copy (slot 0 of the run: a null view, for pages without a
 //!   copy);
@@ -46,8 +47,9 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -65,6 +67,25 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+// A title may register or release buffers while another thread records
+// GPU work: the changed page spans, newest last. A reader that fell more
+// than the journal behind rechecks all its pages. Nothing is journalled
+// until a shader has used the directory.
+static CHANGES: OnceLock<Mutex<VecDeque<(u64, u64)>>> = OnceLock::new();
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Title memory `[start, start + len)` may now belong to another buffer.
+pub(crate) fn ownership_changed(start: u64, len: u64) {
+    if let Some(changes) = CHANGES.get() {
+        let mut changes = changes.lock().unwrap_or_else(|e| e.into_inner());
+        if changes.len() == 256 {
+            changes.pop_front();
+        }
+        changes.push_back((start / PAGE, start.saturating_add(len).div_ceil(PAGE)));
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
@@ -74,6 +95,18 @@ struct Memory {
     /// Per host view heap (by address): the first slot of its current run,
     /// the run's length, and how many copies have their view there.
     heaps: HashMap<usize, (u32, u32, u32)>,
+    /// Copy numbers by shadow id.
+    numbers: HashMap<u64, usize>,
+    /// Mapped directory pages and the copy each has.
+    pages: BTreeMap<u64, usize>,
+    /// Per copy: how many directory pages it holds now. A copy with none
+    /// (its buffer released, the pages another's) is neither brought up to
+    /// date nor copied back: its bytes would land on the new owner's.
+    owned: Vec<u32>,
+    /// The journal generation the directory agrees with.
+    generation: u64,
+    /// Bumped with each new directory (lists keep each one they bind).
+    revision: u64,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -111,14 +144,147 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        CHANGES.get_or_init(Default::default);
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
+            numbers: HashMap::new(),
+            pages: BTreeMap::new(),
+            owned: Vec::new(),
+            generation: GENERATION.load(Ordering::Acquire),
+            revision: 0,
             frame: u64::MAX,
             refused: Default::default(),
         })
+    }
+
+    /// The copy holding all of the page at `start`, if it is the title's
+    /// memory and shaders can write it, and the page's byte in that copy.
+    fn page_owner(start: u64) -> Option<(Arc<Shadow>, u32)> {
+        if !crate::texture::committed(start as *const u8, PAGE as usize) {
+            return None;
+        }
+        // The copy a root view at that address would get; a buffer that
+        // ends inside the page is passed over for what holds all of it.
+        let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
+        let shadow = crate::shadow::find(start, 1)
+            .filter(whole)
+            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
+        // SAFETY: a live buffer.
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            return None;
+        }
+        // The page's byte from the resource's byte 0 (a copy in place can
+        // begin before the title's allocation), where the view starts.
+        shadow.offset_in(start)?;
+        let offset = u32::try_from(shadow.offset(start)).ok()?;
+        Some((shadow, offset))
+    }
+
+    /// The copy's number, given one on first sight; kept for the run, as a
+    /// recorded list may still use it after the title reuses the address.
+    fn number(&mut self, shadow: &Arc<Shadow>) -> Option<usize> {
+        if let Some(&n) = self.numbers.get(&shadow.id()) {
+            return Some(n);
+        }
+        // The directory holds a one-based u32 number.
+        if self.copies.len() >= u32::MAX as usize - 1 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("title memory by address: no number left for another copy; its pages read zeros"));
+            return None;
+        }
+        self.numbers.insert(shadow.id(), self.copies.len());
+        self.copies.push(shadow.clone());
+        self.owned.push(0);
+        Some(self.copies.len() - 1)
+    }
+
+    fn set_page(&mut self, page: u64, mapping: Option<(usize, u32)>) {
+        let old = match mapping {
+            Some((n, _)) => self.pages.insert(page, n),
+            None => self.pages.remove(&page),
+        };
+        if let Some(old) = old {
+            self.owned[old] -= 1;
+        }
+        let (number, offset) = match mapping {
+            Some((n, offset)) => {
+                self.owned[n] += 1;
+                (n as u32 + 1, offset)
+            }
+            None => (0, 0),
+        };
+        // The offset first: a shader that sees the number sees it too.
+        // SAFETY: inside the directory's mapping.
+        unsafe {
+            let entry = self.directory.1.add(page as usize * 2);
+            entry.add(1).write_volatile(offset);
+            entry.write_volatile(number);
+        }
+    }
+
+    /// Pages whose owner changed since the directory was made get their
+    /// new copy (or none) in a new directory: recorded lists read the old.
+    fn reconcile(&mut self) -> Option<bool> {
+        let now = GENERATION.load(Ordering::Acquire);
+        if self.generation == now {
+            return Some(false);
+        }
+        let mut check = BTreeSet::new();
+        {
+            let changes = CHANGES.get()?.lock().unwrap_or_else(|e| e.into_inner());
+            let now = GENERATION.load(Ordering::Relaxed);
+            let count = now - self.generation;
+            if count > changes.len() as u64 {
+                check.extend(self.pages.keys().copied());
+            } else {
+                for &(first, end) in changes.iter().rev().take(count as usize) {
+                    check.extend(self.pages.range(first..end).map(|(&page, _)| page));
+                }
+            }
+            self.generation = now;
+        }
+        let mut replaced = false;
+        let mut moved = 0u64;
+        for page in check {
+            let old = self.pages[&page];
+            let owner = Self::page_owner(page * PAGE);
+            if owner.as_ref().is_some_and(|(s, _)| Arc::ptr_eq(s, &self.copies[old])) {
+                continue;
+            }
+            if !replaced {
+                let next = Self::table(u64::from(MEMORY_PAGES) * 2, "directory")?;
+                // SAFETY: equal-sized tables; the GPU only reads directories.
+                unsafe { std::ptr::copy_nonoverlapping(self.directory.1, next.1, MEMORY_PAGES as usize * 2) };
+                self.directory = next;
+                self.revision += 1;
+                replaced = true;
+            }
+            let mapping = owner.and_then(|(s, offset)| self.number(&s).map(|n| (n, offset)));
+            self.set_page(page, mapping);
+            moved += 1;
+        }
+        if replaced {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                tracing::info!(pages = moved, "title memory by address: pages changed owner; a new directory");
+            }
+        }
+        self.refused.clear();
+        Some(replaced)
+    }
+
+    fn table(dwords: u64, what: &str) -> Option<(ID3D12Resource, *mut u32, u64)> {
+        let (buffer, data) = host()?.shared_buffer(dwords * 4)?;
+        crate::host::name(&buffer, || format!("title memory by address: {what}"));
+        // SAFETY: a fresh mapping of at least that many bytes.
+        unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, data.cast::<u32>(), gpu))
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -126,79 +292,38 @@ impl Memory {
     fn map(&mut self, address: u64) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
-        if page >= u64::from(MEMORY_PAGES) - 1 {
+        if page >= u64::from(MEMORY_PAGES) - 1 || self.pages.contains_key(&page) {
             return;
         }
-        // SAFETY: inside the directory's mapping.
-        let entry = unsafe { self.directory.1.add(page as usize * 2) };
-        // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
-        }
-        let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
             return;
         }
-        if !crate::texture::committed(start as *const u8, PAGE as usize) {
+        let Some((shadow, offset)) = Self::page_owner(page * PAGE) else {
             self.refused.insert(page);
             return;
-        }
-        // The copy a root view at that address would get; a buffer that
-        // ends inside the page is passed over for what holds all of it.
-        let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
-            .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
-            return;
         };
-        // SAFETY: a live buffer.
-        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        let count = self.copies.len();
+        let Some(n) = self.number(&shadow) else { return };
+        self.set_page(page, Some((n, offset)));
+        if n < count {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
-            Some(n) => n,
-            // The directory holds a one-based u32 number.
-            None if self.copies.len() < u32::MAX as usize - 1 => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
-                // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB.
-                // shortcut: a page of a title buffer inside this one that
-                // has a copy of its own is given this copy too.
-                let (first, len) = shadow.span();
-                let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
-                            other.write_volatile(n as u32 + 1);
-                        }
-                    }
-                    at += PAGE;
-                }
-                n
+        // A new copy: every page it holds whole, not only the one asked
+        // for (a structure is more than 64 KiB); a page of a title buffer
+        // inside it with a copy of its own gets that one.
+        let (first, len) = shadow.span();
+        let end = ((first + len) / PAGE).min(u64::from(MEMORY_PAGES) - 1);
+        for p in first.div_ceil(PAGE)..end {
+            if p == page || self.pages.contains_key(&p) {
+                continue;
             }
-            None => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!("title memory by address: no number left for another copy; its pages read zeros")
-                });
-                return;
+            if let Some((owner, off)) = Self::page_owner(p * PAGE)
+                && let Some(number) = self.number(&owner)
+            {
+                self.set_page(p, Some((number, off)));
             }
-        };
-        let offset = shadow.offset_in(start).unwrap_or(0);
-        // The offset first: a shader that sees the number sees it too.
-        // SAFETY: inside the directory's mapping.
-        unsafe {
-            entry.add(1).write_volatile(offset as u32);
-            entry.write_volatile(n as u32 + 1);
         }
     }
 
@@ -241,6 +366,13 @@ impl Memory {
     }
 }
 
+/// `VICTORY_MEMORY_JOURNAL=0`: directory pages keep their first copy for
+/// the run, as before (no new directory when a page changes owner).
+fn journal() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_JOURNAL").is_none_or(|v| v != "0"))
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -259,6 +391,8 @@ pub(crate) fn ready(
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    // (copies that got pages back are brought up to date in this list too)
+    let remapped = journal() && m.reconcile()?;
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -324,8 +458,17 @@ pub(crate) fn ready(
         });
     }
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize).skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        // The whole resource from its byte 0, as the directory's offsets
+        // count; a buffer view holds at most 2^27 elements (D3D12), past
+        // which reads give zeros.
+        // SAFETY: a live buffer.
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
+        const MOST: u64 = 4 << 27;
+        if width > MOST {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::warn!(width, "title memory by address: a copy over 512 MiB; its view covers the first 512 MiB"));
+        }
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, width.min(MOST));
     }
     m.heaps.insert(key, (base, slots, made.max(count)));
     // Once per list, and for copies numbered since: the builder alone
@@ -337,9 +480,12 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
+        if m.owned[n] == 0 {
+            continue;
+        }
         let (start, len) = shadow.span();
         // (also copies whose view this bind made: a run grew)
-        let fresh = n >= numbered.min(made as usize);
+        let fresh = remapped || n >= numbered.min(made as usize);
         if first_read || fresh {
             shadow.refresh(list, start, len);
         }
@@ -348,8 +494,12 @@ pub(crate) fn ready(
         }
     }
     if first_read {
-        list.keep(&m.directory.0);
         list.keep(&m.faults.0);
+    }
+    // Each directory the list binds lives until it has run.
+    const DIRECTORY: usize = usize::MAX - 0x7000_0000;
+    if list.first_use(DIRECTORY - m.revision as usize) {
+        list.keep(&m.directory.0);
     }
     Some(Ready {
         directory: m.directory.2,

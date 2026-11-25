@@ -3406,18 +3406,21 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let old = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if let Some(old) = buffers().remove(&(start, resource)) {
+        crate::memory::ownership_changed(start, old.end - start);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3458,6 +3461,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n != 0 {
+        crate::memory::ownership_changed(at, len);
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
