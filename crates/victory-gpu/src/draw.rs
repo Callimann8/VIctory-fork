@@ -1006,7 +1006,7 @@ impl State {
             STORES.set(true);
             QUARANTINED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
+                note_table_drop(p);
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -2086,6 +2086,45 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if crate::ambient::on() && self.ambient(list, p) {
+            // Our pass set its own pipeline, root signature and heap: the
+            // next draw or dispatch sets the title's again.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the constant indirect light, if it is the
+    /// program that resolves that ([`crate::ambient`]).
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let (slot, offset) = crate::ambient::LIGHT;
+        let light = stage
+            .translated()
+            .used
+            .iter()
+            .find(|u| {
+                u.kind == ResourceType::Uav
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })
+            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                Some(&Root::Table(table)) => {
+                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                }
+                _ => None,
+            });
+        let light = match light {
+            Some(View::Unordered(r, ..)) if r != 0 => r,
+            _ => {
+                once!("no ambient light: the resolve's light is not where it was");
+                return false;
+            }
+        };
+        crate::ambient::raise(list, light as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3420,5 +3459,20 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// A draw or dispatch dropped for want of dynamic descriptor slots: counted,
+/// and logged at 1, 2, 4, 8, ... with its shaders (the first warning alone
+/// does not say how many followed, nor which passes went missing).
+fn note_table_drop(p: &HostPipeline) {
+    static DROPS: AtomicU64 = AtomicU64::new(0);
+    let n = DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            dropped = n,
+            pipeline = %p.name,
+            "draws dropped: their descriptor tables found no free slots"
+        );
     }
 }
