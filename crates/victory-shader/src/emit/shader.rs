@@ -49,8 +49,17 @@ pub const SLOT_MEMORY: u8 = 254;
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
-/// Dwords of the [`SLOT_FAULTS`] buffer.
+/// Dwords of the [`SLOT_FAULTS`] buffer's fault notes; with
+/// [`memory_marks`] a dword per directory page follows (set to 1 by a store
+/// or atomic through the directory).
 pub const MEMORY_FAULTS: u32 = 4096;
+
+/// `VICTORY_MEMORY_MARKS=0`: stores through the directory mark no pages
+/// (the host then copies back every page a storing shader can reach).
+pub fn memory_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MARKS").is_none_or(|v| v != "0"))
+}
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

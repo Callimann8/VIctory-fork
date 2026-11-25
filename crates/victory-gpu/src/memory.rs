@@ -108,6 +108,11 @@ struct Memory {
     ranges: Vec<Vec<(u64, u64)>>,
     /// Copies whose runs need working out again.
     recalculate: BTreeSet<usize>,
+    /// Pages a shader marked as stored to (`memory_marks`), for the run.
+    written: BTreeSet<u64>,
+    /// Per copy: the runs of its pages in `written`, all that is copied
+    /// back after a storing shader.
+    written_ranges: Vec<Vec<(u64, u64)>>,
     /// The journal generation the directory agrees with.
     generation: u64,
     /// Bumped with each new directory (lists keep each one they bind).
@@ -152,7 +157,7 @@ impl Memory {
         CHANGES.get_or_init(Default::default);
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            faults: make(fault_dwords(), "faults")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             numbers: HashMap::new(),
@@ -160,6 +165,8 @@ impl Memory {
             owned: Vec::new(),
             ranges: Vec::new(),
             recalculate: BTreeSet::new(),
+            written: BTreeSet::new(),
+            written_ranges: Vec::new(),
             generation: GENERATION.load(Ordering::Acquire),
             revision: 0,
             frame: u64::MAX,
@@ -207,6 +214,7 @@ impl Memory {
         self.copies.push(shadow.clone());
         self.owned.push(0);
         self.ranges.push(Vec::new());
+        self.written_ranges.push(Vec::new());
         Some(self.copies.len() - 1)
     }
 
@@ -288,10 +296,20 @@ impl Memory {
     }
 
     fn update_ranges(&mut self) {
+        fn add(ranges: &mut Vec<(u64, u64)>, at: u64, end: u64) {
+            if let Some((first, bytes)) = ranges.last_mut()
+                && *first + *bytes == at
+            {
+                *bytes = end - *first;
+            } else {
+                ranges.push((at, end - at));
+            }
+        }
         for index in std::mem::take(&mut self.recalculate) {
             let (start, len) = self.copies[index].span();
-            let ranges = &mut self.ranges[index];
+            let (ranges, written) = (&mut self.ranges[index], &mut self.written_ranges[index]);
             ranges.clear();
+            written.clear();
             for (&page, &owner) in self.pages.range(start / PAGE..(start + len).div_ceil(PAGE)) {
                 if owner != index {
                     continue;
@@ -299,12 +317,9 @@ impl Memory {
                 // (the page's part inside the copy)
                 let at = (page * PAGE).max(start);
                 let end = ((page + 1) * PAGE).min(start + len);
-                if let Some((first, bytes)) = ranges.last_mut()
-                    && *first + *bytes == at
-                {
-                    *bytes = end - *first;
-                } else {
-                    ranges.push((at, end - at));
+                add(ranges, at, end);
+                if self.written.contains(&page) {
+                    add(written, at, end);
                 }
             }
         }
@@ -389,6 +404,31 @@ impl Memory {
         for page in pages {
             self.map(u64::from(page) * PAGE);
         }
+        if victory_shader::emit::memory_marks() {
+            // Pages stores went to since the last look (only mapped pages
+            // are marked): copied back from now on.
+            let mut new = 0u64;
+            let mapped: Vec<(u64, usize)> = self.pages.iter().map(|(&p, &n)| (p, n)).collect();
+            for (page, owner) in mapped {
+                // SAFETY: inside the faults' mapping (`fault_dwords`).
+                let at = unsafe { self.faults.1.add((MEMORY_FAULTS as u64 + page) as usize) };
+                // SAFETY: as above; the GPU may be writing a 1 meanwhile.
+                if unsafe { at.read_volatile() } != 0 {
+                    // SAFETY: as above.
+                    unsafe { at.write_volatile(0) };
+                    if self.written.insert(page) {
+                        self.recalculate.insert(owner);
+                        new += 1;
+                    }
+                }
+            }
+            if new != 0 {
+                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                    tracing::info!(new, written = self.written.len(), mapped = self.pages.len(), "title memory by address: pages shaders stored to (copied back from now on)");
+                }
+            }
+        }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
@@ -397,6 +437,12 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+}
+
+/// The faults buffer: fault notes, then (`memory_marks`) a dword per page.
+fn fault_dwords() -> u64 {
+    let marks = if victory_shader::emit::memory_marks() { MEMORY_PAGES } else { 0 };
+    u64::from(MEMORY_FAULTS) + u64::from(marks)
 }
 
 /// `VICTORY_MEMORY_JOURNAL=0`: directory pages keep their first copy for
@@ -529,11 +575,17 @@ pub(crate) fn ready(
         if !(read || write) {
             continue;
         }
-        for &(start, len) in &m.ranges[n] {
-            if read {
+        if read {
+            for &(start, len) in &m.ranges[n] {
                 shadow.refresh(list, start, len);
             }
-            if write {
+        }
+        if write {
+            // Only pages shaders marked as stored to; a page's first
+            // stores (before the frame's look at the marks) stay on the
+            // card (`memory_marks`).
+            let ranges = if victory_shader::emit::memory_marks() { &m.written_ranges[n] } else { &m.ranges[n] };
+            for &(start, len) in ranges {
                 shadow.gpu_writes(list, start, len);
             }
         }

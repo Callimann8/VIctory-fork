@@ -251,7 +251,7 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at, inside);
         }
-        self.memory(low, high, guard)
+        self.memory(low, high, guard, false)
     }
 
     /// The second 64-byte half of a Box32 node can belong to a different
