@@ -326,13 +326,46 @@ impl Memory {
     /// from memory reads zeros for a frame and notes the fault.
     fn release(&mut self, heap: &HostHeap) {
         let frames = release_frames();
-        let old: Vec<usize> = (0..self.copies.len())
-            .filter(|&n| {
-                self.owned[n] > 0
-                    && self.frame.saturating_sub(self.touched[n]) > frames
-                    && self.copies[n].as_ref().is_some_and(|c| c.is_window())
-            })
-            .collect();
+        let window = |n: usize| self.owned[n] > 0 && self.copies[n].as_ref().is_some_and(|c| c.is_window());
+        let mut old: Vec<usize> = if frames != 0 {
+            (0..self.copies.len())
+                .filter(|&n| window(n) && self.frame.saturating_sub(self.touched[n]) > frames)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Over `VICTORY_MEMORY_BUDGET_MB`: the windows reached longest ago go
+        // too, oldest first, until the rest fit (never one reached in the
+        // last two frames). A busy street held 12.1 GB of windows and the
+        // card's shared memory ran out (run G3).
+        let budget = budget_bytes();
+        if budget != 0 {
+            let size = |n: usize| self.copies[n].as_ref().map_or(0, |c| c.span().1);
+            let gone: BTreeSet<usize> = old.iter().copied().collect();
+            let mut live: u64 = (0..self.copies.len()).filter(|&n| window(n) && !gone.contains(&n)).map(size).sum();
+            if live > budget {
+                let mut aged: Vec<usize> = (0..self.copies.len())
+                    .filter(|&n| window(n) && !gone.contains(&n) && self.frame.saturating_sub(self.touched[n]) >= 2)
+                    .collect();
+                aged.sort_by_key(|&n| self.touched[n]);
+                for n in aged {
+                    if live <= budget {
+                        break;
+                    }
+                    live -= size(n);
+                    old.push(n);
+                }
+                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 30 {
+                    tracing::info!(
+                        live_mb = live >> 20,
+                        budget_mb = budget >> 20,
+                        released = old.len(),
+                        "title memory by address: windows over the budget let go, oldest first"
+                    );
+                }
+            }
+        }
         if old.is_empty() {
             return;
         }
@@ -558,6 +591,15 @@ fn release_frames() -> u64 {
     *N.get_or_init(|| std::env::var("VICTORY_MEMORY_RELEASE_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_MEMORY_BUDGET_MB=N`: numbered windows past N MiB in all are
+/// let go, those reached longest ago first (0, the default: no limit).
+fn budget_bytes() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
 /// `VICTORY_MEMORY_NEXT_CELL=0`: a named address does not also name the
 /// 4 MiB after it.
 fn next_cell() -> bool {
@@ -610,7 +652,7 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
-        if release_frames() != 0 {
+        if release_frames() != 0 || budget_bytes() != 0 {
             m.release(heap);
         }
     }
