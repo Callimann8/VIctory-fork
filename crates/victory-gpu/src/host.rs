@@ -1631,6 +1631,87 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+/// [`CARD_COMPARE`] with a group of 64 threads per piece
+/// (`VICTORY_CARD_WIDE_HASH=1`; off by default): each thread hashes its
+/// sixty-fourth of the piece, and the group's first thread folds the 64
+/// hashes in order. One thread per piece walked its 64 KiB 16 bytes at a
+/// time, 4,096 loads one after the other, so every pass took the time of a
+/// piece however few pieces it had: in the busy area of the GTA 6 build our
+/// send-and-hash and compare lists took 34 ms of the card's ~123 ms a frame
+/// (370-470 hash passes over ~2,100 pieces, ~86 compare passes). The hash
+/// is another function; every stored hash comes from the same shader
+/// (chosen once, at startup), so compares stay consistent. Dispatched with
+/// [`card_groups`] groups.
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    uint p = gid.y * 65535u + gid.x;
+    bool valid = p < pieces;
+    uint piece = first + p;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint chunk = ((hi > lo ? hi - lo : 0u) / 64u + 15u) & ~15u;
+    uint a = min(lo + gi * chunk, hi);
+    uint b = valid ? min(a + chunk, hi) : a;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint at = a; at < b; at += 16u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    part[gi] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0u && valid) {
+        uint4 f = uint4(0x27D4EB2Fu, 0xC2B2AE35u, 0x85EBCA6Bu, 0x9E3779B9u);
+        [loop]
+        for (uint i = 0u; i < 64u; i++) {
+            f = (f ^ part[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            f = f.yzwx ^ (f >> 15);
+        }
+        if (compare != 0u) {
+            differs.Store(out_at + p * 4u, any(f != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            if (compare == 2u) hashes.Store4(piece * 16u, f);
+        } else {
+            hashes.Store4(piece * 16u, f);
+        }
+    }
+}
+"#;
+
+/// Whether [`CARD_COMPARE_WIDE`] is the card's compare (`VICTORY_CARD_WIDE_HASH=1`).
+pub(crate) fn card_wide_hash() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+}
+
+/// The groups a pass of the card's compare over `pieces` pieces is
+/// dispatched with (x, y): 64 pieces a group, or with [`card_wide_hash`] a
+/// group a piece, in rows of 65,535.
+pub(crate) fn card_groups(pieces: u32) -> (u32, u32) {
+    if card_wide_hash() {
+        (pieces.clamp(1, 65535), pieces.div_ceil(65535).max(1))
+    } else {
+        (pieces.div_ceil(64), 1)
+    }
+}
+
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
 /// only with [`relay`]).
@@ -3943,9 +4024,10 @@ impl Host {
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
+            let source = if card_wide_hash() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4263,7 +4345,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_groups(run.pieces);
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     crate::cardmeter::end(list, timed);
@@ -4354,7 +4437,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_groups(r.span.pieces);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
