@@ -336,11 +336,13 @@ static DRAWN: AtomicU64 = AtomicU64::new(0);
 /// [1] windows clamped ([`windows`]), [2] drawn from a window with no clamp
 /// of their own, [3] not windowed for a storing shader, [4] for a count
 /// buffer or more than one record, [5] windows ended by another host list,
-/// [6] misses with a window open (another buffer, kind, or step).
-pub(crate) static WINDOW_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// [6] misses with a window open (another buffer, kind, or step), [7]
+/// clamps hoisted ahead of their list (`crate::indirect::hoisting`), [8]
+/// not hoisted as their list may have written buffers before them.
+pub(crate) static WINDOW_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// The frame-rate line's counts of [`WINDOW_STATS`], reset.
-pub(crate) fn take_window_stats() -> [u64; 7] {
+pub(crate) fn take_window_stats() -> [u64; 9] {
     std::array::from_fn(|i| WINDOW_STATS[i].swap(0, Ordering::Relaxed))
 }
 
@@ -2048,6 +2050,18 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// A draw was recorded: if its shaders store to buffers, it counts as a
+    /// write of the list's ([`HostList::count_write`]).
+    fn note_stores(&self, list: &HostList) {
+        if crate::indirect::hoisting() > 0
+            && list.unwritten()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        {
+            list.count_write();
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
@@ -2097,6 +2111,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2368,6 +2383,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.mesh_scissor(list, false);
+                    self.note_stores(list);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -2767,6 +2783,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.note_stores(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2868,6 +2885,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.note_stores(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2970,6 +2988,29 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Clamped ahead of the list, in a list of their own
+        // (`crate::indirect::hoisting`), while nothing before the draw in
+        // this list may have written its arguments.
+        let hoisted = if crate::indirect::hoisting() > 0 && kind != DISPATCH {
+            if list.unwritten() {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                let b = crate::indirect::bound_hoisted(list, (&args.buffer, args.offset(arguments)), count_arg, (kind, stride, max));
+                if b.is_some() {
+                    WINDOW_STATS[7].fetch_add(1, Ordering::Relaxed);
+                }
+                b
+            } else {
+                WINDOW_STATS[8].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        } else {
+            None
+        };
+        let inline = hoisted.is_none();
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -2977,6 +3018,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && inline
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3008,7 +3050,7 @@ impl State {
         } else if windowed && self.window.is_some() {
             WINDOW_STATS[6].fetch_add(1, Ordering::Relaxed);
         }
-        let (bounded, at) = match hit {
+        let (bounded, at) = match hoisted.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3074,7 +3116,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if inline {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3100,10 +3144,16 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if inline {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            if p.stages.iter().any(|stage| stage.translated().stores) {
+                list.count_write();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

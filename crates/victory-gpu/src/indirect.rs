@@ -404,6 +404,86 @@ fn record_clamp_as(
     true
 }
 
+/// Whether the clamps of indirect draws are recorded in a list of their
+/// own that runs right before the host list (`VICTORY_HOIST_CLAMPS=1`; off
+/// by default), while nothing recorded in the host list before the draw
+/// may have written buffers ([`HostList::unwritten`]).
+///
+/// Each clamp ran as a dispatch of ours between two full barriers, right
+/// before its draw: about 5,200 a frame in the cell (profile of 43d375b),
+/// most of the ~100 ms the card spends on indirect draws. Hoisted, the
+/// clamps run back to back ahead of the list, and the draws follow each
+/// other with nothing of ours between them (the VIctory-Belobug-AMD fork
+/// measured 225 to 72 ms of GPU time a frame with the same idea).
+///
+/// The records are clamped as windows are ([`bound_ahead`]): one that asks
+/// for more than can run is left empty and charges nothing, so the list's
+/// budget is not spent on garbage, and the clamps, which no barrier orders,
+/// cannot run it out in an order that changes from frame to frame.
+/// `VICTORY_HOIST_CLAMPS=2` puts a barrier between the clamps all the same.
+pub(crate) fn hoisting() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// As [`bound`], recorded in the list of `list`'s hoisted clamps
+/// ([`hoisting`]): the buffer and the offset of the clamped records, read
+/// as indirect arguments by `list` once that list ended.
+pub(crate) fn bound_hoisted(
+    list: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, list.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) = unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    // Offsets the shader reaches (32 bits), as in `record_clamp_as`.
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (l, dst, at) = list.hoist_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let ahead = u32::from(count.is_none()) << 1;
+    let constants = [kind, stride, records, args_offset, has_count | ahead, count_offset];
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: the open list of hoisted clamps; our root signature and
+    // pipeline; live source, count, destination (writable: `hoist_room`)
+    // and budget buffers. The clamps write apart and charge the budget
+    // atomically.
+    unsafe {
+        if hoisting() == 2 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+    }
+    Some((dst, at))
+}
+
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {

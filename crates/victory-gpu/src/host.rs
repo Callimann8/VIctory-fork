@@ -794,6 +794,13 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Dispatches, copies and storing draws recorded since the reset: an
+    /// indirect draw is clamped ahead of the list ([`HostList::hoisted`])
+    /// only while none was, as none can have written its arguments.
+    writes: std::sync::atomic::AtomicU64,
+    /// The list that runs the clamps of the list's indirect draws before
+    /// it (`crate::indirect::hoisting`), and where they write.
+    hoist: Mutex<Hoist>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -808,6 +815,26 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// The clamps of a host list's indirect draws, recorded in a list of their
+/// own that runs right before it (`crate::indirect::hoisting`): so that no
+/// dispatch of ours and none of its barriers come between the draws.
+#[derive(Default)]
+struct Hoist {
+    list: Option<Prelude>,
+    /// Recording since the host list's reset (`list` reset and open).
+    open: bool,
+    /// Ended and closed: handed to the submission until the reset.
+    closed: bool,
+    /// Buffers the clamped records go to, with their state.
+    chunks: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    /// Chunks taken since the reset, and the bytes taken of the last one.
+    used: usize,
+    at: u64,
+}
+
+/// The bytes of one chunk of hoisted clamps' records.
+const HOIST_CHUNK: u64 = 256 << 10;
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -3244,6 +3271,8 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                hoist: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4721,6 +4750,9 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            if let Some(clamps) = list.hoisted() {
+                lists.push(Some(clamps));
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -5177,7 +5209,117 @@ impl HostList {
         times
     }
 
+    /// A dispatch, copy or draw that may write buffers was recorded.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether nothing recorded since the reset may have written buffers.
+    pub(crate) fn unwritten(&self) -> bool {
+        self.writes.load(Ordering::Relaxed) == 0
+    }
+
+    /// The list of hoisted clamps, open, and room for `bytes` of clamped
+    /// records in a buffer it may write (buffer, offset): `None` if there
+    /// is none (or `bytes` is more than a chunk).
+    pub(crate) fn hoist_room(&self, bytes: u64) -> Option<(ID3D12GraphicsCommandList, ID3D12Resource, u64)> {
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > HOIST_CHUNK {
+            return None;
+        }
+        let mut hoist = self.hoist.lock().unwrap_or_else(|e| e.into_inner());
+        let hoist = &mut *hoist;
+        if hoist.closed {
+            return None;
+        }
+        if hoist.list.is_none() {
+            hoist.list = host()?.make_prelude();
+        }
+        let (allocator, list) = hoist.list.clone()?;
+        if !hoist.open {
+            // SAFETY: the host list was reset, so this one's last run is
+            // done too; then what earlier lists' shaders wrote comes first.
+            let opened = unsafe {
+                allocator.Reset().and_then(|()| list.Reset(&allocator, None)).map(|()| {
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        ..Default::default()
+                    }]);
+                })
+            };
+            if let Err(e) = opened {
+                tracing::warn!(error = %e, "the list of hoisted indirect clamps did not reset");
+                return None;
+            }
+            (hoist.open, hoist.used, hoist.at) = (true, 0, 0);
+        }
+        if hoist.used > 0 && hoist.at + bytes <= HOIST_CHUNK {
+            let at = hoist.at;
+            hoist.at += bytes;
+            return Some((list, hoist.chunks[hoist.used - 1].0.clone(), at));
+        }
+        if hoist.used == hoist.chunks.len() {
+            let buffer = host()?.uav_buffer(HOIST_CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_string());
+            hoist.chunks.push((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let i = hoist.used;
+        hoist.used += 1;
+        hoist.at = bytes;
+        let (buffer, state) = &mut hoist.chunks[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            // SAFETY: an open list and a live buffer.
+            unsafe { list.ResourceBarrier(&[transition(buffer, *state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]) };
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        Some((list, buffer.clone(), 0))
+    }
+
+    /// Ends the list of hoisted clamps: the records become indirect
+    /// arguments for the host list, and it is closed.
+    fn hoist_end(&self) {
+        let mut hoist = self.hoist.lock().unwrap_or_else(|e| e.into_inner());
+        let hoist = &mut *hoist;
+        if !hoist.open || hoist.closed {
+            return;
+        }
+        let Some((_, list)) = hoist.list.clone() else {
+            return;
+        };
+        let used = hoist.used;
+        let barriers: Vec<_> = hoist.chunks[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                transition(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
+            })
+            .collect();
+        // SAFETY: an open list and live buffers.
+        let closed = unsafe {
+            if !barriers.is_empty() {
+                list.ResourceBarrier(&barriers);
+            }
+            list.Close()
+        };
+        if let Err(e) = closed {
+            fail(format_args!("the list of hoisted indirect clamps did not close ({e})"));
+        }
+        hoist.closed = true;
+    }
+
+    /// At submission: the list of the host list's hoisted clamps, if it has
+    /// one, to run right before it.
+    fn hoisted(&self) -> Option<ID3D12CommandList> {
+        let hoist = self.hoist.lock().unwrap_or_else(|e| e.into_inner());
+        if !hoist.closed {
+            return None;
+        }
+        hoist.list.as_ref().and_then(|(_, list)| list.cast().ok())
+    }
+
     pub(crate) fn close(&self) {
+        self.hoist_end();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5203,6 +5345,11 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.deferred() = Deferred::default();
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut hoist = self.hoist.lock().unwrap_or_else(|e| e.into_inner());
+            (hoist.open, hoist.closed, hoist.used, hoist.at) = (false, false, 0, 0);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6471,8 +6618,8 @@ impl Meter {
         {
             let w = crate::draw::take_window_stats().map(|n| n as f64 / frames);
             tracing::info!(
-                "indirect clamps per frame: {:.0} alone, {:.0} windows; {:.0} draws from a window with no clamp; not windowed: {:.0} storing shaders, {:.0} count buffer or several records; windows ended by another list {:.0}, misses with a window open {:.0} (VICTORY_INDIRECT_WINDOW)",
-                w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+                "indirect clamps per frame: {:.0} alone, {:.0} windows; {:.0} draws from a window with no clamp; not windowed: {:.0} storing shaders, {:.0} count buffer or several records; windows ended by another list {:.0}, misses with a window open {:.0} (VICTORY_INDIRECT_WINDOW); hoisted ahead of their list {:.0}, not hoisted as the list wrote before {:.0} (VICTORY_HOIST_CLAMPS)",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]
             );
         }
         {

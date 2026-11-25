@@ -815,6 +815,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -841,6 +845,10 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -889,6 +897,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     copy_resource(this, dst, src);
 }
 
@@ -914,6 +926,10 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1149,6 +1165,10 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1326,6 +1346,10 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -1381,6 +1405,10 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1992,10 +2020,18 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    if let Some(l) = host_list(this) {
+        l.count_write();
+    }
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
