@@ -90,8 +90,13 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    /// Copy `n` is `copies[n - 1]`; None once let go (`release`).
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// Per copy: the frame something last named, faulted or marked a page
+    /// of it.
+    touched: Vec<u64>,
+    /// Per view heap: every run of copy views it has had (base, length).
+    runs: HashMap<usize, Vec<(u32, u32)>>,
     /// Per host view heap (by address): the first slot of its current run,
     /// the run's length, and how many copies have their view there.
     heaps: HashMap<usize, (u32, u32, u32)>,
@@ -163,6 +168,8 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(fault_dwords(), "faults")?,
             copies: Vec::new(),
+            touched: Vec::new(),
+            runs: HashMap::new(),
             heaps: HashMap::new(),
             numbers: HashMap::new(),
             pages: BTreeMap::new(),
@@ -217,7 +224,8 @@ impl Memory {
             return None;
         }
         self.numbers.insert(shadow.id(), self.copies.len());
-        self.copies.push(shadow.clone());
+        self.copies.push(Some(shadow.clone()));
+        self.touched.push(self.frame);
         self.numbered_by[self.source] += 1;
         if self.copies.len() % 256 == 0 {
             let [view, pair, unit, fault, inside] = self.numbered_by;
@@ -245,6 +253,7 @@ impl Memory {
         let (number, offset) = match mapping {
             Some((n, offset)) => {
                 self.owned[n] += 1;
+                self.touched[n] = self.frame;
                 self.recalculate.insert(n);
                 (n as u32 + 1, offset)
             }
@@ -285,7 +294,7 @@ impl Memory {
         for page in check {
             let old = self.pages[&page];
             let owner = Self::page_owner(page * PAGE);
-            if owner.as_ref().is_some_and(|(s, _)| Arc::ptr_eq(s, &self.copies[old])) {
+            if owner.as_ref().is_some_and(|(s, _)| self.copies[old].as_ref().is_some_and(|c| Arc::ptr_eq(s, c))) {
                 continue;
             }
             if !replaced {
@@ -310,6 +319,52 @@ impl Memory {
         Some(replaced)
     }
 
+    /// Lets go of windows nothing named, faulted or marked for
+    /// `VICTORY_MEMORY_RELEASE_FRAMES` frames: their pages leave the
+    /// directory (a new one), their views in `heap`'s runs become null, and
+    /// the copy can go. A shader that still reads them by a pointer it took
+    /// from memory reads zeros for a frame and notes the fault.
+    fn release(&mut self, heap: &HostHeap) {
+        let frames = release_frames();
+        let old: Vec<usize> = (0..self.copies.len())
+            .filter(|&n| {
+                self.owned[n] > 0
+                    && self.frame.saturating_sub(self.touched[n]) > frames
+                    && self.copies[n].as_ref().is_some_and(|c| c.is_window())
+            })
+            .collect();
+        if old.is_empty() {
+            return;
+        }
+        let Some(next) = Self::table(u64::from(MEMORY_PAGES) * 2, "directory") else { return };
+        // SAFETY: equal-sized tables; the GPU only reads directories.
+        unsafe { std::ptr::copy_nonoverlapping(self.directory.1, next.1, MEMORY_PAGES as usize * 2) };
+        self.directory = next;
+        self.revision += 1;
+        let gone: BTreeSet<usize> = old.iter().copied().collect();
+        let pages: Vec<u64> = self.pages.iter().filter(|(_, n)| gone.contains(n)).map(|(&p, _)| p).collect();
+        for &page in &pages {
+            self.set_page(page, None);
+        }
+        let key = std::ptr::from_ref(heap) as usize;
+        let runs = self.runs.get(&key).cloned().unwrap_or_default();
+        for &n in &old {
+            if let Some(copy) = self.copies[n].take() {
+                self.numbers.remove(&copy.id());
+            }
+            for &(base, slots) in &runs {
+                if (n as u32) + 1 < slots {
+                    heap.null_raw_uav_at(base + 1 + n as u32);
+                }
+            }
+        }
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 30 {
+            let live = self.copies.iter().filter(|c| c.is_some()).count();
+            tracing::info!(released = old.len(), pages = pages.len(), live, "title memory by address: let go of windows nothing reached lately");
+        }
+    }
+
     fn update_ranges(&mut self) {
         fn add(ranges: &mut Vec<(u64, u64)>, at: u64, end: u64) {
             if let Some((first, bytes)) = ranges.last_mut()
@@ -321,10 +376,11 @@ impl Memory {
             }
         }
         for index in std::mem::take(&mut self.recalculate) {
-            let (start, len) = self.copies[index].span();
             let (ranges, written) = (&mut self.ranges[index], &mut self.written_ranges[index]);
             ranges.clear();
             written.clear();
+            let Some(copy) = &self.copies[index] else { continue };
+            let (start, len) = copy.span();
             for (&page, &owner) in self.pages.range(start / PAGE..(start + len).div_ceil(PAGE)) {
                 if owner != index {
                     continue;
@@ -355,7 +411,11 @@ impl Memory {
     fn map(&mut self, address: u64) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
-        if page >= u64::from(MEMORY_PAGES) - 1 || self.pages.contains_key(&page) {
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return;
+        }
+        if let Some(&n) = self.pages.get(&page) {
+            self.touched[n] = self.frame;
             return;
         }
         // A shader's pointer, or a constant taken for an address, may be
@@ -434,6 +494,7 @@ impl Memory {
                 if unsafe { at.read_volatile() } != 0 {
                     // SAFETY: as above.
                     unsafe { at.write_volatile(0) };
+                    self.touched[owner] = self.frame;
                     if self.written.insert(page) {
                         self.recalculate.insert(owner);
                         new += 1;
@@ -475,6 +536,14 @@ impl Source {
 fn unit_constants() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_UNIT_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_MEMORY_RELEASE_FRAMES=N`: numbered windows nothing named,
+/// faulted or marked for N frames are let go (0, the default: kept for the
+/// run).
+fn release_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_MEMORY_RELEASE_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// `VICTORY_MEMORY_NEXT_CELL=0`: a named address does not also name the
@@ -522,6 +591,9 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        if release_frames() != 0 {
+            m.release(heap);
+        }
     }
     let numbered = m.copies.len();
     m.source = Source::VIEW;
@@ -571,6 +643,7 @@ pub(crate) fn ready(
                     tracing::info!(previous = old, slots, "title memory by address: grew the run of copy views");
                 }
                 run = Some((base, slots, 0));
+                m.runs.entry(key).or_default().push((base, slots));
             }
             None if run.is_none() => return None,
             None => {}
@@ -585,6 +658,7 @@ pub(crate) fn ready(
         });
     }
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize).skip(made as usize) {
+        let Some(shadow) = shadow else { continue };
         // The whole resource from its byte 0, as the directory's offsets
         // count; a buffer view holds at most 2^27 elements (D3D12), past
         // which reads give zeros.
@@ -613,6 +687,7 @@ pub(crate) fn ready(
     m.recalculate.clone_from(&changed);
     m.update_ranges();
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
+        let Some(shadow) = shadow else { continue };
         if m.owned[n] == 0 {
             continue;
         }

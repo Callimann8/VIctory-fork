@@ -2241,6 +2241,11 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Whether this is a window of memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
