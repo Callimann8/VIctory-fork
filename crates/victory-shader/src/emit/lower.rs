@@ -262,6 +262,11 @@ struct Lower<'a> {
     /// the group counts its answers, so the whole group takes them together
     /// ([`group_wide_check`]), and whether the entry zeroed it yet.
     group_slot: Option<(u32, bool)>,
+    /// With `group_slot`: the joins where a wave that skipped takes the skip's values
+    /// ([`group_wide_check`]), and per such branch the console wave's own answer (true: to
+    /// its taken side).
+    group_joins: GroupJoins,
+    wave_cond: HashMap<usize, V>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -440,7 +445,12 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
 /// back to the branch (a loop the wave leaves together) is run on by a finished wave with no
 /// lane until the group leaves; the joins after the loop are held to the same rule.
 /// `VICTORY_WAVE_WIDE_GROUP=strict` refuses such loops.
-pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'static str> {
+/// The joins (by block) where scalar values the region changed meet the console's skip, with
+/// each branch (and its region) whose skip comes straight in: a wave whose own answer was to
+/// skip takes the skip's value there (`Lower::fill_phis`).
+pub(super) type GroupJoins = HashMap<usize, Vec<(usize, Vec<bool>)>>;
+
+pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<GroupJoins, &'static str> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -502,14 +512,25 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'sta
             break;
         }
     }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, ts) in succ.iter().enumerate() {
+        for &t in ts {
+            preds[t].push(b);
+        }
+    }
+    let mut out = GroupJoins::new();
     let mut wide: Vec<usize> = st.wide.iter().copied().collect();
     wide.sort_unstable();
     for d in wide {
         let mut seen = vec![false; n];
+        let mut looped = false;
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if b == d && strict {
-                return Err("a group-wide branch around a loop");
+            if b == d {
+                if strict {
+                    return Err("a group-wide branch around a loop");
+                }
+                looped = true;
             }
             if seen[b] || post(d, b) {
                 continue;
@@ -528,6 +549,8 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'sta
                 return Err("a group-wide branch around a scalar store");
             }
         }
+        // one way in: values from before the branch reach every block of the region
+        let single = (0..n).filter(|&b| seen[b]).all(|b| preds[b].iter().all(|&q| q == d || seen[q]));
         // the joins: blocks after the region that a region block (or the branch) leads to
         let joins: HashSet<usize> = (0..n)
             .filter(|&b| seen[b] || b == d)
@@ -542,12 +565,19 @@ pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'sta
                     _ => true,
                 };
                 if !lane_mask && live.contains(&phi.value) && phi.args.iter().any(|&a| a != phi.args[0]) {
-                    return Err("a group-wide branch with scalar values joined after it");
+                    // a skip straight into the join: a wave that skipped takes its value
+                    if looped || !single || !p.blocks[j].preds.contains(&d) {
+                        return Err("a group-wide branch with scalar values joined after it");
+                    }
+                    let list = out.entry(j).or_default();
+                    if !list.iter().any(|(x, _)| *x == d) {
+                        list.push((d, seen.clone()));
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -1690,6 +1720,8 @@ impl<'a> Lower<'a> {
             split_lds,
             lds_meet,
             group_slot,
+            group_joins: if group_slot.is_some() { group_wide_check(p, x.st).unwrap_or_default() } else { GroupJoins::new() },
+            wave_cond: HashMap::new(),
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -4115,7 +4147,15 @@ impl<'a> Lower<'a> {
             let ptr = self.s.m.element(c, lds, k);
             self.s.m.atomic(c, Rmw::Sub, ptr, some);
             let z = self.s.m.i32(0);
-            return Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, count, z));
+            let p = if any { pred::NE } else { pred::EQ };
+            if self.group_joins.values().flatten().any(|(d, _)| *d == b) {
+                // the console wave's own answer too: its two halves exchange theirs
+                let (lo, hi) = self.exchange_halves(c, some);
+                let both = self.s.m.bin(c, Bin::Or, lo, hi);
+                let own = self.s.m.cmp(c, p, both, z);
+                self.wave_cond.insert(b, own);
+            }
+            return Ok(self.s.m.cmp(c, p, count, z));
         }
         // what the halves exchange is "some lane speaks against" either way (for `any`:
         // some lane's `when` holds; else: some lane's does not), so a half with no lane says
@@ -11514,6 +11554,7 @@ impl<'a> Lower<'a> {
                     .iter()
                     .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
             let mut incoming = Vec::new();
+            let mut froms: Vec<usize> = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
@@ -11588,6 +11629,42 @@ impl<'a> Lower<'a> {
                     _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
+                froms.push(q);
+            }
+            // After a branch the group took together: a wave whose own answer was the skip
+            // straight into this join brings the skip's value from the region's side too
+            // (inner branches first, so an outer skip has the last word).
+            if let Some(list) = self.group_joins.get(&b).cloned() {
+                let mut list = list;
+                list.sort_by_key(|(d, _)| std::cmp::Reverse(self.rpo[*d]));
+                for (d, region) in list {
+                    let Some(&own) = self.wave_cond.get(&d) else {
+                        return Err(Stop::Retry(phi.value, "a group-wide join without the wave's own answer"));
+                    };
+                    let Some(at) = froms.iter().position(|&q| q == d) else { continue };
+                    let skip = incoming[at].0;
+                    let to_join = match st.exits[d] {
+                        LaneExit::Branch { taken, .. } => taken == b,
+                        _ => continue,
+                    };
+                    for k in 0..incoming.len() {
+                        let q = froms[k];
+                        if q == d || !region.get(q).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let (x, qb) = incoming[k];
+                        if self.s.m.type_of(x) != self.s.m.type_of(skip) {
+                            return Err(Stop::Retry(phi.value, "a group-wide join of mismatched values"));
+                        }
+                        let skipped = if to_join {
+                            own
+                        } else {
+                            let t = self.s.m.bool(true);
+                            self.s.m.bin(qb, Bin::Xor, own, t)
+                        };
+                        incoming[k].0 = self.s.m.select(qb, skipped, skip, x);
+                    }
+                }
             }
             self.s.m.set_phi(v, incoming);
         }
