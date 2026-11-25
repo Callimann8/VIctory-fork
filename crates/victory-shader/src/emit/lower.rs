@@ -258,6 +258,10 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// A group of several console waves with branches taken wave-wide: the LDS dword where
+    /// the group counts its answers, so the whole group takes them together
+    /// ([`group_wide_check`]), and whether the entry zeroed it yet.
+    group_slot: Option<(u32, bool)>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -424,6 +428,109 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         regions.push((d, seen));
     }
     Some(regions)
+}
+
+/// For a thread group of several console waves (`VICTORY_WAVE_WIDE_GROUP`): whether every
+/// branch taken wave-wide ([`Structured::wide`]) can be taken by the whole group together
+/// instead (`Lower::wave_wide`), so that group barriers inside stay ones every thread meets.
+/// A console wave with no lane for the region then runs it with no lane active, which only
+/// holds where the console's skip and the region leave the same scalar state behind: no
+/// loop, no end of the program and no scalar store inside, and the joins after it bring the
+/// same scalar values (lane masks aside) either way.
+pub(super) fn group_wide_check(p: &Program, st: &Structured) -> Result<(), &'static str> {
+    let n = st.exits.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, e) in st.exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                succ[b].push(taken);
+                succ[b].push(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return Err("a group-wide branch in a program with an indirect exit"),
+        }
+    }
+    let words = n.div_ceil(64);
+    let full = vec![u64::MAX; words];
+    let mut pdom: Vec<Vec<u64>> = (0..n)
+        .map(|b| {
+            if succ[b].is_empty() {
+                let mut v = vec![0; words];
+                v[b / 64] |= 1 << (b % 64);
+                v
+            } else {
+                full.clone()
+            }
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let mut v = full.clone();
+            for &t in &succ[b] {
+                for w in 0..words {
+                    v[w] &= pdom[t][w];
+                }
+            }
+            v[b / 64] |= 1 << (b % 64);
+            if v != pdom[b] {
+                pdom[b] = v;
+                changed = true;
+            }
+        }
+    }
+    let post = |d: usize, b: usize| pdom[d][b / 64] >> (b % 64) & 1 == 1;
+    let mut wide: Vec<usize> = st.wide.iter().copied().collect();
+    wide.sort_unstable();
+    for d in wide {
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = succ[d].clone();
+        while let Some(b) = stack.pop() {
+            if b == d {
+                return Err("a group-wide branch around a loop");
+            }
+            if seen[b] || post(d, b) {
+                continue;
+            }
+            seen[b] = true;
+            stack.extend(succ[b].iter().copied());
+        }
+        for b in (0..n).filter(|&b| seen[b]) {
+            if succ[b].is_empty() {
+                return Err("a group-wide branch around the end of the program");
+            }
+            if p.blocks[b].insts.iter().any(|i| {
+                let name = i.name();
+                matches!(i.fields, Fields::Smem { .. }) && (name.contains("store") || name.contains("atomic"))
+            }) {
+                return Err("a group-wide branch around a scalar store");
+            }
+        }
+        // the joins: blocks after the region that a region block (or the branch) leads to
+        let joins: HashSet<usize> = (0..n)
+            .filter(|&b| seen[b] || b == d)
+            .flat_map(|b| succ[b].iter().copied())
+            .filter(|&j| !seen[j])
+            .collect();
+        for j in joins {
+            for phi in &p.blocks[j].phis {
+                let lane_mask = match phi.reg {
+                    Reg::S(c) => c == EXEC || c == EXEC + 1 || st.phi_masks.contains_key(&phi.value),
+                    Reg::Scc => st.phi_masks.contains_key(&phi.value),
+                    _ => true,
+                };
+                if !lane_mask && phi.args.iter().any(|&a| a != phi.args[0]) {
+                    return Err("a group-wide branch with scalar values joined after it");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -1285,6 +1392,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut group_slot: Option<(u32, bool)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1370,6 +1478,10 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                if group > 64 && !x.st.wide.is_empty() {
+                                    group_slot = Some((s.lds_dwords, false));
+                                    s.lds_dwords += 1;
+                                }
                             }
                         }
                     }
@@ -1560,6 +1672,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            group_slot,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -3951,6 +4064,42 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let mine = self.boolean(when, c)?;
+        if let Some((slot, zeroed)) = self.group_slot {
+            // The whole group takes the branch together ([`group_wide_check`]): every host
+            // wave adds whether one of its lanes speaks against, the group meets, reads the
+            // count, meets again and takes its share back out (the next count is read only
+            // after the group met once more, so every share of this one is out by then).
+            let lds = self.s.lds();
+            let k = self.s.m.i32(slot);
+            if !zeroed {
+                let e = self.s.entry;
+                let ptr = self.s.m.element(e, lds, k);
+                let z = self.s.m.i32(0);
+                self.s.m.store(e, ptr, z);
+                self.group_sync(e);
+                self.group_slot = Some((slot, true));
+            }
+            let set = if any {
+                mine
+            } else {
+                let t = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, mine, t)
+            };
+            let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+            let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
+            self.s.flags |= flags::WAVE_OPS;
+            let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
+            let ptr = self.s.m.element(c, lds, k);
+            self.s.m.atomic(c, Rmw::Add, ptr, some);
+            self.group_sync(c);
+            let ptr = self.s.m.element(c, lds, k);
+            let count = self.s.m.load(c, ptr);
+            self.group_sync(c);
+            let ptr = self.s.m.element(c, lds, k);
+            self.s.m.atomic(c, Rmw::Sub, ptr, some);
+            let z = self.s.m.i32(0);
+            return Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, count, z));
+        }
         // what the halves exchange is "some lane speaks against" either way (for `any`:
         // some lane's `when` holds; else: some lane's does not), so a half with no lane says
         // nothing

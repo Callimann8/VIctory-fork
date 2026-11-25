@@ -570,6 +570,11 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Groups of several console waves take the branches together as a group
+        // (`lower::group_wide_check`); `VICTORY_WAVE_WIDE_GROUP=0`: not tried.
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() % 64 == 0
+                && std::env::var_os("VICTORY_WAVE_WIDE_GROUP").is_none_or(|v| v != "0") => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -581,6 +586,15 @@ fn widen(
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
+        if let crate::native::StageIo::Cs(cs) = native.io
+            && cs.threads.iter().product::<u32>() > 64
+            && let Err(what) = lower::group_wide_check(p, &st)
+        {
+            if why {
+                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: {what}", wide.len());
+            }
+            return Err(ShaderError::Unsupported { offset: 0, what });
+        }
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
