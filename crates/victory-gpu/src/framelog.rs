@@ -405,7 +405,7 @@ fn text(f: &Frame) -> String {
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
-         faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         faults: {:.0} page, {:.0} guard, {} lost guards opened since start | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -454,6 +454,7 @@ fn text(f: &Frame) -> String {
         ms(T::DiskUs),
         s(S_PAGE_FAULTS),
         t(T::GuardFaults),
+        crate::watch::ORPHANS.load(std::sync::atomic::Ordering::Relaxed),
         s(S_PROCESS_USER) / 1e3,
         s(S_PROCESS_KERNEL) / 1e3,
         ms(T::PaceUs),

@@ -1043,6 +1043,19 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // `xmem` maps a view, commits it and only then says so: a copy's
+        // check on another thread in that gap found the block neither clean
+        // nor guarded and made the new view read-only. Forgotten here, that
+        // guard stayed with no one to open it, and the next write there
+        // (a DirectStorage inflate at a scene change, R1i and main run 2)
+        // was an access violation nobody claimed. The view is read-write
+        // again; on a placeholder (an unmapping) this fails harmlessly.
+        if remap_opens() {
+            use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1085,16 +1098,64 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        if orphan_opens() && open_orphan(&mut g, at) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Whether [`title_memory_remapped`] makes the guarded blocks it forgets
+/// read-write again (`VICTORY_GUARD_REMAP_OPEN=0`: only forgets, as before).
+fn remap_opens() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_REMAP_OPEN").is_none_or(|v| v != "0"))
+}
+
+/// Whether a write fault in a read-only view block the guards do not know
+/// is opened (`VICTORY_GUARD_ORPHANS=0`: left to crash, as before).
+fn orphan_opens() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ORPHANS").is_none_or(|v| v != "0"))
+}
+
+/// Write faults taken at read-only view blocks the guards did not know,
+/// since the start.
+pub(crate) static ORPHANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A write fault at `at` in a mapped view, read-only, that no guard holds:
+/// a guard whose bookkeeping was lost (the runtime never makes title views
+/// read-only otherwise; `xmem` maps every view read-write). Opened, and the
+/// block left neither clean nor guarded, so the next check takes it as
+/// written. Called with the guards' lock held.
+fn open_orphan(g: &mut Guards, at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT || info.Type != MEM_MAPPED || info.Protect != PAGE_READONLY {
+        return false;
+    }
+    let block = at / BLOCK;
+    let mut old = 0;
+    // SAFETY: a title view block read-only by a guard of ours; only its
+    // protection changes.
+    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    g.clean.remove(&block);
+    ORPHANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Whether `at` is committed read-write memory now.
