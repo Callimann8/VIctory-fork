@@ -34,8 +34,6 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
-#[cfg(windows)]
-mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
@@ -49,12 +47,14 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
-#[cfg(windows)]
-mod tiles;
 #[cfg(windows)]
 mod watch;
 
