@@ -794,10 +794,13 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
-    /// Dispatches, copies and storing draws recorded since the reset: an
-    /// indirect draw is clamped ahead of the list ([`HostList::hoisted`])
-    /// only while none was, as none can have written its arguments.
+    /// Dispatches, copies and storing draws recorded since the reset.
     writes: std::sync::atomic::AtomicU64,
+    /// Title memory the list's commands so far may write (shader writes as
+    /// declared, copies' destinations), merged (start -> end): an indirect
+    /// draw is clamped ahead of the list ([`HostList::hoisted`]) only if
+    /// its arguments are outside it.
+    written: Mutex<std::collections::BTreeMap<usize, usize>>,
     /// The list that runs the clamps of the list's indirect draws before
     /// it (`crate::indirect::hoisting`), and where they write.
     hoist: Mutex<Hoist>,
@@ -3272,6 +3275,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 writes: std::sync::atomic::AtomicU64::new(0),
+                written: Mutex::default(),
                 hoist: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -5214,9 +5218,36 @@ impl HostList {
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether nothing recorded since the reset may have written buffers.
-    pub(crate) fn unwritten(&self) -> bool {
-        self.writes.load(Ordering::Relaxed) == 0
+    /// The list's commands so far may write `[at, at + len)` of title
+    /// memory.
+    pub(crate) fn note_written(&self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let (mut lo, mut hi) = (at, at.saturating_add(len));
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        // Merged with every range it touches.
+        let touching: Vec<(usize, usize)> = written
+            .range(..=hi)
+            .rev()
+            .take_while(|&(_, &end)| end >= lo)
+            .map(|(&a, &b)| (a, b))
+            .collect();
+        for (a, b) in touching {
+            written.remove(&a);
+            (lo, hi) = (lo.min(a), hi.max(b));
+        }
+        written.insert(lo, hi);
+    }
+
+    /// Whether no command recorded so far may have written any of `ranges`
+    /// of title memory ([`HostList::note_written`]).
+    pub(crate) fn unwritten_at(&self, ranges: &[(usize, usize)]) -> bool {
+        let written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.iter().all(|&(at, len)| {
+            let end = at.saturating_add(len);
+            written.range(..end).next_back().is_none_or(|(_, &e)| e <= at)
+        })
     }
 
     /// The list of hoisted clamps, open, and room for `bytes` of clamped
@@ -5346,6 +5377,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.writes.store(0, Ordering::Relaxed);
+        self.written.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut hoist = self.hoist.lock().unwrap_or_else(|e| e.into_inner());
             (hoist.open, hoist.closed, hoist.used, hoist.at) = (false, false, 0, 0);
@@ -5828,6 +5860,7 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.note_written(address, len);
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));

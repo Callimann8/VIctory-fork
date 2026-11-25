@@ -2054,7 +2054,6 @@ impl State {
     /// write of the list's ([`HostList::count_write`]).
     fn note_stores(&self, list: &HostList) {
         if crate::indirect::hoisting() > 0
-            && list.unwritten()
             && crate::pipeline::host_pipeline(self.pipeline as This)
                 .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
         {
@@ -2992,7 +2991,11 @@ impl State {
         // (`crate::indirect::hoisting`), while nothing before the draw in
         // this list may have written its arguments.
         let hoisted = if crate::indirect::hoisting() > 0 && kind != DISPATCH {
-            if list.unwritten() {
+            let mut ranges = vec![(arguments as usize, len as usize)];
+            if let Some((_, at)) = &counter {
+                ranges.push((*at as usize, 4));
+            }
+            if list.unwritten_at(&ranges) {
                 args.refresh(list, arguments, len);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
