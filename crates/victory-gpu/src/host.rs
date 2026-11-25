@@ -1667,7 +1667,8 @@ void main(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint chunk = ((hi > lo ? hi - lo : 0u) / 64u + 15u) & ~15u;
+    // Every byte of [lo, hi) in some thread's part: 64 parts of a multiple of 16.
+    uint chunk = (((hi > lo ? hi - lo : 0u) + 63u) / 64u + 15u) & ~15u;
     uint a = min(lo + gi * chunk, hi);
     uint b = valid ? min(a + chunk, hi) : a;
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
