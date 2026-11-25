@@ -139,6 +139,27 @@ fn cbv_direct() -> bool {
 /// ([`cbv_direct`]) and copied to upload memory.
 pub(crate) static CBV_TABLE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// `VICTORY_BVH_THREAD_DISPATCH=0`: the builder's thread-counted
+/// `DispatchX` runs that many groups, as before the DexNom port.
+fn thread_dispatch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_THREAD_DISPATCH").is_none_or(|v| v != "0"))
+}
+
+/// The root parameter and dword of a compute pipeline's user-data word of
+/// `kind`, if its shader reads one.
+fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u32, u32)> {
+    let stage = p.stages.first()?;
+    let (param, _) = stage.user_data?;
+    stage
+        .translated()
+        .host
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(kind))
+        .map(|u| (param, u.index))
+}
+
 fn write_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
@@ -803,6 +824,10 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        // Set around a thread-counted builder dispatch (`dispatch`).
+        if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             // Dword 1: how many copies have views for this bind.
             return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
@@ -2071,7 +2096,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2124,8 +2149,28 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // The builder's `DispatchX` with flag 0x20 counts threads (its box
+        // decompression, header and geometry reload passes): as many
+        // groups as hold them, and the count for the last group's guard
+        // (DexNom bc3cd4b). VICTORY_BVH_THREAD_DISPATCH=0: the old way.
+        let builder = crate::pipeline::is_builder(self.pipeline as This);
+        let thread_group = (builder && flags.unwrap_or(0) & 0x20 != 0 && thread_dispatch())
+            .then(|| p.stages[0].translated().compute_threads)
+            .flatten();
+        let threads = [x, y, z];
+        let [x, y, z] = thread_group.map_or(threads, |size| std::array::from_fn(|i| threads[i].div_ceil(size[i])));
+        let tail = thread_group.and_then(|_| compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X));
+        if let Some((param, word)) = tail {
+            // SAFETY: the translated shader declares this root word.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if let Some((param, word)) = tail {
+            // Later dispatches of the pipeline use all lanes.
+            // SAFETY: as above.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 

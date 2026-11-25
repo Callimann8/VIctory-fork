@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, USER_DISPATCH_THREADS_X,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -606,6 +606,12 @@ fn widen(
     }
 }
 
+/// Container digests of XboxBvhBuilder's Box32/Box16 rehydration kernels.
+const BOX_REHYDRATION: [u128; 2] = [
+    0xba30_5538_e28d_414c_af39_a51a_4bc2_f308,
+    0xd635_3bf6_df15_ff8e_c4aa_aec1_0dbf_3974,
+];
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -672,7 +678,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -682,7 +688,29 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    // XboxBvhBuilder's Box32/16 rehydration kernels write one header per
+    // thread the dispatch asks for; their last group can be short
+    // (DexNom bc3cd4b). Where the guard cannot run on this host (a wave64
+    // program a 32-lane host splits with group barriers), the program
+    // runs unguarded, as before.
+    let box_rehydration = BOX_REHYDRATION.contains(&u128::from_be_bytes(c.digest))
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [64, 1, 1]);
+    let guarded = box_rehydration
+        .then(|| lower::lower_with_thread_limit(&parts, true).ok())
+        .flatten()
+        .filter(|l| !(l.wave_size == Some(64) && lower::host_max_wave() == 32));
+    if box_rehydration {
+        eprintln!(
+            "RT builder box rehydration {:032x}: thread-count guard {}",
+            u128::from_be_bytes(c.digest),
+            if guarded.is_some() { "on" } else { "NOT possible on this host (runs unguarded)" }
+        );
+    }
+    let l = match guarded {
+        Some(l) => l,
+        None => lower::lower(&parts)?,
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

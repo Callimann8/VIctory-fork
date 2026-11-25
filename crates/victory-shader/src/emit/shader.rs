@@ -68,6 +68,10 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// 4 and c). The shader adds the dword to every byte offset through that
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
+/// Actual X thread count of a one-dimensional partial dispatch (the RT
+/// builder's `DispatchX` with thread counts). Zero keeps all threads of
+/// every group active. `dword` holds the group's X width.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 pub const USER_VIEW_BIAS: u32 = 0x103;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
