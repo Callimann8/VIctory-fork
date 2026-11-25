@@ -426,7 +426,13 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // `VICTORY_WAVE_WIDE` may also list container digests (hex, a prefix of at
+        // least 8 digits each, comma separated): only those programs take the form.
+        let wide_on = std::env::var("VICTORY_WAVE_WIDE").is_ok_and(|v| {
+            let digest = format!("{:032x}", u128::from_be_bytes(c.digest));
+            v == "1"
+                || v.split(',').map(str::trim).any(|d| d.len() >= 8 && digest.starts_with(&d.to_ascii_lowercase()))
+        });
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
