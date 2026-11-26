@@ -2803,6 +2803,48 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
     fetched.len() as u64
 }
 
+/// `VICTORY_FETCH_JOIN=1`: the pieces a fetch of what shaders wrote to card
+/// copies brings down are copied one copy per run of pieces that follow one
+/// another in one buffer and in the fetch's own buffer, not one per piece
+/// (after DexNom ab34a8b's packed readback). The same bytes land at the
+/// same places; the card's copy queue gets fewer, longer copies.
+fn fetch_join() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_JOIN").is_some_and(|v| v == "1"))
+}
+
+/// Since the start: fetch copies made, and pieces they brought down.
+static FETCH_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The copies (source buffer, source offset, bytes, offset in the fetch's
+/// buffer) that bring down `pieces` (copy, from, to, offset in the fetch's
+/// buffer), joined where [`fetch_join`] allows.
+fn fetch_copies(pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)]) -> Vec<(&ID3D12Resource, u64, u64, u64)> {
+    let join = fetch_join();
+    let mut copies: Vec<(&ID3D12Resource, u64, u64, u64)> = Vec::with_capacity(pieces.len());
+    for (shadow, lo, hi, at) in pieces {
+        let (lo, n) = (*lo as u64, (*hi - *lo) as u64);
+        if join
+            && let Some(last) = copies.last_mut()
+            && std::ptr::eq(last.0, &shadow.buffer)
+            && last.1 + last.2 == lo
+            && last.3 + last.2 == *at
+        {
+            last.2 += n;
+            continue;
+        }
+        copies.push((&shadow.buffer, lo, n, *at));
+    }
+    if join {
+        let n = FETCH_JOINED[0].fetch_add(copies.len() as u64, Ordering::Relaxed) + copies.len() as u64;
+        let p = FETCH_JOINED[1].fetch_add(pieces.len() as u64, Ordering::Relaxed) + pieces.len() as u64;
+        if (n - copies.len() as u64) >> 14 != n >> 14 {
+            tracing::info!(copies = n, pieces = p, "fetches of what shaders wrote to card copies: copies made for pieces, since the start (VICTORY_FETCH_JOIN=1)");
+        }
+    }
+    copies
+}
+
 #[cfg(test)]
 mod relay_tests {
     use super::{fetched_beside, flagged_pieces, landable, note_beside};
@@ -5488,6 +5530,8 @@ impl Host {
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let landed_sent = plans.iter().map(|p| p.1.sent_as).max();
+        // The copies that fetch them (`fetch_copies`).
+        let copies = fetch_copies(&pieces);
         let on_copy = f.copy.clone().filter(|_| landed_sent.is_some());
         let waiting = std::time::Instant::now();
         let ran = if let Some((queue, allocator, list)) = on_copy {
@@ -5498,8 +5542,8 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    for &(source, lo, n, at) in &copies {
+                        list.CopyBufferRegion(&buffer, at, source, lo, n);
                     }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -5524,8 +5568,8 @@ impl Host {
                     // title's either way.
                     let after = second.order_done();
                     let copy = second.down.list()?;
-                    for (shadow, lo, hi, at) in &pieces {
-                        copy.1.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    for &(source, lo, n, at) in &copies {
+                        copy.1.CopyBufferRegion(&buffer, at, source, lo, n);
                     }
                     let job = second.down.send(copy, &[(&self.fence, behind)], total)?;
                     second.down.wait(job, event)?;
@@ -5544,8 +5588,8 @@ impl Host {
                 }
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for &(source, lo, n, at) in &copies {
+                    list.CopyBufferRegion(&buffer, at, source, lo, n);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
