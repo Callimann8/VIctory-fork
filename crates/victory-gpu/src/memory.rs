@@ -828,7 +828,11 @@ pub(crate) fn ready(
     m.update_ranges();
     let now = crate::frame::current();
     let mut refreshed_now = Vec::new();
-    for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
+    // Nothing to bring up or declare for any copy: a later bind of the same
+    // list with no copy new or remapped since (the builder binds hundreds
+    // of times a frame, each walking every numbered copy for nothing).
+    let idle_bind = !first_read && !first_write && !remapped && changed.is_empty() && numbered >= count as usize && made >= count;
+    for (n, shadow) in m.copies.iter().enumerate().take(if idle_bind { 0 } else { count as usize }) {
         let Some(shadow) = shadow else { continue };
         // In place: the title's own bytes; nothing to bring up or copy back.
         if m.owned[n] == 0 || shadow.in_place() {
