@@ -1807,42 +1807,61 @@ fn scatter_table(
     // The last destination dword the current group touches.
     let mut last_word = u64::MAX;
     for (i, &(a, b)) in ranges.iter().enumerate() {
-        // The page from before that holds the whole range, if any.
-        let page = {
-            let at = old_pages.partition_point(|o| o.0 + o.1.len() <= a);
-            old_pages.get(at).filter(|o| o.0 <= a && b <= o.0 + o.1.len()).map(|_| at)
-        };
-        if page.is_none() && b - a >= SCATTER_MIN {
+        // The pages from before this range meets (joined ranges may run
+        // over several of them, or past them).
+        let first = old_pages.partition_point(|o| o.0 + o.1.len() <= a);
+        let meets = old_pages.get(first).is_some_and(|o| o.0 < b);
+        if !meets && b - a >= SCATTER_MIN {
             big.push(i);
             continue;
         }
-        let old = match page {
-            Some(p) => {
-                let base = match old_used.iter().find(|u| u.1 == p) {
+        let src = u32::try_from(src_at(i)).ok()?;
+        u32::try_from(b).ok()?;
+        // In pieces that end on multiples of 256 bytes (long ranges: whole
+        // pages, [`merge_pages`]) and on the pages' ends, so that a piece
+        // lies in one page from before or in none: pieces share no dword,
+        // so each is a group of its own and the card runs them side by
+        // side.
+        let mut p = a;
+        let mut page = first;
+        while p < b {
+            while old_pages.get(page).is_some_and(|o| o.0 + o.1.len() <= p) {
+                page += 1;
+            }
+            let o = old_pages.get(page);
+            let inside = o.is_some_and(|o| o.0 <= p);
+            let mut q = b;
+            if b - a >= SCATTER_MIN {
+                q = q.min((p / SCATTER_MIN + 1) * SCATTER_MIN);
+            }
+            if let Some(o) = o {
+                q = q.min(if inside { o.0 + o.1.len() } else { o.0 });
+            }
+            let old = if inside {
+                let base = match old_used.iter().find(|u| u.1 == page) {
                     Some(u) => u.0,
                     None => {
                         let base = old_bytes;
-                        old_used.push((base, p));
-                        old_bytes += old_pages[p].1.len().next_multiple_of(4);
+                        old_used.push((base, page));
+                        old_bytes += old_pages[page].1.len().next_multiple_of(4);
                         base
                     }
                 };
-                Some(base + (a - old_pages[p].0))
+                Some(base + (p - old_pages[page].0))
+            } else {
+                None
+            };
+            let first_word = (p / 4) as u64;
+            let index = entries.len() as u32;
+            // Fixed up below: an offset in the area of bytes from before.
+            entries.push([src + (p - a) as u32, p as u32, (q - p) as u32, old.map_or(u32::MAX, |o| o as u32)]);
+            match groups.last_mut() {
+                Some(g) if last_word != u64::MAX && first_word <= last_word => g[1] += 1,
+                _ => groups.push([index, 1]),
             }
-            None => None,
-        };
-        let src = u32::try_from(src_at(i)).ok()?;
-        let (d, n) = (u32::try_from(a).ok()?, u32::try_from(b - a).ok()?);
-        u32::try_from(b).ok()?;
-        let first_word = (a / 4) as u64;
-        let index = entries.len() as u32;
-        // Fixed up below: an offset in the area of bytes from before.
-        entries.push([src, d, n, old.map_or(u32::MAX, |o| o as u32)]);
-        match groups.last_mut() {
-            Some(g) if last_word != u64::MAX && first_word <= last_word => g[1] += 1,
-            _ => groups.push([index, 1]),
+            last_word = ((q - 1) / 4) as u64;
+            p = q;
         }
-        last_word = ((b - 1) / 4) as u64;
     }
     let entries_at = (groups.len() * 8).next_multiple_of(16);
     let old_at = entries_at + entries.len() * 16;
@@ -3319,9 +3338,11 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 /// `VICTORY_SYNC_SNAPSHOT=1`: changed bytes of copies in the card's memory go
 /// up from a per-submission snapshot, not from the CPU side at the time the
 /// card runs the copy (which later merges may have changed already).
-fn sync_snapshot() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_SNAPSHOT").is_some_and(|v| v == "1"))
+/// `2`: only the ranges the scatter pass takes (short ones, and those in
+/// pages merged under flights), which later merges change.
+fn sync_snapshot() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SYNC_SNAPSHOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// Bytes put in [`sync_snapshot`] buffers since the last frame-rate line.
@@ -3348,6 +3369,15 @@ fn merge_runs() -> usize {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(if merge_scatter() { usize::MAX } else { 512 })
     })
+}
+
+/// `VICTORY_MERGE_PAGES=1` (with [`merge_scatter`]): a page changed under
+/// shader writes goes up whole with its bytes from before instead of as
+/// its changed runs (hundreds to 16,000 a page, each a range to handle on
+/// the CPU); the scatter pass compares per dword on the card.
+pub(crate) fn merge_pages() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| merge_scatter() && std::env::var_os("VICTORY_MERGE_PAGES").is_some_and(|v| v == "1"))
 }
 
 /// Most changed runs one page may have to be merged under shader writes
@@ -3854,7 +3884,7 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
-    if sync_snapshot() {
+    if sync_snapshot() > 0 {
         tracing::info!(
             "card sync snapshot per frame (VICTORY_SYNC_SNAPSHOT=1): {:.2} MB",
             SNAPSHOT_BYTES.swap(0, Ordering::Relaxed) as f64 / frames / (1 << 20) as f64
@@ -4640,12 +4670,50 @@ impl Host {
         // of this submission's own, so that its copies to the card take the
         // bytes as they are now, not as the CPU side holds them when the
         // card gets to them behind the flights.
+        // The pages from before of each copy's merges under flights
+        // (`Shadow::card_old_pages`), taken once.
+        let olds: Vec<Vec<(usize, Vec<u8>)>> = dirty.iter().map(|(shadow, _)| shadow.card_old_pages()).collect();
+        // Per copy and range: where its bytes are in `landed`; `None`: on
+        // the CPU side at the range's own offset. The copy queue's landing
+        // buffer packs every range in order.
+        let mut packed_at: Vec<Vec<Option<u64>>> = {
+            let mut at = 0u64;
+            dirty
+                .iter()
+                .map(|(_, ranges)| {
+                    ranges
+                        .iter()
+                        .map(|&(a, b)| {
+                            let here = at;
+                            at += (b - a) as u64;
+                            landed.is_some().then_some(here)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
         let mut snapshot_used: Option<(ID3D12Resource, usize, u64)> = None;
-        if landed.is_none() && sync_snapshot() && dirty.iter().all(|(shadow, _)| shadow.carded()) {
-            let bytes: u64 = dirty.iter().flat_map(|(_, ranges)| ranges.iter().map(|&(a, b)| (b - a) as u64)).sum();
-            if bytes > 0 {
-                let found = work.scatter_tables.iter().position(|t| t.2 >= bytes);
-                let buffer = match found {
+        if landed.is_none() && sync_snapshot() > 0 && dirty.iter().all(|(shadow, _)| shadow.carded()) {
+            // Which ranges: all (1), or (2) those the scatter pass takes
+            // (short, or in a page merged under flights): the bytes that
+            // later merges change while the card has not got to them.
+            let all = sync_snapshot() == 1;
+            let takes = |i: usize, a: usize, b: usize| {
+                all || (merge_scatter() && (b - a < SCATTER_MIN || olds[i].iter().any(|o| o.0 < b && a < o.0 + o.1.len())))
+            };
+            let mut bytes = 0u64;
+            for (i, (_, ranges)) in dirty.iter().enumerate() {
+                for (j, &(a, b)) in ranges.iter().enumerate() {
+                    if takes(i, a, b) {
+                        packed_at[i][j] = Some(bytes);
+                        bytes += (b - a) as u64;
+                    }
+                }
+            }
+            let buffer = if bytes == 0 {
+                None
+            } else {
+                match work.scatter_tables.iter().position(|t| t.2 >= bytes) {
                     Some(i) => Some(work.scatter_tables.swap_remove(i)),
                     None => {
                         let size = bytes.next_power_of_two().max(1 << 16);
@@ -4654,23 +4722,27 @@ impl Host {
                             (buffer, data as usize, size)
                         })
                     }
-                };
-                if let Some(buffer) = buffer {
-                    let mut at = 0usize;
-                    for (shadow, ranges) in &dirty {
-                        for &(a, b) in ranges {
-                            // SAFETY: the mapping holds `buffer.2 >= bytes`
-                            // bytes and no list reads it (given back by a
-                            // plan whose submission has run, or new); the
-                            // range lies in the copy's CPU side.
-                            unsafe { shadow.card_cpu_copy(a, b, (buffer.1 + at) as *mut u8) };
-                            at += b - a;
+                }
+            };
+            match buffer {
+                Some(buffer) => {
+                    for (i, (shadow, ranges)) in dirty.iter().enumerate() {
+                        for (j, &(a, b)) in ranges.iter().enumerate() {
+                            if let Some(at) = packed_at[i][j] {
+                                // SAFETY: the mapping holds `buffer.2 >=
+                                // bytes` bytes and no list reads it (given
+                                // back by a plan whose submission has run,
+                                // or new); the range lies in the copy's CPU
+                                // side.
+                                unsafe { shadow.card_cpu_copy(a, b, (buffer.1 + at as usize) as *mut u8) };
+                            }
                         }
                     }
                     SNAPSHOT_BYTES.fetch_add(bytes, Ordering::Relaxed);
                     landed = Some(buffer.0.clone());
                     snapshot_used = Some(buffer);
                 }
+                None => packed_at.iter_mut().flatten().for_each(|o| *o = None),
             }
         }
         // With [`merge_scatter`]: per copy, the table of its small ranges
@@ -4680,13 +4752,11 @@ impl Host {
         let mut tables_used: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
         let scatters: Vec<Option<(ID3D12Resource, u32, u32, Vec<usize>)>> = {
             const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
-            let mut at = 0u64;
             dirty
                 .iter()
-                .map(|(shadow, ranges)| {
-                    let base = at;
-                    at += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
-                    let old_pages = shadow.card_old_pages();
+                .enumerate()
+                .map(|(i, (shadow, ranges))| {
+                    let old_pages = &olds[i];
                     if work.scatter.is_none() || !shadow.carded() || (old_pages.is_empty() && ranges.iter().all(|&(a, b)| b - a >= SCATTER_MIN)) {
                         return None;
                     }
@@ -4694,15 +4764,11 @@ impl Host {
                     if unsafe { shadow.buffer.GetDesc() }.Flags.0 & UNORDERED == 0 {
                         return None;
                     }
-                    // Where each range's bytes are: the landing buffer packs
-                    // them in order, else the CPU side at the same offset.
-                    let mut offsets = Vec::with_capacity(ranges.len());
-                    let mut packed = base;
-                    for &(a, b) in ranges {
-                        offsets.push(if landed.is_some() { packed } else { a as u64 });
-                        packed += (b - a) as u64;
-                    }
-                    let (table, groups, entries_at, big) = scatter_table(ranges, |i| offsets[i], &old_pages)?;
+                    // Where each range's bytes are (`packed_at`): the
+                    // ranges the pass takes are all in `landed` if it is
+                    // there, else all on the CPU side at their own offset.
+                    let offsets: Vec<u64> = ranges.iter().zip(&packed_at[i]).map(|(&(a, _), at)| at.unwrap_or(a as u64)).collect();
+                    let (table, groups, entries_at, big) = scatter_table(ranges, |i| offsets[i], old_pages)?;
                     let bytes = (table.len() * 4) as u64;
                     let found = work.scatter_tables.iter().position(|t| t.2 >= bytes);
                     let buffer = match found {
@@ -4742,9 +4808,7 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     #[cfg(feature = "diagnostics")]
                     let shot_span = crate::shot::span_begin(list);
-                    // Where the next range lies in the landing buffer.
-                    let mut at = 0u64;
-                    for ((shadow, ranges), scatter) in dirty.iter().zip(&scatters) {
+                    for (((shadow, ranges), scatter), packed) in dirty.iter().zip(&scatters).zip(&packed_at) {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -4758,13 +4822,12 @@ impl Host {
                                 None => true,
                             };
                             if take {
-                                match &landed {
-                                    Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
-                                    None => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
+                                match (&landed, packed[i]) {
+                                    (Some(landing), Some(at)) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
+                                    _ => list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64),
                                 }
                                 copied = true;
                             }
-                            at += (b - a) as u64;
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);

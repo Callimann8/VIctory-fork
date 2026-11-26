@@ -3213,6 +3213,29 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // With `crate::host::merge_pages`: the page goes up whole
+                    // with its bytes from before; the scatter pass puts in
+                    // each byte where the card still holds those, the same
+                    // as the changed runs would (unchanged bytes are equal
+                    // anyway), without finding the runs.
+                    if crate::host::merge_pages()
+                        && let Some(card) = &self.card
+                    {
+                        if title[..] == held[..] {
+                            continue;
+                        }
+                        {
+                            let mut old = card.old_pages.lock().unwrap_or_else(|e| e.into_inner());
+                            if !old.iter().any(|(o, b)| *o <= at && at + n <= *o + b.len()) {
+                                old.push((at, held.to_vec()));
+                            }
+                        }
+                        held.copy_from_slice(title);
+                        self.card_changed(at, at + n);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(n as u64, Ordering::Relaxed);
+                        continue;
+                    }
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     // The page as the card got it, for the scatter pass:
                     // the first time in this submission only.
