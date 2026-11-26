@@ -3532,6 +3532,16 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
+    /// Copies the CPU side's bytes at offsets `[from, to)` to `out`.
+    ///
+    /// # Safety
+    /// `out` holds `to - from` writable bytes; `to` lies in the copy.
+    pub(crate) unsafe fn card_cpu_copy(&self, from: usize, to: usize, out: *mut u8) {
+        debug_assert!(from <= to && to as u64 <= self.len as u64);
+        // SAFETY: inside the mapping of the copy's CPU side (caller).
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(from), out, to - from) };
+    }
+
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();

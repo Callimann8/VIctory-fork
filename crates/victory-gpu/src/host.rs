@@ -3316,6 +3316,17 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 /// under shader writes, wait only until no flight in the air may still
 /// write the stale spans, ask again and look again (three times), and only
 /// then settle everything as before.
+/// `VICTORY_SYNC_SNAPSHOT=1`: changed bytes of copies in the card's memory go
+/// up from a per-submission snapshot, not from the CPU side at the time the
+/// card runs the copy (which later merges may have changed already).
+fn sync_snapshot() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_SNAPSHOT").is_some_and(|v| v == "1"))
+}
+
+/// Bytes put in [`sync_snapshot`] buffers since the last frame-rate line.
+static SNAPSHOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static SETTLE_STALE_SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn settle_stale_on() -> bool {
@@ -3841,6 +3852,12 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+    }
+    if sync_snapshot() {
+        tracing::info!(
+            "card sync snapshot per frame (VICTORY_SYNC_SNAPSHOT=1): {:.2} MB",
+            SNAPSHOT_BYTES.swap(0, Ordering::Relaxed) as f64 / frames / (1 << 20) as f64
         );
     }
     if settle_stale_on() {
@@ -4619,6 +4636,43 @@ impl Host {
                 landed = Some(landing);
             }
         }
+        // With [`sync_snapshot`]: the changed bytes copied now into a buffer
+        // of this submission's own, so that its copies to the card take the
+        // bytes as they are now, not as the CPU side holds them when the
+        // card gets to them behind the flights.
+        let mut snapshot_used: Option<(ID3D12Resource, usize, u64)> = None;
+        if landed.is_none() && sync_snapshot() && dirty.iter().all(|(shadow, _)| shadow.carded()) {
+            let bytes: u64 = dirty.iter().flat_map(|(_, ranges)| ranges.iter().map(|&(a, b)| (b - a) as u64)).sum();
+            if bytes > 0 {
+                let found = work.scatter_tables.iter().position(|t| t.2 >= bytes);
+                let buffer = match found {
+                    Some(i) => Some(work.scatter_tables.swap_remove(i)),
+                    None => {
+                        let size = bytes.next_power_of_two().max(1 << 16);
+                        self.shared_buffer(size).map(|(buffer, data)| {
+                            name(&buffer, || "card sync snapshot".into());
+                            (buffer, data as usize, size)
+                        })
+                    }
+                };
+                if let Some(buffer) = buffer {
+                    let mut at = 0usize;
+                    for (shadow, ranges) in &dirty {
+                        for &(a, b) in ranges {
+                            // SAFETY: the mapping holds `buffer.2 >= bytes`
+                            // bytes and no list reads it (given back by a
+                            // plan whose submission has run, or new); the
+                            // range lies in the copy's CPU side.
+                            unsafe { shadow.card_cpu_copy(a, b, (buffer.1 + at) as *mut u8) };
+                            at += b - a;
+                        }
+                    }
+                    SNAPSHOT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                    landed = Some(buffer.0.clone());
+                    snapshot_used = Some(buffer);
+                }
+            }
+        }
         // With [`merge_scatter`]: per copy, the table of its small ranges
         // for [`CARD_SCATTER`] (in a buffer of PC memory, its group count,
         // where its entries start) and the indices of the ranges that stay
@@ -4796,7 +4850,7 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
-            scatter_tables: tables_used,
+            scatter_tables: tables_used.into_iter().chain(snapshot_used).collect(),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
