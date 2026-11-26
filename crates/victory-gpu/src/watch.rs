@@ -1528,6 +1528,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
+    let mut watched: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
@@ -1575,6 +1576,19 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
                 }
             }
         }
+        if open && !g.demoted.is_empty() && !g.protected.contains(&block) && g.demoted.contains(&(block / CELL_BLOCKS)) {
+            // A cell [`private_fault`] sent back to the write watch, inside
+            // a range the guards answer: the watch is asked for it, and it
+            // is not guarded again (which would undo the sending back).
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            watched.get_or_insert(block);
+            continue;
+        }
+        if let Some(from) = watched.take() {
+            watch_blocks(from, block, &mut written);
+        }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -1590,6 +1604,33 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
         }
     }
     Some(written)
+}
+
+/// The pages of blocks `[from, to)` the write watch saw written since its
+/// last asking (reset now), added to `written`; all of them if it cannot
+/// say.
+fn watch_blocks(from: usize, to: usize, written: &mut Vec<usize>) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (to - from) * BLOCK / KERNEL_PAGE;
+    let mut found = vec![0usize; count];
+    let mut granularity = 0;
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(WRITE_WATCH_FLAG_RESET, (from * BLOCK) as *const _, (to - from) * BLOCK, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+    } != 0;
+    if failed {
+        written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
+        return;
+    }
+    let mut last = usize::MAX;
+    for &at in &found[..count] {
+        let page = at / PAGE;
+        if page != last {
+            written.push(page);
+            last = page;
+        }
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
