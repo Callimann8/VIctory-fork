@@ -874,13 +874,17 @@ fn private_demote(g: &mut Guards, cell: usize) {
     // Only the blocks taken: views and other memory sharing the cell keep
     // their guards.
     let taken: Vec<usize> = g.private.range(cell * CELL_BLOCKS..(cell + 1) * CELL_BLOCKS).copied().collect();
+    // (counted only where something was taken: `kernel_writing` also marks
+    // cells nothing was taken in yet)
+    if !taken.is_empty() {
+        PRIVATE_COUNT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     for b in taken {
         g.private.remove(&b);
         g.viewed.remove(&b);
         g.back.insert(b);
         open_here(g, b * BLOCK, (b + 1) * BLOCK);
     }
-    PRIVATE_COUNT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 struct Guards {
@@ -1910,13 +1914,14 @@ pub fn writing(at: usize, len: usize) {
 /// writes, the guards do not). View memory is as before.
 pub fn kernel_writing(at: usize, len: usize) {
     if private_on() && len != 0 {
+        // Every cell under the destination, also one with no block taken
+        // yet: a guard_private on another thread between this and the
+        // kernel's write (or before an overlapped read lands) must not take
+        // a block of it (it skips demoted cells).
         let mut g = guards();
-        if !g.private.is_empty() {
-            let end = at.saturating_add(len);
-            let cells: BTreeSet<usize> = g.private.range(at / BLOCK..end.div_ceil(BLOCK)).map(|&b| b / CELL_BLOCKS).collect();
-            for cell in cells {
-                private_demote(&mut g, cell);
-            }
+        let end = at.saturating_add(len);
+        for cell in at / BLOCK / CELL_BLOCKS..end.div_ceil(BLOCK).div_ceil(CELL_BLOCKS) {
+            private_demote(&mut g, cell);
         }
     }
     writing(at, len);
