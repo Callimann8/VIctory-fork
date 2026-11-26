@@ -22,7 +22,7 @@
 
     # Data folders holding the real save. Never used by a run; checked after
     # every run, and the plan stops if anything in them changed.
-    RealDataDirs = @('C:\xcl\data-new', '%LOCALAPPDATA%\victory\data')
+    RealDataDirs = @('C:\xcl\victory-data\data-new', 'C:\xcl\data-new', '%LOCALAPPDATA%\victory\data')
 
     # Where the launcher's own log may be, if it does not print to its window.
     LogSearch = @('C:\xcl\runs')
