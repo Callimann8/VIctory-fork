@@ -47,6 +47,8 @@
         @{ Name = 'R11'; Seconds = 120;   Build = 'test'; Use = 'best', 'R11'; Try = $true }   # Belobug per-draw CPU savings
         @{ Name = 'W0'; Seconds = 120;    Build = 'test'; Use = 'best', 'W0' }               # PREP_WIDE=serial, compared only ("prepared in stretches" estimate)
         @{ Name = 'W1'; Seconds = 240;    Build = 'test'; Use = 'best', 'W1'; Try = $true }  # PREP_WIDE=1 on helper threads; picture must match
+        @{ Name = 'WT'; Seconds = 120; Build = 'test'; Use = 'best', 'WT'; Try = $true }   # 12 helper threads (yuriko)
+        @{ Name = 'TL'; Seconds = 120; Build = 'test'; Use = 'best', 'TL' }   # RT builder thread limit (fxceless PR #1292), own warm-up; compared only, picture (RT shadows/reflections) must match or improve
         @{ Name = 'TRACER'; Seconds = 120; Build = 'test'; Use = 'best', 'TRACER' }           # own warm-up; the real test (WAVE_WIDE without b5b83854) is set up by hand
         @{ Name = 'G2'; Seconds = 120;    Build = 'test'; Use = 'best', 'G2' }               # LDS_PRUNE, own warm-up; compared only, picture must match (GPU thread)
         @{ Name = 'BUSY'; Seconds = 120;  Build = 'test'; Use = 'best', 'BUSY'; Prompt = 'Walk out of the cell into the crowded area' }

@@ -41,7 +41,12 @@
     NoisyLimits = @{ VideoPct = 1.0; GpuPct = 4.0; CpuPct = 5.0 }
 
     # Switches the shader translator reads: a run that sets one gets its own warm-up.
-    ShaderSwitches = @('VICTORY_CODE_TABLE_AFTER', 'VICTORY_TRACER_GUARDS', 'VICTORY_LDS_PRUNE')
+    # (every VICTORY_* the translator in crates/victory-shader reads, as of usi0eu 7f5a49c, minus debug-only ones)
+    ShaderSwitches = @('VICTORY_CODE_TABLE_AFTER', 'VICTORY_TRACER_GUARDS', 'VICTORY_LDS_PRUNE', 'VICTORY_THREAD_LIMIT',
+        'VICTORY_WAVE_WIDE', 'VICTORY_WAVE_WIDE_GROUP', 'VICTORY_WAVE_LOCAL', 'VICTORY_WAVE_OWN_BITS', 'VICTORY_WAVE_DEEP_SKIPS',
+        'VICTORY_MEMORY_MARKS', 'VICTORY_MEMORY_READ_MARKS', 'VICTORY_GROUP_SYNC', 'VICTORY_SHADER_OPT', 'VICTORY_SHADER_LOOP_LIMIT',
+        'VICTORY_LDS_BORROW', 'VICTORY_FIRSTLANE_OWN', 'VICTORY_FIRST_HALF', 'VICTORY_F16_NEAREST', 'VICTORY_STRICT_JOINS',
+        'VICTORY_MESH_OUTPUT_STRICT', 'VICTORY_BVH_BUILDER', 'VICTORY_BVH_GUARD_SPLIT', 'VICTORY_BVH_NO_HIT')
 
     # Key presses to get from the title screen into the save, if a run needs
     # them (SendKeys syntax), e.g. @(@{ AfterSeconds = 90; Keys = '{ENTER}' }).
