@@ -273,6 +273,7 @@ impl Lane {
             }
             self.stats.jobs.fetch_add(1, Ordering::Relaxed);
             self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+            crate::switchmap::act(crate::switchmap::S::Queue2, bytes);
             Ok(job)
         }
     }

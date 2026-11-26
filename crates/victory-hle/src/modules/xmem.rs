@@ -177,11 +177,17 @@ fn virtual_alloc(
             constrained.into(),
         )
     };
+    if at.is_null() && !constrained && kind & MEM_WRITE_WATCH != 0 && watch_fixed() && !base.is_null() {
+        victory_gpu::switchmap::refuse(victory_gpu::switchmap::S::WatchFixed, "write-watched reservation refused by Windows");
+    }
     let at = if at.is_null() && !constrained && kind & MEM_WRITE_WATCH != 0 {
         // SAFETY: as above, without the watch (`VICTORY_WATCH_FIXED=1`).
         unsafe { VirtualAlloc2(GetCurrentProcess(), base, size, kind & !MEM_WRITE_WATCH, protect, std::ptr::null_mut(), 0) }
     } else {
         if !at.is_null() && !constrained && kind & MEM_WRITE_WATCH != 0 {
+            if watch_fixed() && !base.is_null() {
+                victory_gpu::switchmap::act(victory_gpu::switchmap::S::WatchFixed, size as u64);
+            }
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -499,6 +505,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         if handle.is_null() && committed && !on_wine() {
             let error = std::io::Error::last_os_error();
             tracing::warn!(n, %error, "the page pool could not be committed whole (VICTORY_POOL_COMMIT=1): reserved as usual");
+            victory_gpu::switchmap::refuse(victory_gpu::switchmap::S::PoolCommit, "pool could not be committed whole");
             committed = false;
             handle = create(bytes, false);
         }
@@ -881,6 +888,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
             if mapped.is_null() {
                 return 0;
             }
+            if run > 1 {
+                victory_gpu::switchmap::act(victory_gpu::switchmap::S::MapRuns, run as u64 - 1);
+            }
             i += run;
         }
         return 1;
@@ -952,6 +962,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
         if !map(&mut physical, to + k, run * PAGE, slice) {
             return false;
+        }
+        if runs && run > 1 {
+            victory_gpu::switchmap::act(victory_gpu::switchmap::S::MapRuns, run as u64 - 1);
         }
         k += run * PAGE;
     }
@@ -1106,6 +1119,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         // the rest only loses its guards (the new view is read-write).
         let (cut_from, cut_to) = (at.max(base), (at + size).min(end));
         if remap_keep() {
+            victory_gpu::switchmap::act(victory_gpu::switchmap::S::RemapKeep, (size - (cut_to - cut_from)) as u64);
             victory_gpu::title_memory_remapped(cut_from, cut_to - cut_from);
             if at < cut_from {
                 victory_gpu::title_memory_reshown(at, cut_from - at);

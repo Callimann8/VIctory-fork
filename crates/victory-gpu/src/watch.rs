@@ -448,6 +448,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // the answer, with the guards' lock not taken and no kernel call.
     if guarded && light == 2 && published(j, first * PAGE, last * PAGE) {
         LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::switchmap::act(crate::switchmap::S::LightRefresh, 0);
         j.asked += 1;
         return Some((
             j.asked,
@@ -523,6 +524,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // on (the journal's lock is still held: no other asking came between).
     if failed && light != 0 {
         LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::switchmap::amount(crate::switchmap::S::LightRefresh, 1);
         publish(j, &pages, first * PAGE, last * PAGE, told());
     }
     Some((
@@ -1416,6 +1418,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
     if same && by_bits {
         LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::switchmap::act(crate::switchmap::S::LightRefresh, 0);
     }
     same
 }
@@ -1584,12 +1587,14 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
             let noted = life != 0 && g.verified.get(&block).is_some_and(|&at| now < at.saturating_add(life));
             if noted {
                 ABSENT_LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::switchmap::act(crate::switchmap::S::AbsentOnce, 0);
                 open = false;
             } else {
                 // Ordinary commits need no runtime mapping notification. Reuse
                 // this asking's query for the following blocks in the same region.
                 if block >= uncommitted_until {
                     ABSENT_LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::switchmap::amount(crate::switchmap::S::AbsentOnce, 1);
                     uncommitted_until = uncommitted_end(block);
                 }
                 open = block >= uncommitted_until;

@@ -232,6 +232,9 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
             .unwrap_or(0)
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
+    if floor > u64::from(size) {
+        victory_gpu::switchmap::act(victory_gpu::switchmap::S::DstorageStaging, floor - u64::from(size));
+    }
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size).max(floor);
     }

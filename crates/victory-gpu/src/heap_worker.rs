@@ -161,6 +161,7 @@ impl Batch {
         let left = list.refresh_textures_ahead();
         STATS[1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
         STATS[5].fetch_add(left, Relaxed);
+        crate::switchmap::act(crate::switchmap::S::HeapWorker, started.elapsed().as_micros() as u64);
         list.close();
         let heap = HeldHeap::new(crate::descriptor::heap(self.heap));
         lock(&READY).push(Ready { list, publish, _heap: heap });

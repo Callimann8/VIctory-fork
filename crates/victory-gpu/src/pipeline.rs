@@ -201,6 +201,19 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     if let Some(n) = form.split("lds-pruned=").nth(1).and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u64>().ok()) {
         crate::switchmap::act(crate::switchmap::S::LdsPrune, n);
     }
+    // Shader-crate switches without counts of their own: each shader the run
+    // takes up while one is set (the translation, fresh or from the cache,
+    // was made with it: the switches are in the cache key).
+    {
+        static ON: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        let on = ON.get_or_init(|| ["VICTORY_TRACER_GUARDS", "VICTORY_CODE_TABLE_AFTER"].map(|k| std::env::var_os(k).is_some_and(|v| v == "1")));
+        if on[0] {
+            crate::switchmap::act(crate::switchmap::S::TracerGuards, 0);
+        }
+        if on[1] {
+            crate::switchmap::act(crate::switchmap::S::CodeTableAfter, 0);
+        }
+    }
     let stores = programs.is_empty() || programs.iter().any(stores);
     let compute_threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),

@@ -2133,6 +2133,9 @@ pub(crate) fn card_compare_source() -> &'static str {
 
 /// The groups a compare pass over `pieces` pieces is dispatched with.
 pub(crate) fn card_compare_groups(pieces: u32) -> u32 {
+    if card_hash_wide() {
+        crate::switchmap::act(crate::switchmap::S::CardHashWide, u64::from(pieces) << 16);
+    }
     if card_hash_wide() { pieces } else { pieces.div_ceil(64) }
 }
 
@@ -3437,6 +3440,7 @@ mod fill_ahead {
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
             if pieces() {
+                crate::switchmap::act(crate::switchmap::S::FillWaitPieces, 0);
                 let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
                 let before = hot.len();
                 hot.extend(from / PIECE..=(to - 1) / PIECE);
@@ -3836,6 +3840,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     if step_index() {
+        crate::switchmap::act(crate::switchmap::S::StepIndex, 0);
         // By copy (its address): its place in `spans`, or that no shader's
         // writes are pending on it. Asked once a copy, not once a step
         // (20,000 to 43,000 refresh steps a frame, each a lock and a search
@@ -5280,6 +5285,7 @@ impl Host {
                         }
                     }
                     if batched {
+                        crate::switchmap::act(crate::switchmap::S::CardSyncBatch, synced.len() as u64);
                         hashes(list, &synced);
                     }
                     crate::cardmeter::end(list, timed);
@@ -8787,6 +8793,7 @@ fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
         && fills_plain()
         && crate::plaincopy::copy_short(dst, src, len)
     {
+        crate::switchmap::act(crate::switchmap::S::FillsPlain, len as u64);
         #[cfg(feature = "diagnostics")]
         crate::backreads::touched(src as usize, len, false);
         return;
