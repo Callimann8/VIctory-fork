@@ -708,19 +708,25 @@ fn prefer_run() -> bool {
 }
 
 /// The host buffer a root view at `address` binds: the copy `find` gives,
-/// or for a self-copy dispatch with windows cut to runs
-/// (`VICTORY_INPLACE_RUNS=1`) the run window that the builder's raw
-/// addresses reach there, if it holds the program's head. The self-copy's
-/// only change is its head (`State::self_copy`): on the run window the
-/// builder sees it at once, where on a copy it would see it only once the
-/// copy went back to title memory. Past the run's end its view reads zeros
-/// and drops stores: what it stores there is what it read.
+/// or with windows cut to runs (`VICTORY_INPLACE_RUNS=1`) the run window
+/// that the directory of title memory by address gives there
+/// (`crate::memory`), so that a root view and the builder's raw addresses
+/// reach the same bytes: a copy would show what shaders store through the
+/// other only once it went back to title memory. Taken when the run holds
+/// all that the copy would from `address` on (the rest of the copy is
+/// memory that is not there), or for a self-copy dispatch, which reads and
+/// writes only its head (`State::self_copy`) and for which the run must
+/// hold 64 bytes. A root view is a one-view table
+/// (`bounded_root_srvs`): past the run's end it reads zeros and drops
+/// stores.
 fn root_find(address: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
     let found = crate::shadow::find(address, 1);
-    if prefer_run()
+    if crate::inplace::runs_on()
+        && crate::pipeline::host::bounded_root_srvs()
         && !found.as_ref().is_some_and(|s| s.in_place())
         && !crate::shadow::buffer_holds(address)
         && let Some(run) = crate::shadow::run_window(address).filter(|s| s.offset_in(address).is_some() && s.left(address) >= 64)
+        && (prefer_run() || found.as_ref().is_none_or(|f| run.left(address) >= f.left(address)))
     {
         return Some(run);
     }

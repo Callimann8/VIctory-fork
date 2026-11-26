@@ -4252,6 +4252,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
+    // (pages that could not be placed may be placeable now)
+    NO_RUN.lock().unwrap_or_else(|e| e.into_inner()).retain(|&page, _| page + PAGE as u64 <= at || page >= end);
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
@@ -4313,11 +4315,33 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
         found.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(found);
     }
+    // A page that could not be placed lately is not asked about again for
+    // a while (root views ask at every bind: `crate::draw`).
+    let frame = crate::frame::current();
+    let mut no = NO_RUN.lock().unwrap_or_else(|e| e.into_inner());
+    if no.get(&page).is_some_and(|&at| frame.saturating_sub(at) < 30) {
+        return None;
+    }
     let cell = page & !(WINDOW - 1);
-    let (start, len) = crate::inplace::run_around(page, cell, cell + WINDOW)?;
-    let placed = crate::inplace::place_for(start, len, true)?;
+    let Some(placed) = crate::inplace::run_around(page, cell, cell + WINDOW)
+        .and_then(|(start, len)| Some((start, len, crate::inplace::place_for(start, len, true)?)))
+    else {
+        if no.len() >= 65_536 {
+            no.clear();
+        }
+        no.insert(page, frame);
+        return None;
+    };
+    no.remove(&page);
+    drop(no);
+    let (start, len, placed) = placed;
     let shadow = Arc::new(Shadow::placed(placed, start, len, true));
     map.insert((start, len), shadow.clone());
+    drop(map);
+    // The directory's pages there may still name a copy (numbered when no
+    // run could be placed): it looks at them again, so that it and root
+    // views reach the same bytes.
+    crate::memory::ownership_changed(start, len);
     let n = RUN_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n.is_power_of_two() {
         tracing::info!(windows = n, start = format_args!("{start:#x}"), len, "title memory in place: windows cut to a run of memory, made since the start (VICTORY_INPLACE_RUNS=1)");
@@ -4327,6 +4351,9 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
 
 /// Windows [`run_window`] made since the start.
 static RUN_WINDOWS: AtomicU64 = AtomicU64::new(0);
+
+/// Pages [`run_window`] could not place, with the frame it last tried.
+static NO_RUN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
