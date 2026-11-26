@@ -39,6 +39,7 @@
         @{ Name = 'R5'; Seconds = 240;    Build = 'test'; Use = 'best', 'R5'; Try = $true }
         @{ Name = 'R6'; Seconds = 120;    Build = 'test'; Use = 'best', 'R6'; Try = $true }
         @{ Name = 'R6b'; Seconds = 120;   Build = 'test'; Use = 'best', 'R6b'; Try = $true }
+        @{ Name = 'R6c'; Seconds = 120; Build = 'test'; Use = 'best', 'R6c'; Try = $true }   # texture checks on helper threads (fxceless ceb9e1f)
         @{ Name = 'R7'; Seconds = 120;    Build = 'test'; Use = 'best', 'R7'; Try = $true }
         @{ Name = 'R8'; Seconds = 120;    Build = 'test'; Use = 'best', 'R8'; Try = $true }
         @{ Name = 'R9'; Seconds = 120;    Build = 'test'; Use = 'best', 'R9'; Try = $true }
