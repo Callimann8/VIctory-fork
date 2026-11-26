@@ -2161,6 +2161,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A title buffer copy done on the card ([`copy_on_card`]): source copy
+    /// and address, destination copy and address, bytes.
+    CardCopy(std::sync::Arc<crate::shadow::Shadow>, usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2834,6 +2837,125 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// `VICTORY_COPY_ON_CARD=1` (after Belobug's card steps, cc03ecb): a title
+/// buffer copy whose source flights in the air may write, and whose
+/// destination they do not, is done on the card behind them instead of on
+/// the CPU after a wait: the source's host copy (refreshed with the
+/// title's bytes by a step put in front of it) is copied into the
+/// destination's host copy by a list of ours ahead of the submission's
+/// lists, and into a read-back buffer whose bytes go to title memory when
+/// the flight lands (until then the range counts as written by flights, so
+/// what reads it on the CPU waits). Only when both are copies in the card's
+/// memory, the copy is at most 64 KiB, the submission runs no title work
+/// and no other step of it touches the destination. Needs the relay's
+/// second stage.
+///
+/// Why: OV8 waited 10.5 ms a frame for one 2 KiB copy out of a buffer the
+/// card writes every frame (0xdc07ea000), whose bytes did change.
+fn copy_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay_exact() && std::env::var_os("VICTORY_COPY_ON_CARD").is_some_and(|v| v == "1"))
+}
+
+/// Copies done on the card since the last frame-rate line ([`copy_on_card`]),
+/// and their bytes.
+static CARD_COPIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`copy_on_card`]: turns the copies of `runs` it holds for into a refresh
+/// of the source and a [`Step::CardCopy`], against `written` (what the
+/// flights in the air may write).
+fn take_card_copies(runs: &[&HostList], written: &[(usize, usize)]) {
+    if written.is_empty() {
+        return;
+    }
+    // Title work may read or write anything: nothing is taken.
+    let mut steps = 0usize;
+    for list in runs {
+        let deferred = list.deferred();
+        if deferred.copies.iter().any(|s| matches!(s, Step::Run(_))) {
+            return;
+        }
+        steps += deferred.copies.len();
+    }
+    if steps == 0 {
+        return;
+    }
+    // Whether a step other than (list, index) touches `[from, to)`.
+    let touched_elsewhere = |at: (usize, usize), from: usize, to: usize| -> bool {
+        runs.iter().enumerate().any(|(l, list)| {
+            list.deferred().copies.iter().enumerate().any(|(i, step)| {
+                if (l, i) == at {
+                    return false;
+                }
+                let meets = |a: usize, n: usize| a < to && a + n > from;
+                match step {
+                    &Step::Copy(d, s, n) => meets(d, n) || meets(s, n),
+                    &Step::Fill(_, s, n, _) => meets(s, n),
+                    &Step::CardCopy(_, s, _, d, n) => meets(d, n) || meets(s, n),
+                    Step::Texture(staging) => {
+                        let (a, n) = staging.memory();
+                        meets(a, n)
+                    }
+                    _ => false,
+                }
+            })
+        })
+    };
+    for (l, list) in runs.iter().enumerate() {
+        let candidates: Vec<(usize, usize, usize, usize)> = list
+            .deferred()
+            .copies
+            .iter()
+            .enumerate()
+            .filter_map(|(i, step)| match *step {
+                Step::Copy(dst, src, len) => Some((i, dst, src, len)),
+                _ => None,
+            })
+            .filter(|&(_, dst, src, len)| {
+                len > 0
+                    && len <= 1 << 16
+                    && touches(written, src, src + len)
+                    && !touches(written, dst, dst + len)
+                    && !(fill_ahead::on() && !fill_ahead::must_wait(src, len))
+            })
+            .collect();
+        // From the back, so that the indices before stay right.
+        for &(i, dst, src, len) in candidates.iter().rev() {
+            if touched_elsewhere((l, i), dst, dst + len) {
+                continue;
+            }
+            let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
+                continue;
+            };
+            let holds = |shadow: &crate::shadow::Shadow, a: usize| {
+                let (start, n) = shadow.span();
+                shadow.carded() && start as usize <= a && a + len <= (start + n) as usize
+            };
+            if std::sync::Arc::ptr_eq(&from, &to) || !holds(&from, src) || !holds(&to, dst) {
+                continue;
+            }
+            let mut deferred = list.deferred();
+            deferred.copies[i] = Step::CardCopy(from.clone(), src, to, dst, len);
+            deferred.copies.insert(i, Step::Refresh(from, src, len));
+            CARD_COPIED[0].fetch_add(1, Ordering::Relaxed);
+            CARD_COPIED[1].fetch_add(len as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The card copies of `runs` ([`Step::CardCopy`]).
+fn card_copies_of(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::CardCopy(from, src, to, dst, len) = step {
+                out.push((from.clone(), *src, to.clone(), *dst, *len));
+            }
+        }
+    }
+    out
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2896,7 +3018,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::CardCopy(..) => {}
             }
         }
     }
@@ -3914,6 +4036,13 @@ fn late_line(frames: f64) {
             SNAPSHOT_BYTES.swap(0, Ordering::Relaxed) as f64 / frames / (1 << 20) as f64
         );
     }
+    if copy_on_card() {
+        tracing::info!(
+            "title buffer copies done on the card per frame (VICTORY_COPY_ON_CARD=1): {:.2}, {:.0} bytes",
+            CARD_COPIED[0].swap(0, Ordering::Relaxed) as f64 / frames,
+            CARD_COPIED[1].swap(0, Ordering::Relaxed) as f64 / frames
+        );
+    }
     if settle_stale_on() {
         tracing::info!(
             "settles under shader writes spared per frame (VICTORY_SETTLE_STALE=1): {:.2}",
@@ -4621,7 +4750,8 @@ impl Host {
                 second.sent_up(&self.queue, sent_as);
             }
         };
-        if declared.is_empty() && dirty.is_empty() {
+        let card_copies = card_copies_of(runs);
+        if declared.is_empty() && dirty.is_empty() && card_copies.is_empty() {
             numbered();
             return None;
         }
@@ -4924,6 +5054,48 @@ impl Host {
             };
             if let Err(e) = recorded {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            }
+            used.push((false, sync));
+        }
+        // Title buffer copies done on the card ([`copy_on_card`]): behind
+        // the sync list (the source's refresh went up in it), ahead of the
+        // submission's lists. Into the destination's host copy, and into a
+        // read-back buffer whose bytes go to title memory when the flight
+        // lands. A list of their own: the sync list leaves the copies in
+        // other states, and buffers are back in the common state between
+        // calls.
+        if !card_copies.is_empty() {
+            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+                fail(format_args!("no host list for title buffer copies done on the card"));
+            };
+            let (allocator, list) = &sync;
+            let mut backs = Vec::new();
+            // SAFETY: the list's last run finished (as the sync list's);
+            // live buffers, and the ranges lie in them (`take_card_copies`).
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    for (from, src, to, dst, len) in &card_copies {
+                        let (src_at, dst_at) = (*src as u64 - from.span().0, *dst as u64 - to.span().0);
+                        list.CopyBufferRegion(&to.buffer, dst_at, &from.buffer, src_at, *len as u64);
+                        if let Some(back) = self.read_back_buffer(*len as u64) {
+                            list.CopyBufferRegion(&back, 0, &from.buffer, src_at, *len as u64);
+                            backs.push((back, *dst, *len));
+                        }
+                    }
+                    list.Close()?;
+                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("title buffer copies could not be done on the card ({e})"));
+            }
+            if let Some(first) = runs.first() {
+                for (back, dst, len) in backs {
+                    first.defer_read_back(back, dst as *mut u8, [len, 1, len]);
+                }
             }
             used.push((false, sync));
         }
@@ -6146,6 +6318,10 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        if late && copy_on_card() {
+            let written = line().written.clone();
+            take_card_copies(runs, &written);
+        }
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
@@ -6279,6 +6455,9 @@ impl Host {
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
+            // Copies done on the card: their destinations reach title
+            // memory when the flight lands ([`copy_on_card`]).
+            texture_back_ranges.extend(card_copies_of(runs).iter().map(|c| (c.3, c.3 + c.4)));
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
@@ -7873,6 +8052,9 @@ impl HostList {
                     }
                     continue;
                 }
+                // Done by our list on the card ([`copy_on_card`]); the
+                // source's refresh is the step before it.
+                Step::CardCopy(..) => continue,
             };
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
