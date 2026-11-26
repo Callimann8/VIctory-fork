@@ -134,6 +134,7 @@ fn lowered_on(
         written_root_uavs: lowered.written_root_uavs,
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
