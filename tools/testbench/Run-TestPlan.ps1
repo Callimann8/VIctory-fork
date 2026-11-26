@@ -405,7 +405,7 @@ function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp, [double]$Skip 
     if ($Skip -lt 0) { $Skip = $SkipSeconds }
     $m = @{ Usual = @(); Prep = @(); Idle = @(); Back = @(); Free = @(); Medians = @(); Frames = 0; Seconds = 0.0; Long = 0; Lines = 0
         Crash = ''; Slots = 0; Warmup = ''; Fields = [ordered]@{}; Phases = [ordered]@{}; SwitchLines = @(); Unmapped = ''
-        Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = ''; TexLine = ''; Accounting = @() }
+        Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = ''; TexLine = ''; WaitLine = ''; Accounting = @() }
     if (-not (Test-Path $Path)) { return $m }
     foreach ($k in $FrameFields.Keys) { $m.Fields[$k] = New-Object System.Collections.Generic.List[double] }
     $world = $null
@@ -424,14 +424,16 @@ function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp, [double]$Skip 
         $isMap = $line -match 'switch map: '
         $isTex = $line -match 'texture problems: '
         $isAcc = $line -match 'card accounting: '
+        $isWait = $line -match 'card waits: '
         $phase = $null
         foreach ($p in $PhaseLines) { if ($line.Contains($p)) { $phase = $p; break } }
-        if (-not ($isFrame -or $isMap -or $phase -or $isTex -or $isAcc)) { continue }
+        if (-not ($isFrame -or $isMap -or $phase -or $isTex -or $isAcc -or $isWait)) { continue }
         if ($world) {
             $t = Get-Stamp $line
             if ($t -and ($t - $world).TotalSeconds -lt $Skip) { continue }
         }
         if ($isTex) { $m.TexLine = ($line -replace '^.*?texture problems: ', '') -replace ' frames=\d+\s*$', ''; continue }
+        if ($isWait) { $m.WaitLine = ($line -replace '^.*?card waits: ', '') -replace ' frames=\d+\s*$', ''; continue }
         if ($isAcc) { $m.Accounting += (($line -replace '^.*?card accounting: ', '') -replace ' frames=\d+\s*$', ''); continue }
         if ($isMap) {
             $text = ($line -replace '^.*?switch map: ', '') -replace ' frames=\d+\s*$', ''
@@ -627,7 +629,7 @@ function Invoke-Run($Run, [string]$Name, $Expanded, [int]$Seconds = 0) {
     New-Item -ItemType Directory -Force -Path $pics | Out-Null
     $r = [ordered]@{ Name = $Name; Build = $Run.Build; Sets = ($Expanded.Sets -join '+'); Switches = (($Expanded.Env.GetEnumerator() | ForEach-Object { "$($_.Key -replace '^VICTORY_','')=$($_.Value)" }) -join ' ')
         Phases = $null; SwitchMap = @(); SwitchMissing = @(); SwitchUnmapped = ''; SwitchFlags = ''; CpuCores = @(); CpuAllPct = $null; BusyCores = $null; CpuMsPerFrame = $null
-        TexLine = ''; TexFlags = ''; Accounting = @(); PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
+        TexLine = ''; TexFlags = ''; WaitLine = ''; WaitMs = $null; Accounting = @(); PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
         Status = 'not run'; Seconds = $null; FrameMs = $null; Fps = $null; MedianMs = $null; PrepMs = $null; GpuMs = $null; CopyBackMs = $null; FreeMbMin = $null; LongPct = $null
         VsBase = $null; Helped = $null; Pictures = ''; PictureNote = ''; Noisy = [bool]$Noisy; NoisyWhy = @($(if ($Noisy) { 'whole plan marked noisy (-Noisy)' })); Note = ''; Dir = $dir; Pics = $pics; Log = ''; World = ''; Started = (Get-Date).ToString('s') }
     Say "copying the test save for $Name..."
@@ -793,6 +795,15 @@ function Invoke-Run($Run, [string]$Name, $Expanded, [int]$Seconds = 0) {
     # Texture problems (last line of the measured stretch) and card accounting.
     $r.TexLine = $m.TexLine
     $r.Accounting = @($m.Accounting | Select-Object -Last 5)
+    # Card waits (last line of the measured stretch): "none" or "N/f, X ms/f; ...".
+    $r.WaitLine = $m.WaitLine
+    if ($m.WaitLine -match '^\s*none\b') { $r.WaitMs = 0 }
+    elseif ($m.WaitLine -match '^\s*[\d.]+/f,\s*([\d.]+)\s*ms/f') { $r.WaitMs = [double]$matches[1] }
+    # Every single "card wait:" line (VICTORY_WAIT_LOG=1), whole log.
+    if ($r.Log -and (Test-Path $r.Log)) {
+        $one = @(Select-String -LiteralPath $r.Log -Pattern 'card wait: ' -SimpleMatch | ForEach-Object { Clear-Line $_.Line })
+        if ($one.Count) { $one | Set-Content (Join-Path $dir 'card-waits.txt') -Encoding UTF8 }
+    }
     if ($m.Accounting.Count) { $m.Accounting | Set-Content (Join-Path $dir 'card-accounting.txt') -Encoding UTF8 }
     $tex = @()
     if ($m.TexLine -match '([\d.]+) slots refused/f' -and [double]$matches[1] -gt 0) { $tex += "slots refused $($matches[1])/f" }
@@ -899,6 +910,9 @@ function Get-RunDetails($R) {
     if ($R.PSObject.Properties.Name -contains 'TexLine' -and $R.TexLine) {
         $o.Add(''); $o.Add("Texture problems (last report)$(if ($R.TexFlags) { ', **flagged: ' + $R.TexFlags + '**' }): $($R.TexLine)")
     }
+    if ($R.PSObject.Properties.Name -contains 'WaitLine' -and $R.WaitLine) {
+        $o.Add(''); $o.Add("Card waits (last report$(if (Test-Path (Join-Path $R.Dir 'card-waits.txt')) { '; every wait in card-waits.txt' })): $($R.WaitLine -replace '\|','/')")
+    }
     if ($R.PSObject.Properties.Name -contains 'Accounting' -and @($R.Accounting).Count) {
         $o.Add(''); $o.Add("Card accounting (last $(@($R.Accounting).Count) reports; all in card-accounting.txt):"); $o.Add('')
         foreach ($a in $R.Accounting) { $o.Add("- $($a -replace '\|','/')") }
@@ -927,7 +941,7 @@ function Get-RunDetails($R) {
 function Write-Table {
     $rows = @($Results.Values | Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-(again|long)$', '')); if ($i -lt 0) { $i = 999 }; 2 * $i + [int]($_.Name -match '-(again|long)$') })
     $csv = Join-Path $PlanDir 'results.csv'
-    $rows | Select-Object Name, Build, Sets, Status, FrameMs, Fps, MedianMs, PrepMs, GpuMs, CopyBackMs, FreeMbMin, LongPct, VsBase, Helped, Pictures, Noisy, CpuAllPct, BusyCores, CpuMsPerFrame, PeakWsGB, PeakCommitGB, PeakVramGB, PeakSharedGB, MinFreeRamGB, SwitchFlags, @{ n = 'NoisyWhy'; e = { $_.NoisyWhy -join '; ' } }, Note, Switches, PictureNote, Dir |
+    $rows | Select-Object Name, Build, Sets, Status, FrameMs, Fps, MedianMs, PrepMs, GpuMs, CopyBackMs, WaitMs, FreeMbMin, LongPct, VsBase, Helped, Pictures, Noisy, CpuAllPct, BusyCores, CpuMsPerFrame, PeakWsGB, PeakCommitGB, PeakVramGB, PeakSharedGB, MinFreeRamGB, SwitchFlags, @{ n = 'NoisyWhy'; e = { $_.NoisyWhy -join '; ' } }, Note, Switches, PictureNote, Dir |
         Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# Test plan $planName")
@@ -940,14 +954,14 @@ function Write-Table {
     if ($CloseCallPct -gt 0) { $md.Add("Close calls: Try runs within +-$CloseCallPct% of the stack before them and shorter than $RerunSeconds s ran again at $RerunSeconds s (name-long); 'best' follows the rerun.") ; $md.Add('') }
     $md.Add("Started $($script:PlanStart). Each run: its own Seconds (else $RunSeconds s) after the game world started; numbers are medians of the frame-log reports after the first $SkipSeconds s. Frame = usual frame (long frames left out), fps = all frames / time. GPU = frame minus card idle. vs base = frame against $Baseline (negative = faster). Close = within $MarginPct%.")
     $md.Add('')
-    $md.Add('| Run | Build | Sets | s | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Flags | Pictures | Noisy | Note |')
-    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    $md.Add('| Run | Build | Sets | s | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Waits ms/f | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Flags | Pictures | Noisy | Note |')
+    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($r in $rows) {
         $vs = if ($null -ne $r.VsBase) { '{0:+0.0;-0.0}%' -f $r.VsBase } else { '-' }
         $helped = if ($r.Helped -eq $true) { ' (kept)' } else { '' }
         $nz = if ($r.Noisy) { 'yes: ' + ($r.NoisyWhy -join '; ') } else { '' }
         if ($r.Name -eq $PicRef) { $r.Pictures = 'reference' }
-        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $(if ($r.PSObject.Properties.Name -contains 'Seconds') { $r.Seconds }) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $(if ($null -ne $r.CpuAllPct) { "$($r.CpuAllPct) ($($r.BusyCores))" }) | $(if ($null -ne $r.PeakWsGB) { "$($r.PeakWsGB) / $($r.PeakVramGB)" }) | $($r.SwitchFlags) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
+        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $(if ($r.PSObject.Properties.Name -contains 'Seconds') { $r.Seconds }) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(if ($r.PSObject.Properties.Name -contains 'WaitMs') { if ($null -ne $r.WaitMs) { '{0:N1}' -f $r.WaitMs } else { '-' } }) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $(if ($null -ne $r.CpuAllPct) { "$($r.CpuAllPct) ($($r.BusyCores))" }) | $(if ($null -ne $r.PeakWsGB) { "$($r.PeakWsGB) / $($r.PeakVramGB)" }) | $($r.SwitchFlags) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
     }
     $md.Add('')
     $md.Add("Best stack at the end: $(if ($BestSets.Count) { $BestSets -join ' + ' } else { '(none helped)' })")

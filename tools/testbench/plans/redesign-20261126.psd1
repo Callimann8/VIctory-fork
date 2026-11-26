@@ -37,6 +37,7 @@
         @{ Name = 'R4'; Seconds = 120;    Build = 'test'; Use = 'best', 'R4'; Try = $true; Prompt = 'Walk out of the cell and back, then check RT shadows and reflections; Enter to measure' }
         @{ Name = 'R4b'; Seconds = 120;   Build = 'test'; Use = 'best', 'R3d', 'R4b'; Prompt = 'Load the test save and walk outside; Enter to measure' }   # compared only: WATCH_FIXED on GUARD_PRIVATE=all
         @{ Name = 'R5'; Seconds = 240;    Build = 'test'; Use = 'best', 'R5'; Try = $true }
+        @{ Name = 'R5b'; Seconds = 120; Build = 'test'; Use = 'best', 'R5b'; Try = $true }   # guards re-armed outside the locks (fxceless PR #1315)
         @{ Name = 'R6'; Seconds = 120;    Build = 'test'; Use = 'best', 'R6'; Try = $true }
         @{ Name = 'R6b'; Seconds = 120;   Build = 'test'; Use = 'best', 'R6b'; Try = $true }
         @{ Name = 'R6c'; Seconds = 120; Build = 'test'; Use = 'best', 'R6c'; Try = $true }   # texture checks on helper threads (fxceless ceb9e1f)
@@ -55,6 +56,6 @@
         @{ Name = 'ROOM'; Seconds = 120;  Build = 'test'; Use = 'best', 'ROOM' }   # more card room for textures: fewer missing textures? watch 'texture problems' and the card budget line
         @{ Name = 'SWEEP'; Seconds = 120; Build = 'test'; Use = 'best', 'SWEEP' }  # missing textures: free idle copies when the texture queue has no room
         @{ Name = 'KEPT'; Seconds = 120; Build = 'test'; Use = 'best', 'KEPT' }   # missing textures: kept room given to textures after 30 s unchanged
-        @{ Name = 'TEX'; Seconds = 120;   Build = 'test'; Use = 'best'; Env = @{ VICTORY_CARD_ACCOUNTING = '1' } }   # missing textures: what waits for room / is not mapped yet (5-s line); not timed against others
+        @{ Name = 'TEX'; Seconds = 120;   Build = 'test'; Use = 'best'; Env = @{ VICTORY_CARD_ACCOUNTING = '1'; VICTORY_WAIT_MAP = '1'; VICTORY_WAIT_LOG = '1' } }   # + every CPU wait on the card with its last writer (CPU/GPU side by side data)   # missing textures: what waits for room / is not mapped yet (5-s line); not timed against others
     )
 }

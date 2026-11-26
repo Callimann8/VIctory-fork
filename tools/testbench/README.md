@@ -30,11 +30,13 @@ powershell -ExecutionPolicy Bypass -File .\Run-TestPlan.ps1 -Resume C:\xcl\runs\
 
 Results go to `C:\xcl\runs\testbench\<plan>-<date>-<time>\`:
 - `results.md` / `results.csv`: one row per run, with frame ms, fps, change against the baseline,
-  CPU preparing, GPU (frame minus card idle), copy-back, lowest free memory, long frames, picture verdict and noisy mark.
+  CPU preparing, GPU (frame minus card idle), copy-back, card waits (ms per frame), lowest free memory, long frames, picture verdict and noisy mark.
 - `<run>\`: `err.log`/`out.log` (the game's log), `env.txt` (exact switches), `frames\` (pictures),
   `pictures\report.html` (side by side with main and a red difference map), `pc-use.csv`.
 - `results.md` also has a **Run details** section per run (also in `<run>\details.md`):
   - texture problems (last report; flagged when slots are refused or uploads skipped) and the last 5 `card accounting:` lines (all in `card-accounting.txt`);
+  - the last `card waits:` line of the measured stretch (its ms/f is the table's Waits column); with
+    `VICTORY_WAIT_LOG=1` every single `card wait:` line of the log goes to `card-waits.txt`;
   - the switch map: what each switch did per frame in the last 3 `switch map:` lines of the measured stretch,
     with NEVER ACTED and refusals flagged, and switches the map does not name;
   - phase timings (medians per frame) from the frame line, plus every `prep split: label N ms | ...` line
