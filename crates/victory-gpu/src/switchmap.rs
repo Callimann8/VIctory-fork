@@ -72,6 +72,7 @@ switches! {
     MemoryBudget = "VICTORY_MEMORY_BUDGET_MB", "windows let go over the budget", "bytes";
     PrepWide = "VICTORY_PREP_WIDE", "stretches cut into pieces", "pieces";
     SweepAtRoom = "VICTORY_SWEEP_AT_ROOM", "idle texture copies let go for room", "bytes";
+    RoomKeptSecs = "VICTORY_ROOM_KEPT_SECS", "room questions answered without kept room", "";
 }
 
 const N: usize = NAMES.len();
@@ -223,7 +224,13 @@ pub(crate) fn texture_line(frames: f64) {
         .map(|&(f, why)| format!("f{f}{}", if why == 1 { " xor" } else { "" }))
         .collect();
     let card = crate::host::host().and_then(|h| h.video_memory()).map_or(String::new(), |v| {
-        format!("; the card {} MB in use of {} MB budget", v[1] >> 20, v[0] >> 20)
+        format!(
+            "; the card {} MB in use of {} MB budget, room kept from textures {} MB for buffer copies and {} MB for targets (VICTORY_ROOM_KEPT_SECS drops it)",
+            v[1] >> 20,
+            v[0] >> 20,
+            crate::shadow::card_room_kept() >> 20,
+            crate::resource::targets_room_kept() >> 20
+        )
     });
     tracing::info!(
         frames = frames as u64,

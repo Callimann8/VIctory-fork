@@ -1456,9 +1456,7 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => used + room_kept() < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1493,6 +1491,37 @@ pub(crate) fn targets_room_kept() -> u64 {
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     most.saturating_sub(targets)
+}
+
+/// What [`room`] counts as used beyond the card's own number: room kept
+/// for card copies of title buffers and for render targets not made yet.
+/// `VICTORY_ROOM_KEPT_SECS=<n>`: once neither has changed for n seconds,
+/// none (the copies and targets of the world's first frames are made; a
+/// copy limit never reached kept its rest from textures for the run). Off
+/// (unset or 0): kept as before.
+#[cfg(windows)]
+pub(crate) fn room_kept() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kept = crate::shadow::card_room_kept() + targets_room_kept();
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let secs = *SECS.get_or_init(|| {
+        std::env::var("VICTORY_ROOM_KEPT_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    if secs == 0 || kept == 0 {
+        return kept;
+    }
+    // The kept bytes at the last look, and when they last changed.
+    static LAST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = crate::host::now_ms();
+    if LAST[0].swap(kept, Relaxed) != kept {
+        LAST[1].store(now, Relaxed);
+        return kept;
+    }
+    if now.saturating_sub(LAST[1].load(Relaxed)) < secs * 1000 {
+        return kept;
+    }
+    crate::switchmap::act(crate::switchmap::S::RoomKeptSecs, 0);
+    0
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
