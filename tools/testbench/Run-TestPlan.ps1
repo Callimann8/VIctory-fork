@@ -80,7 +80,22 @@ $LogSearch      = @(Get-Setting 'LogSearch' @('C:\xcl\runs') | ForEach-Object { 
 $RealDataDirs   = @(Get-Setting 'RealDataDirs' @() | ForEach-Object { Expand-Path $_ })
 $SaveSource     = Expand-Path (Get-Setting 'SaveSource' '')
 $NoisyFlag      = Join-Path $RunsRoot 'NOISY'
-$Sets           = Get-Setting 'Sets' @{}
+$Sets           = @{}
+# Switch sets from a run-switches.ps1 ($VictoryRuns = [ordered]@{ R1 = @{...} }),
+# read without running it; the plan's own Sets win over it.
+$SetsFile = Expand-Path (Get-Setting 'SetsFile' '')
+if ($SetsFile) {
+    if (-not (Test-Path $SetsFile)) { throw "SetsFile not found: $SetsFile" }
+    $tk = $null; $pe = $null
+    $sAst = [System.Management.Automation.Language.Parser]::ParseFile($SetsFile, [ref]$tk, [ref]$pe)
+    $assign = $sAst.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$VictoryRuns' }, $true)
+    $hAst = if ($assign) { $assign.Right.Find({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true) } else { $null }
+    if (-not $hAst) { throw "no `$VictoryRuns = @{...} in $SetsFile" }
+    $fromFile = $hAst.SafeGetValue()
+    foreach ($k in $fromFile.Keys) { $Sets[$k] = $fromFile[$k] }
+}
+$planSets = Get-Setting 'Sets' @{}
+foreach ($k in $planSets.Keys) { $Sets[$k] = $planSets[$k] }
 $Builds         = $cfg.Builds
 if ($planData.ContainsKey('Builds')) { foreach ($k in $planData.Builds.Keys) { $Builds[$k] = $planData.Builds[$k] } }
 foreach ($k in @($Builds.Keys)) { $Builds[$k].Launcher = Expand-Path $Builds[$k].Launcher }

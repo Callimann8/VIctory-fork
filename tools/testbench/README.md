@@ -6,7 +6,7 @@ Runs a whole test plan on Carlos's PC by itself and writes a results table.
 |---|---|
 | `Run-TestPlan.ps1` | The runner: warm-up, a fresh save copy per run, each run with its switches, frame-log numbers, picture check, results table |
 | `testbench.config.psd1` | PC paths: launchers, test save, real save folders, run length |
-| `plans/redesign-20261126.psd1` | Tonight's run list (switch sets from `run-switches.ps1`, runs in order) |
+| `plans/redesign-20261126.psd1` | Tonight's run list (runs in order; switch sets read from `C:\xcl\run-switches.ps1` via `SetsFile`) |
 | `piccheck/` | The picture check (small Rust tool, built automatically on first use) |
 | `Mark-Noisy.cmd` | Double-click during a run to mark it noisy (you used the PC) |
 
@@ -72,6 +72,7 @@ also checks that no file of the real save (`RealDataDirs`) changed.
 - `OnlyIfCrashed`: a fallback that runs only if the named run did not finish.
 - `Prompt`: beeps when the world has started and waits for Enter before measuring.
 - `Env`: extra switches for one run.
+- `SetsFile`: a `run-switches.ps1` whose `$VictoryRuns` sets are read (not run); `Sets` in the plan win over it.
 
 ## Noisy runs (using the PC during a run)
 
