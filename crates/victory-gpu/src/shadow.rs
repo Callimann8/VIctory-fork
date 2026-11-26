@@ -2759,6 +2759,12 @@ impl Shadow {
 
     /// Whether the memory behind the copy turned out not to be write-watched:
     /// every refresh then copies its whole range.
+    /// Whether this is title memory in place, not a copy (`crate::inplace`):
+    /// nothing to refresh, snapshot or copy back.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }

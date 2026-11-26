@@ -345,7 +345,8 @@ impl Memory {
         // card's shared memory ran out (run G3).
         let budget = budget_bytes();
         if budget != 0 {
-            let size = |n: usize| self.copies[n].as_ref().map_or(0, |c| c.span().1);
+            // (memory in place costs nothing beside the title's own)
+            let size = |n: usize| self.copies[n].as_ref().filter(|c| !c.in_place()).map_or(0, |c| c.span().1);
             let gone: BTreeSet<usize> = old.iter().copied().collect();
             let mut live: u64 = (0..self.copies.len()).filter(|&n| window(n) && !gone.contains(&n)).map(size).sum();
             if live > budget {
@@ -779,7 +780,8 @@ pub(crate) fn ready(
     let mut refreshed_now = Vec::new();
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
         let Some(shadow) = shadow else { continue };
-        if m.owned[n] == 0 {
+        // In place: the title's own bytes; nothing to bring up or copy back.
+        if m.owned[n] == 0 || shadow.in_place() {
             continue;
         }
         // (also copies whose view this bind made: a run grew)

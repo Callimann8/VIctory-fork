@@ -138,10 +138,19 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // View memory: known from the runtime without asking Windows. A window
+    // that lies in one run of a committed section is placed on the section
+    // itself (`VICTORY_POOL_COMMIT=1`, [`place_on_section`]); the rest is
+    // turned down.
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, offset) if window && views_in_place() => {
+            return place_on_section(section, offset, start, len);
+        }
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -162,6 +171,103 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Err(Some(e)) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+            }
+            None
+        }
+    }
+}
+
+/// Whether a window over view memory (the title's page pool) is placed on
+/// its section when the section is committed (`VICTORY_INPLACE_VIEWS=0`:
+/// never, as before). Sections are committed only with
+/// `VICTORY_POOL_COMMIT=1` (the runtime's switch; under Wine always).
+fn views_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// Heaps opened on committed sections of the page pool, by section handle
+/// (`OpenExistingHeapFromFileMapping`: the heap is the section, whatever
+/// its views do; opening locks nothing). Forgotten when the handle's
+/// number is given to a new section ([`title_memory_section`]).
+static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, (ID3D12Heap, u64)>>> = Mutex::new(None);
+
+/// Windows placed on sections, and their bytes, since the start.
+static SECTION_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The heap of `section` (opened on first ask) and its bytes; `None` if
+/// the section is not committed or the host refused it.
+fn section_heap(section: usize) -> Option<(ID3D12Heap, u64)> {
+    let committed = views().sections.iter().find(|s| s.0 == section).filter(|s| s.2).map(|s| s.1);
+    let bytes = committed?;
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps.get_or_insert_with(Default::default);
+    if let Some(found) = heaps.get(&section) {
+        return Some(found.clone());
+    }
+    let host = crate::host::host()?;
+    match open(&host.device, From::Section(section)) {
+        Ok(heap) => {
+            // SAFETY: a live heap.
+            let size = unsafe { heap.GetDesc() }.SizeInBytes.min(bytes);
+            tracing::info!(section, mb = size >> 20, "title memory in place: a section of the page pool opened as a host heap (VICTORY_POOL_COMMIT)");
+            heaps.insert(section, (heap.clone(), size));
+            Some((heap, size))
+        }
+        Err(e) => {
+            if SECTION_STATS[2].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(section, error = %e, "title memory in place: the host refused to open a section of the page pool; its windows stay copies");
+            }
+            None
+        }
+    }
+}
+
+/// A window `[start, start + len)` that is one run of `section` from
+/// `offset` on, as a buffer placed in the section's heap: shaders read and
+/// write the pool's own pages (every view of them shows what they write),
+/// and nothing is copied, checked or copied back for it. `None` leaves the
+/// caller to make a copy, as before.
+///
+/// What it assumes is what windows in private memory in place assume
+/// (`VICTORY_INPLACE=1`): another host copy of the same bytes (a title
+/// buffer's, a texture's) is not told of what shaders write here. The
+/// directory of title memory by address prefers a buffer's copy for pages
+/// a buffer holds, so the builder's writes through raw addresses go where
+/// they went before for those.
+fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option<Placed> {
+    let (heap, size) = section_heap(section).or_else(|| {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        None
+    })?;
+    let at = offset & !(K64 as u64 - 1);
+    let bias = offset - at;
+    let bytes = (bias + len.max(1)).next_multiple_of(K64 as u64);
+    if at + bytes > size {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let host = crate::host::host()?;
+    match place(&host.device, &heap, at, bytes) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            STATS[1].fetch_add(len, Ordering::Relaxed);
+            let n = SECTION_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+            SECTION_STATS[1].fetch_add(len, Ordering::Relaxed);
+            if n == 1 || n.is_power_of_two() {
+                tracing::info!(
+                    windows = n,
+                    mb = SECTION_STATS[1].load(Ordering::Relaxed) >> 20,
+                    "title memory in place: windows over the page pool placed on its sections since the start (no copy, no refresh, no copy-back)"
+                );
+            }
+            Some(Placed { buffer, heap, gpu, bias })
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a window over the page pool not placed on its section: a copy instead");
             }
             None
         }
@@ -286,6 +392,11 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // A heap opened on an earlier section with this handle's number is
+    // not this section's (lists and windows that hold it keep it alive).
+    if let Some(heaps) = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        heaps.remove(&section);
+    }
     {
         let mut v = views();
         v.sections.retain(|s| s.0 != section);
