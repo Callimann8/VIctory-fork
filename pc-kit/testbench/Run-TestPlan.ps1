@@ -207,9 +207,18 @@ function Stop-Game($Launch) {
     if (@(Get-GameProcesses).Count -gt 0) { throw "the game did not close; stop it by hand and use -Resume" }
 }
 
+# Maximum / Average of one property over objects; objects without it (or with $null) are left out.
+# (Windows PowerShell 5.1's Measure-Object -Property throws when any object lacks the property.)
+function Get-Stat($Items, [string]$Name, [string]$What) {
+    $vals = @($Items | ForEach-Object { if ($_ -and $_.PSObject.Properties[$Name] -and $null -ne $_.$Name) { [double]$_.$Name } })
+    if ($vals.Count -eq 0) { return 0 }
+    $m = $vals | Measure-Object -Maximum -Average
+    if ($What -eq 'Maximum') { return $m.Maximum } else { return $m.Average }
+}
+
 function Start-Launcher([string]$Copy, [string[]]$LauncherArgs, [string]$Out, [string]$Err) {
     $shell = (Get-Process -Id $PID).Path
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Copy`"") + $LauncherArgs
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Copy`"") + @($LauncherArgs | Where-Object { $_ })
     $more = @{}
     if ($PSVersionTable.PSVersion.Major -lt 6 -or $IsWindows) { $more.WindowStyle = 'Minimized' }
     Start-Process -FilePath $shell -ArgumentList $argList -RedirectStandardOutput $Out -RedirectStandardError $Err -PassThru @more
@@ -308,7 +317,7 @@ function Get-Usage([int[]]$GamePids) {
         }
         $r.Cpu = $other / $cores
     } catch { }
-    return $r
+    return [pscustomobject]$r
 }
 
 # Per-core processor use, the game's memory and graphics memory, free RAM
@@ -333,7 +342,7 @@ function Get-Sample([int[]]$GamePids) {
         }
     } catch { }
     try { $r.FreeRam = [double](Get-CimInstance -ClassName Win32_OperatingSystem -Property FreePhysicalMemory -ErrorAction Stop).FreePhysicalMemory * 1KB } catch { }
-    return $r
+    return [pscustomobject]$r
 }
 
 # ------------------------------------------------------------------ the save
@@ -824,9 +833,9 @@ function Invoke-Run($Run, [string]$Name, $Expanded, [int]$Seconds = 0) {
         if ($cores.Count) { $r.CpuAllPct = [Math]::Round(($cores | Measure-Object -Average).Average, 0); $r.BusyCores = @($cores | Where-Object { $_ -ge 50 }).Count }
         $gb = { param($x) [Math]::Round($x / 1GB, 2) }
         $r.PeakWsGB = & $gb (($samples | ForEach-Object { [Math]::Max($_.Ws, $_.PeakWs) } | Measure-Object -Maximum).Maximum)
-        $r.PeakCommitGB = & $gb (($samples | Measure-Object -Property Commit -Maximum).Maximum)
-        $r.PeakVramGB = & $gb (($samples | Measure-Object -Property Dedicated -Maximum).Maximum)
-        $r.PeakSharedGB = & $gb (($samples | Measure-Object -Property Shared -Maximum).Maximum)
+        $r.PeakCommitGB = & $gb ((Get-Stat $samples 'Commit' 'Maximum'))
+        $r.PeakVramGB = & $gb ((Get-Stat $samples 'Dedicated' 'Maximum'))
+        $r.PeakSharedGB = & $gb ((Get-Stat $samples 'Shared' 'Maximum'))
         $free = @($samples | Where-Object { $null -ne $_.FreeRam } | ForEach-Object { $_.FreeRam })
         if ($free.Count) { $r.MinFreeRamGB = & $gb (($free | Measure-Object -Minimum).Minimum) }
         $cpuS = @($samples | Where-Object { $null -ne $_.CpuMs })
@@ -842,9 +851,9 @@ function Invoke-Run($Run, [string]$Name, $Expanded, [int]$Seconds = 0) {
     if ($r.Status -eq 'OK' -and $m.Lines -lt 5) { $r.Status = 'FEW LINES'; $r.Note = ($r.Note + " | only $($m.Lines) frame-log reports after the first $SkipSeconds s").Trim(' |') }
 
     if ($usage.Count) {
-        $video = ($usage | Measure-Object -Property Video -Average).Average
-        $gpu = ($usage | Measure-Object -Property Gpu -Average).Average
-        $cpu = ($usage | Measure-Object -Property Cpu -Average).Average
+        $video = (Get-Stat $usage 'Video' 'Average')
+        $gpu = (Get-Stat $usage 'Gpu' 'Average')
+        $cpu = (Get-Stat $usage 'Cpu' 'Average')
         $top = ($usage | Where-Object { $_.Top } | Group-Object Top | Sort-Object Count -Descending | Select-Object -First 1)
         $lim = Get-Setting 'NoisyLimits' @{ VideoPct = 1.0; GpuPct = 4.0; CpuPct = 5.0 }
         if ($video -gt $lim.VideoPct) { $r.NoisyWhy += ("video playing ({0:N1}% decoder)" -f $video) }
