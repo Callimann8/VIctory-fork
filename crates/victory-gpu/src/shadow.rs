@@ -3224,7 +3224,7 @@ impl Shadow {
                             old.push((at, held.to_vec()));
                         }
                     }
-                    if runs.len() > *runs_left {
+                    if runs.len() > *runs_left || runs.len() > crate::host::merge_page_runs() {
                         MERGE_REFUSED[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }

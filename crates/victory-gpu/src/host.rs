@@ -3326,6 +3326,20 @@ fn merge_runs() -> usize {
     })
 }
 
+/// Most changed runs one page may have to be merged under shader writes
+/// (`VICTORY_MERGE_PAGE_RUNS`; no limit by default): a page past it (the
+/// game rewriting most of a page) settles the flights as before, so dense
+/// pages can be kept apart from sparse ones in tests.
+pub(crate) fn merge_page_runs() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_PAGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
