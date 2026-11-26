@@ -3001,7 +3001,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on() && !fill_ahead::hot(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3018,8 +3018,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Fill(_, src, len, what) => {
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
-                        // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        // (`fill_ahead`); unless a fill there read too early
+                        // before (`VICTORY_FILL_WAIT_PIECES`).
+                        if fill_ahead::on() && !fill_ahead::hot(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3120,6 +3121,33 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
+    /// `VICTORY_FILL_WAIT_PIECES=1`: a fill found to have read bytes a
+    /// flight then changed makes only fills of the same 64 KiB pieces wait
+    /// from then on ([`hot`]), not every fill for the rest of the run (off
+    /// by default). The one fill a piece that read too early still drew
+    /// with the bytes from before, as the first one does now; a submission
+    /// stood still for a settle at each fill that touched any range a
+    /// flight might write (the profile of 43d375b: 1.0 a frame, 73 ms).
+    fn pieces() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_PIECES").is_some_and(|v| v == "1"))
+    }
+
+    /// With [`pieces`]: the 64 KiB pieces where a fill read ahead of a
+    /// flight that changed its bytes.
+    static HOT: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+    static HOT_ANY: AtomicBool = AtomicBool::new(false);
+
+    /// Whether a fill of `len` bytes at `src` waits for flights all the
+    /// same ([`pieces`]).
+    pub(super) fn hot(src: usize, len: usize) -> bool {
+        if !HOT_ANY.load(Relaxed) || len == 0 {
+            return false;
+        }
+        let hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+        hot.range(src / PIECE..=(src + len - 1) / PIECE).next().is_some()
+    }
+
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
     pub(super) fn read(src: usize, len: usize) {
@@ -3175,6 +3203,23 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if pieces() {
+                let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
+                let before = hot.len();
+                hot.extend(from / PIECE..=(to - 1) / PIECE);
+                HOT_ANY.store(true, Relaxed);
+                if hot.len() != before && before < 64 {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
+                         them (first at {:#x}, landed in frame {frame}): fills of those 64 KiB wait for flights from here on \
+                         (VICTORY_FILL_WAIT_PIECES=1; {} pieces wait now, {n} such fills)",
+                        to - from,
+                        a + first,
+                        hot.len()
+                    );
+                }
+                continue;
+            }
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -3214,6 +3259,12 @@ mod fill_ahead {
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
         );
+        if HOT_ANY.load(Relaxed) {
+            tracing::info!(
+                pieces = HOT.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                "fills of upload memory: 64 KiB pieces whose fills wait for flights (VICTORY_FILL_WAIT_PIECES=1)"
+            );
+        }
     }
 }
 
