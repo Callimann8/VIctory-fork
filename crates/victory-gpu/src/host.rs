@@ -8422,7 +8422,10 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
+        } else if !((crate::split::threads() != 0 && crate::plaincopy::copy(to, at, n)) || read(at, to, n)) {
+            // (With `VICTORY_COPY_THREADS`, a committed run is first copied
+            // in place, as `copy_mapped` copies, and shared out over the
+            // threads; the kernel's copy if that meets a page not there.)
             // A mapping may change between query and read.
             read_pieces(at, to, n);
         }
