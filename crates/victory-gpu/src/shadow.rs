@@ -1541,7 +1541,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1561,6 +1561,11 @@ fn workers() -> &'static Workers {
         }
     });
     workers
+}
+
+/// The threads kept for [`wide`] (the caller makes one more).
+pub(crate) fn wide_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all

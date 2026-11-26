@@ -56,6 +56,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod prep_wide;
 mod split;
 pub mod switchmap;
 #[cfg(windows)]
