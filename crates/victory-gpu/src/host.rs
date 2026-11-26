@@ -1716,7 +1716,10 @@ const SCATTER_MIN: usize = 256;
 /// offset, bytes, 0) sorted by destination; no two groups touch the same
 /// dword of the destination, so each dword is read and written by one
 /// thread. Bytes outside the entries keep what the card holds (what
-/// shaders stored there).
+/// shaders stored there). The fourth dword, unless 0xFFFFFFFF, is where
+/// in the table the range's bytes from before lie (title bytes put in
+/// under shader writes): a byte goes in only where the card still holds
+/// that byte from before, and one a shader stored since stays.
 pub(crate) const CARD_SCATTER: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
 cbuffer Table : register(b0) {
@@ -1735,6 +1738,23 @@ uint load_bytes(uint at, uint n) {
     if (shift != 0u && (at & 3u) + n > 4u) v |= src.Load(word + 4u) << (32u - shift);
     return v;
 }
+// As `load_bytes`, from the table.
+uint load_table(uint at, uint n) {
+    uint word = at & ~3u;
+    uint shift = (at & 3u) * 8u;
+    uint v = table.Load(word) >> shift;
+    if (shift != 0u && (at & 3u) + n > 4u) v |= table.Load(word + 4u) << (32u - shift);
+    return v;
+}
+// 0xFF in each byte where `a` and `b` hold the same byte.
+uint same_bytes(uint a, uint b) {
+    uint x = a ^ b;
+    uint m = 0u;
+    [unroll] for (uint k = 0u; k < 4u; k++) {
+        if (((x >> (k * 8u)) & 0xFFu) == 0u) m |= 0xFFu << (k * 8u);
+    }
+    return m;
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1742,10 +1762,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint2 g = table.Load2(id.x * 8u);
     [loop]
     for (uint e = g.x; e < g.x + g.y; e++) {
-        uint3 r = table.Load3(entries_at + e * 16u);
+        uint4 r = table.Load4(entries_at + e * 16u);
         uint s = r.x;
         uint d = r.y;
         uint end = r.y + r.z;
+        uint o = r.w;
         [loop]
         while (d < end) {
             uint word = d & ~3u;
@@ -1753,7 +1774,12 @@ void main(uint3 id : SV_DispatchThreadID) {
             uint n = min(4u - off, end - d);
             uint v = load_bytes(s, n) << (off * 8u);
             uint mask = (n == 4u ? 0xFFFFFFFFu : ((1u << (n * 8u)) - 1u)) << (off * 8u);
-            dst.Store(word, (dst.Load(word) & ~mask) | (v & mask));
+            uint card = dst.Load(word);
+            if (o != 0xFFFFFFFFu) {
+                mask &= same_bytes(card, load_table(o, n) << (off * 8u));
+                o += n;
+            }
+            dst.Store(word, (card & ~mask) | (v & mask));
             d += n;
             s += n;
         }
@@ -1766,23 +1792,52 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// offset = `src_at(range index)`), as dwords, its group count and where
 /// its entries start in bytes; and the indices of the others. `None` if
 /// an offset does not fit 32 bits.
-fn scatter_table(ranges: &[(usize, usize)], src_at: impl Fn(usize) -> u64) -> Option<(Vec<u32>, u32, u32, Vec<usize>)> {
+fn scatter_table(
+    ranges: &[(usize, usize)],
+    src_at: impl Fn(usize) -> u64,
+    old_pages: &[(usize, Vec<u8>)],
+) -> Option<(Vec<u32>, u32, u32, Vec<usize>)> {
     let mut entries: Vec<[u32; 4]> = Vec::new();
     let mut groups: Vec<[u32; 2]> = Vec::new();
     let mut big = Vec::new();
+    // Bytes from before, appended after the entries: (byte offset in that
+    // area, page index) per page used.
+    let mut old_used: Vec<(usize, usize)> = Vec::new();
+    let mut old_bytes = 0usize;
     // The last destination dword the current group touches.
     let mut last_word = u64::MAX;
     for (i, &(a, b)) in ranges.iter().enumerate() {
-        if b - a >= SCATTER_MIN {
+        // The page from before that holds the whole range, if any.
+        let page = {
+            let at = old_pages.partition_point(|o| o.0 + o.1.len() <= a);
+            old_pages.get(at).filter(|o| o.0 <= a && b <= o.0 + o.1.len()).map(|_| at)
+        };
+        if page.is_none() && b - a >= SCATTER_MIN {
             big.push(i);
             continue;
         }
+        let old = match page {
+            Some(p) => {
+                let base = match old_used.iter().find(|u| u.1 == p) {
+                    Some(u) => u.0,
+                    None => {
+                        let base = old_bytes;
+                        old_used.push((base, p));
+                        old_bytes += old_pages[p].1.len().next_multiple_of(4);
+                        base
+                    }
+                };
+                Some(base + (a - old_pages[p].0))
+            }
+            None => None,
+        };
         let src = u32::try_from(src_at(i)).ok()?;
         let (d, n) = (u32::try_from(a).ok()?, u32::try_from(b - a).ok()?);
         u32::try_from(b).ok()?;
         let first_word = (a / 4) as u64;
         let index = entries.len() as u32;
-        entries.push([src, d, n, 0]);
+        // Fixed up below: an offset in the area of bytes from before.
+        entries.push([src, d, n, old.map_or(u32::MAX, |o| o as u32)]);
         match groups.last_mut() {
             Some(g) if last_word != u64::MAX && first_word <= last_word => g[1] += 1,
             _ => groups.push([index, 1]),
@@ -1790,10 +1845,24 @@ fn scatter_table(ranges: &[(usize, usize)], src_at: impl Fn(usize) -> u64) -> Op
         last_word = ((b - 1) / 4) as u64;
     }
     let entries_at = (groups.len() * 8).next_multiple_of(16);
-    let mut table: Vec<u32> = Vec::with_capacity(entries_at / 4 + entries.len() * 4);
+    let old_at = entries_at + entries.len() * 16;
+    u32::try_from(old_at + old_bytes).ok()?;
+    for e in &mut entries {
+        if e[3] != u32::MAX {
+            e[3] += old_at as u32;
+        }
+    }
+    let mut table: Vec<u32> = Vec::with_capacity((old_at + old_bytes) / 4);
     table.extend(groups.iter().flatten());
     table.resize(entries_at / 4, 0);
     table.extend(entries.iter().flatten());
+    table.resize((old_at + old_bytes) / 4, 0);
+    // SAFETY: the area of bytes from before lies in `table` (sized above).
+    let area = unsafe { std::slice::from_raw_parts_mut(table.as_mut_ptr().cast::<u8>().add(old_at), old_bytes) };
+    for &(base, p) in &old_used {
+        let bytes = &old_pages[p].1;
+        area[base..base + bytes.len()].copy_from_slice(bytes);
+    }
     Some((table, groups.len() as u32, entries_at as u32, big))
 }
 
@@ -4530,7 +4599,8 @@ impl Host {
                 .map(|(shadow, ranges)| {
                     let base = at;
                     at += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
-                    if work.scatter.is_none() || !shadow.carded() || ranges.iter().all(|&(a, b)| b - a >= SCATTER_MIN) {
+                    let old_pages = shadow.card_old_pages();
+                    if work.scatter.is_none() || !shadow.carded() || (old_pages.is_empty() && ranges.iter().all(|&(a, b)| b - a >= SCATTER_MIN)) {
                         return None;
                     }
                     // SAFETY: a live buffer.
@@ -4545,7 +4615,7 @@ impl Host {
                         offsets.push(if landed.is_some() { packed } else { a as u64 });
                         packed += (b - a) as u64;
                     }
-                    let (table, groups, entries_at, big) = scatter_table(ranges, |i| offsets[i])?;
+                    let (table, groups, entries_at, big) = scatter_table(ranges, |i| offsets[i], &old_pages)?;
                     let bytes = (table.len() * 4) as u64;
                     let found = work.scatter_tables.iter().position(|t| t.2 >= bytes);
                     let buffer = match found {

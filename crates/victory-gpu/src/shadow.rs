@@ -102,6 +102,14 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With `crate::host::merge_scatter`: of each page whose title bytes
+    /// were put in under shader writes ([`Shadow::merge_under_writes`]) and
+    /// not sent yet, its offset and what the CPU's side held before (the
+    /// card's bytes as the flights in the air got them, less what they
+    /// write). The scatter pass puts a title byte in only where the card
+    /// still holds that byte: one a shader in the air stored stays, as on
+    /// the console, where the card runs after the CPU's write.
+    old_pages: Mutex<Vec<(usize, Vec<u8>)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -3206,6 +3214,16 @@ impl Shadow {
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                    // The page as the card got it, for the scatter pass:
+                    // the first time in this submission only.
+                    if crate::host::merge_scatter() && !runs.is_empty()
+                        && let Some(card) = &self.card
+                    {
+                        let mut old = card.old_pages.lock().unwrap_or_else(|e| e.into_inner());
+                        if !old.iter().any(|(o, b)| *o <= at && at + n <= *o + b.len()) {
+                            old.push((at, held.to_vec()));
+                        }
+                    }
                     if runs.len() > *runs_left {
                         MERGE_REFUSED[2].fetch_add(1, Ordering::Relaxed);
                         return true;
@@ -3498,6 +3516,18 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+    }
+
+    /// With `crate::host::merge_scatter`: the pages put in under shader
+    /// writes since the last send, with their bytes from before
+    /// (`Card::old_pages`), sorted by offset; taken.
+    pub(crate) fn card_old_pages(&self) -> Vec<(usize, Vec<u8>)> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        let mut old = std::mem::take(&mut *card.old_pages.lock().unwrap_or_else(|e| e.into_inner()));
+        old.sort_unstable_by_key(|o| o.0);
+        old
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3879,6 +3909,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    old_pages: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -4109,6 +4140,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                old_pages: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -4388,6 +4420,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                old_pages: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
