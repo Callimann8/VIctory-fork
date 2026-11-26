@@ -1,0 +1,16 @@
+[package]
+name = "piccheck"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Compares a test run's saved frames with a reference run's and flags visual differences"
+
+# Its own workspace: a test tool, built apart from the emulator.
+[workspace]
+
+[dependencies]
+png = "0.17"
+
+[profile.release]
+opt-level = 3
