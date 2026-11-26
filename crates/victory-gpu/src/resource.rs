@@ -2198,6 +2198,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = made {
+        NO_HOST_TEXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if let Some(t) = &texture {
@@ -2212,6 +2213,27 @@ fn host_texture_as(
         }
     }
     texture
+}
+
+/// Host textures the card refused to make (out of memory, a description it
+/// does not take), since the start: for the texture line of the switch map.
+pub(crate) static NO_HOST_TEXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Texture contents not uploaded since the start: without a console layout
+/// (a format the upload does not know), in an XOR mode; and the first
+/// formats seen so (at most 16), for the texture line of the switch map.
+pub(crate) static NOT_UPLOADED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static NOT_UPLOADED_FORMATS: std::sync::Mutex<Vec<(u32, u8)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes texture contents of `desc` not uploaded: `why` 0 no console
+/// layout, 1 an XOR mode.
+pub(crate) fn note_not_uploaded(desc: &ResourceDesc, why: u8) {
+    NOT_UPLOADED[usize::from(why.min(1))].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut seen = NOT_UPLOADED_FORMATS.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 16 && !seen.contains(&(desc.format, why)) {
+        seen.push((desc.format, why));
+    }
 }
 
 /// Textures made with dropped mips (diagnostics and the memory line).

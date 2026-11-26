@@ -9430,6 +9430,7 @@ impl Meter {
         crate::split::line(frames);
     crate::watch::private_line();
         crate::switchmap::line(frames);
+        crate::switchmap::texture_line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();

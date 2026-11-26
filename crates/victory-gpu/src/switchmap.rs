@@ -186,3 +186,64 @@ pub(crate) fn line(frames: f64) {
         if unmapped.is_empty() { String::new() } else { format!(" || set, no counter: {}", unmapped.join(" ")) }
     );
 }
+
+/// With the switch map: why textures may be missing or late, per frame
+/// since the last line ("texture problems: ..."). Passes that found the
+/// card without room for new host copies and the slots they refused (fxceless
+/// run 295: black surfaces were exactly textures without room on the card),
+/// slots still waiting now, host copies the sweep let go and made again,
+/// host textures the card refused to make, uploads skipped for a format the
+/// upload does not know or an XOR mode (with the formats), levels left
+/// without tiles, mips dropped, and the card's memory now. `VICTORY_CARD_ACCOUNTING=1`
+/// adds the five-second line of what the waiting textures need and how much
+/// of their memory the title has mapped yet (streaming).
+#[cfg(windows)]
+pub(crate) fn texture_line(frames: f64) {
+    if frames <= 0.0 {
+        return;
+    }
+    let k = &crate::resource::KINDS;
+    let now = [
+        crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
+        crate::draw::HEAP_TEXTURES_REFUSED_ROOM.load(Relaxed),
+        k[2].load(Relaxed),
+        k[4].load(Relaxed),
+        crate::resource::NO_HOST_TEXTURE.load(Relaxed),
+        crate::resource::NOT_UPLOADED[0].load(Relaxed),
+        crate::resource::NOT_UPLOADED[1].load(Relaxed),
+        crate::tiles::STATS[9].load(Relaxed),
+    ];
+    static BEFORE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    let d: Vec<f64> = (0..8).map(|i| (now[i] - BEFORE[i].swap(now[i], Relaxed)) as f64 / frames).collect();
+    let formats: Vec<String> = crate::resource::NOT_UPLOADED_FORMATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|&(f, why)| format!("f{f}{}", if why == 1 { " xor" } else { "" }))
+        .collect();
+    let card = crate::host::host().and_then(|h| h.video_memory()).map_or(String::new(), |v| {
+        format!("; the card {} MB in use of {} MB budget", v[1] >> 20, v[0] >> 20)
+    });
+    tracing::info!(
+        frames = frames as u64,
+        "texture problems: card full for new textures {:.1} passes/f, {:.1} slots refused/f (since start {}), {} slots waiting now; \
+         sweep let go {:.1}/f, made again {:.1}/f; card refused to make {:.2}/f (since start {}); upload attempts skipped: \
+         {:.1}/f unknown layout, {:.1}/f XOR mode (since start {} / {}{}); levels left without tiles {:.1}/f; mips dropped on {} textures{}",
+        d[0],
+        d[1],
+        now[1],
+        crate::draw::HEAP_TEXTURES_WAITING.load(Relaxed),
+        d[2],
+        d[3],
+        d[4],
+        now[4],
+        d[5],
+        d[6],
+        now[5],
+        now[6],
+        if formats.is_empty() { String::new() } else { format!("; formats {}", formats.join(" ")) },
+        d[7],
+        crate::resource::MIP_DROPPED[0].load(Relaxed),
+        card,
+    );
+}

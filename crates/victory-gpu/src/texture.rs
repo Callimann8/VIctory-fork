@@ -1515,6 +1515,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
+        crate::resource::note_not_uploaded(&desc, 0);
         once!(
             ?desc,
             "texture contents without a console layout not uploaded"
@@ -1522,6 +1523,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     };
     if layout.desc.swizzle.xor() {
+        crate::resource::note_not_uploaded(&desc, 1);
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
