@@ -6436,6 +6436,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        crate::prep_wide::submitted();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -8027,6 +8028,9 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if prep_wide() {
+                        crate::prep_wide::barrier(crate::prep_wide::B_COPY);
+                    }
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
@@ -8042,6 +8046,11 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    if prep_wide() {
+                        // At the end of the stretch, beside its other pieces.
+                        batch.seg.fill(dst, src, len);
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -8056,7 +8065,16 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
+                        if prep_wide() {
+                            crate::prep_wide::barrier(crate::prep_wide::B_RUN);
+                        }
                         batch.title_written();
+                    } else if prep_wide() {
+                        // Where it writes is not known: what came before it
+                        // is done first (the refreshes still pending stay
+                        // so, as without the switch).
+                        crate::prep_wide::barrier(crate::prep_wide::B_HOST);
+                        batch.run_segment();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -8077,20 +8095,16 @@ impl HostList {
                     // the next flush of all (flushing all of them at every
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
-                    batch.flush_one(shadow);
-                    #[cfg(feature = "diagnostics")]
-                    let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
-                    }
+                    batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if prep_wide() {
+                            batch.seg.texture(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -8217,6 +8231,27 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`crate::prep_wide`]: the steps since the last barrier, sorted
+    /// into pieces that may run beside one another.
+    seg: crate::prep_wide::Segment<std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// The pieces of a stretch ([`crate::prep_wide`]).
+type PrepPiece = crate::prep_wide::Piece<std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::texture::Staging>>;
+
+/// Whether a submission's steps are cut into stretches ([`crate::prep_wide`]).
+fn prep_wide() -> bool {
+    crate::prep_wide::mode() != crate::prep_wide::Mode::Off
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        // (Every submission flushes its batch; this only makes sure no
+        // step is ever left out.)
+        if !self.seg.is_empty() {
+            self.run_segment();
+        }
+    }
 }
 
 impl Batch {
@@ -8259,8 +8294,131 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
         Self::brought(&mut self.current, &shadow, from, to);
+        if prep_wide() {
+            // In the copy's chain, before the snapshot that follows.
+            self.seg.update(std::sync::Arc::as_ptr(&shadow) as usize, shadow, from, to);
+            return;
+        }
+        Self::update(&shadow, from, to);
+    }
+
+    /// Shaders will write `[address, address + len)` of `shadow`'s copy:
+    /// its pending refresh first, then its bytes are kept.
+    fn gpu_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        self.flush_one(shadow);
+        if prep_wide() {
+            self.seg.writing(std::sync::Arc::as_ptr(shadow) as usize, shadow.clone(), address, len);
+            return;
+        }
+        Self::writing(shadow, address, len);
+    }
+
+    /// [`crate::shadow::Shadow::writing`], timed.
+    fn writing(shadow: &crate::shadow::Shadow, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        let snapshot = std::time::Instant::now();
+        shadow.writing(address, len);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::GpuWrites, 1);
+            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+        }
+    }
+
+    /// A fill of upload memory from title memory, timed.
+    fn fill(dst: usize, src: usize, len: usize) {
+        let started = std::time::Instant::now();
+        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        preparing(0, started.elapsed().as_micros() as u64);
+        preparing(1, len as u64);
+    }
+
+    /// One piece of a stretch, on whichever thread.
+    fn run_piece(piece: PrepPiece) {
+        use crate::prep_wide::{Op, Piece};
+        match piece {
+            Piece::Chain(ops) => {
+                for op in ops {
+                    match op {
+                        Op::Update(shadow, from, to) => Self::update(&shadow, from, to),
+                        Op::Writing(shadow, address, len) => Self::writing(&shadow, address, len),
+                    }
+                }
+            }
+            Piece::Fills(fills) => {
+                for (dst, src, len) in fills {
+                    Self::fill(dst, src, len);
+                }
+            }
+            Piece::Texture(staging) => staging.refresh(),
+        }
+    }
+
+    /// With [`crate::prep_wide`]: runs the stretch collected since the last
+    /// barrier, its pieces beside one another (or one after the other,
+    /// timed, with `serial`), and returns when all are done.
+    fn run_segment(&mut self) {
+        use crate::prep_wide::{Mode, least, mode, pack, ran};
+        if self.seg.is_empty() {
+            return;
+        }
+        // One write-watch asking for every range the stretch refreshes, as
+        // a flush makes one for its refreshes.
+        let ranges = self.seg.update_ranges(|s| !s.unwatched());
+        let ahead = ranges.len() > 1;
+        if ahead {
+            let started = std::time::Instant::now();
+            crate::watch::ask_ahead(&ranges);
+            preparing(0, started.elapsed().as_micros() as u64);
+        }
+        let pieces = self.seg.take();
+        let n = pieces.len();
+        let threads = crate::shadow::wide_threads() + 1;
+        let started = std::time::Instant::now();
+        match mode() {
+            Mode::Wide if n >= least() => {
+                // The time counted is the time it took, not the threads' sum.
+                let before = PREPARING[0].load(Ordering::Relaxed);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = pack(pieces, 2 * threads, crate::prep_wide::cost)
+                    .into_iter()
+                    .map(|group| {
+                        Box::new(move || {
+                            for piece in group {
+                                Self::run_piece(piece);
+                            }
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                let wall = started.elapsed();
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                let over = summed.saturating_sub(wall.as_micros() as u64);
+                PREPARING[0].fetch_sub(over, Ordering::Relaxed);
+                crate::framelog::sub(crate::framelog::T::CopyUs, over);
+                ran(n, &[], wall.as_nanos() as u64, true, threads as u64);
+            }
+            Mode::Serial => {
+                let times: Vec<u64> = pieces
+                    .into_iter()
+                    .map(|piece| {
+                        let started = std::time::Instant::now();
+                        Self::run_piece(piece);
+                        started.elapsed().as_nanos() as u64
+                    })
+                    .collect();
+                ran(n, &times, started.elapsed().as_nanos() as u64, false, threads as u64);
+            }
+            _ => {
+                for piece in pieces {
+                    Self::run_piece(piece);
+                }
+                ran(n, &[], started.elapsed().as_nanos() as u64, false, threads as u64);
+            }
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
+        }
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
@@ -8336,6 +8494,16 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        if prep_wide() {
+            // The pending refreshes join their copies' chains, and the
+            // stretch runs.
+            for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
+                Self::brought(&mut self.current, &shadow, from, to);
+                self.seg.update(std::sync::Arc::as_ptr(&shadow) as usize, shadow, from, to);
+            }
+            self.run_segment();
+            return;
+        }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;

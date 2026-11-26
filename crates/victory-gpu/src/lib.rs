@@ -54,6 +54,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod prep_wide;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
