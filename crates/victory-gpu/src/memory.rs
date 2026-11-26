@@ -121,7 +121,8 @@ struct Memory {
     source: usize,
     numbered_by: [u64; 5],
     /// Pages a shader marked as stored to (`memory_marks`), for the run.
-    written: BTreeSet<u64>,
+    /// With the frame each was last marked in (`VICTORY_MEMORY_WRITTEN_FRAMES`).
+    written: BTreeMap<u64, u64>,
     /// Per copy: the runs of its pages in `written`, all that is copied
     /// back after a storing shader.
     written_ranges: Vec<Vec<(u64, u64)>>,
@@ -180,7 +181,7 @@ impl Memory {
             owned: Vec::new(),
             ranges: Vec::new(),
             recalculate: BTreeSet::new(),
-            written: BTreeSet::new(),
+            written: BTreeMap::new(),
             written_ranges: Vec::new(),
             source: 0,
             numbered_by: [0; 5],
@@ -428,7 +429,7 @@ impl Memory {
                 let at = (page * PAGE).max(start);
                 let end = ((page + 1) * PAGE).min(start + len);
                 add(ranges, at, end);
-                if self.written.contains(&page) {
+                if self.written.contains_key(&page) {
                     add(written, at, end);
                 }
             }
@@ -534,7 +535,7 @@ impl Memory {
                     // SAFETY: as above.
                     unsafe { at.write_volatile(0) };
                     self.touched[owner] = self.frame;
-                    if self.written.insert(page) {
+                    if self.written.insert(page, self.frame).is_none() {
                         self.recalculate.insert(owner);
                         new += 1;
                     }
@@ -549,6 +550,38 @@ impl Memory {
                         // SAFETY: as above.
                         unsafe { at.write_volatile(0) };
                         self.touched[owner] = self.frame;
+                    }
+                }
+            }
+            // Pages no shader stored to for N frames are no longer declared
+            // written (`VICTORY_MEMORY_WRITTEN_FRAMES`).
+            let frames = written_frames();
+            if frames != 0 {
+                let now = self.frame;
+                let pages = &self.pages;
+                let mut gone = Vec::new();
+                self.written.retain(|&page, &mut at| {
+                    let keep = now.saturating_sub(at) <= frames;
+                    if !keep {
+                        gone.push(page);
+                    }
+                    keep
+                });
+                for page in &gone {
+                    if let Some(&owner) = pages.get(page) {
+                        self.recalculate.insert(owner);
+                    }
+                }
+                if !gone.is_empty() {
+                    WRITTEN_DROPPED.fetch_add(gone.len() as u64, Ordering::Relaxed);
+                    static SAID: AtomicU64 = AtomicU64::new(0);
+                    if now >= SAID.load(Ordering::Relaxed) + 300 {
+                        SAID.store(now, Ordering::Relaxed);
+                        tracing::info!(
+                            dropped = WRITTEN_DROPPED.load(Ordering::Relaxed),
+                            written = self.written.len(),
+                            "title memory by address: pages no shader stored to lately, no longer copied back (VICTORY_MEMORY_WRITTEN_FRAMES), since the start; still declared"
+                        );
                     }
                 }
             }
@@ -619,6 +652,23 @@ fn refresh_once() -> bool {
 
 /// Refreshes left out by [`refresh_once`], and done, since the start.
 static ONCE_SKIPPED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `VICTORY_MEMORY_WRITTEN_FRAMES=N` (with page marks): a page shaders
+/// stored to stays declared written, snapshotted and compared after every
+/// list that binds a storing shader, only while a store marked it in the
+/// last N frames (0, the default: for the rest of the run). The builder's
+/// pages written once (a structure built and then only read) cost a
+/// snapshot and a compare per list for the whole run before. What the
+/// first store to a page does stays on the card until the marks are read
+/// either way (`memory_marks`), so a page written again after it was
+/// dropped goes back to the title from its next frame on, as a new one.
+fn written_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_MEMORY_WRITTEN_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Pages [`written_frames`] took out of the written set, since the start.
+static WRITTEN_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// `VICTORY_MEMORY_BUDGET_MB=N`: numbered windows past N MiB in all are
 /// let go, those reached longest ago first (0, the default: no limit).
