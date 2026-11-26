@@ -63,6 +63,10 @@ function Expand-Path([string]$P) { if ($P) { [Environment]::ExpandEnvironmentVar
 $RunsRoot       = Expand-Path (Get-Setting 'RunsRoot' 'C:\xcl\runs\testbench')
 $RunSeconds     = [int](Get-Setting 'RunSeconds' 240)
 $SkipSeconds    = [int](Get-Setting 'SkipSeconds' 60)
+$EarlyStop      = [int](Get-Setting 'EarlyStopSeconds' 0)      # 0 = off
+$EarlySlowerPct = [double](Get-Setting 'EarlyStopSlowerPct' 15)
+$CloseCallPct   = [double](Get-Setting 'CloseCallPct' 0)       # 0 = off
+$RerunSeconds   = [int](Get-Setting 'RerunSeconds' 240)
 $StartTimeout   = [int](Get-Setting 'StartTimeoutSeconds' 900)
 $WarmupTimeout  = [int](Get-Setting 'WarmupTimeoutSeconds' 7200)
 $ProcessName    = Get-Setting 'ProcessName' 'victory'
@@ -397,7 +401,8 @@ $FrameFields = [ordered]@{
 # split of the preparing time); every label becomes a phase of its own.
 $PhaseLines = @(Get-Setting 'PhaseLines' @('prep split:'))
 
-function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
+function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp, [double]$Skip = -1) {
+    if ($Skip -lt 0) { $Skip = $SkipSeconds }
     $m = @{ Usual = @(); Prep = @(); Idle = @(); Back = @(); Free = @(); Medians = @(); Frames = 0; Seconds = 0.0; Long = 0; Lines = 0
         Crash = ''; Slots = 0; Warmup = ''; Fields = [ordered]@{}; Phases = [ordered]@{}; SwitchLines = @(); Unmapped = ''
         Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = ''; TexLine = ''; Accounting = @() }
@@ -424,7 +429,7 @@ function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
         if (-not ($isFrame -or $isMap -or $phase -or $isTex -or $isAcc)) { continue }
         if ($world) {
             $t = Get-Stamp $line
-            if ($t -and ($t - $world).TotalSeconds -lt $SkipSeconds) { continue }
+            if ($t -and ($t - $world).TotalSeconds -lt $Skip) { continue }
         }
         if ($isTex) { $m.TexLine = ($line -replace '^.*?texture problems: ', '') -replace ' frames=\d+\s*$', ''; continue }
         if ($isAcc) { $m.Accounting += (($line -replace '^.*?card accounting: ', '') -replace ' frames=\d+\s*$', ''); continue }
@@ -606,8 +611,13 @@ function Invoke-Warmup([string]$BuildName, $EnvMap, [string]$Tag) {
     Say ("warm-up done in {0:N0} s: {1}" -f ((Get-Date) - $began).TotalSeconds, $(if ($summary) { $summary } else { 'no summary line (see ' + $dir + ')' }))
 }
 
-function Invoke-Run($Run, [string]$Name, $Expanded) {
+function Invoke-Run($Run, [string]$Name, $Expanded, [int]$Seconds = 0) {
     $b = $Builds[$Run.Build]
+    # Measured time: the call's, else the run's own Seconds, else RunSeconds.
+    $secs = if ($Seconds -gt 0) { $Seconds } elseif ($Run.ContainsKey('Seconds')) { [int]$Run.Seconds } else { $RunSeconds }
+    # Early stop (Try runs only; not the baseline): after EarlyStop s, slower than the best stack by EarlySlowerPct.
+    $early = $EarlyStop -gt 0 -and $Run.ContainsKey('Try') -and $Run.Try -and $Run.Name -ne $Baseline -and $BestFrame -and $secs -gt $EarlyStop
+    $earlyDone = $false
     $mode = if ($b.ContainsKey('Pictures') -and $PictureMode -ne 'off') { $b.Pictures } else { $PictureMode }
     $dir = Join-Path $PlanDir $Name
     if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
@@ -618,7 +628,7 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     $r = [ordered]@{ Name = $Name; Build = $Run.Build; Sets = ($Expanded.Sets -join '+'); Switches = (($Expanded.Env.GetEnumerator() | ForEach-Object { "$($_.Key -replace '^VICTORY_','')=$($_.Value)" }) -join ' ')
         Phases = $null; SwitchMap = @(); SwitchMissing = @(); SwitchUnmapped = ''; SwitchFlags = ''; CpuCores = @(); CpuAllPct = $null; BusyCores = $null; CpuMsPerFrame = $null
         TexLine = ''; TexFlags = ''; Accounting = @(); PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
-        Status = 'not run'; FrameMs = $null; Fps = $null; MedianMs = $null; PrepMs = $null; GpuMs = $null; CopyBackMs = $null; FreeMbMin = $null; LongPct = $null
+        Status = 'not run'; Seconds = $null; FrameMs = $null; Fps = $null; MedianMs = $null; PrepMs = $null; GpuMs = $null; CopyBackMs = $null; FreeMbMin = $null; LongPct = $null
         VsBase = $null; Helped = $null; Pictures = ''; PictureNote = ''; Noisy = [bool]$Noisy; NoisyWhy = @($(if ($Noisy) { 'whole plan marked noisy (-Noisy)' })); Note = ''; Dir = $dir; Pics = $pics; Log = ''; World = ''; Started = (Get-Date).ToString('s') }
     Say "copying the test save for $Name..."
     New-RunData $data
@@ -675,7 +685,7 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
                         if ($l -match 'frame=(\d+)') { Set-Content -Path (Join-Path $pics 'world.txt') -Value "first=$($matches[1])" }
                         $worldAt = Get-Date
                         if (-not $storageOk) { Stop-Game $proc; throw "SAVE SAFETY STOP: the game world started but the log never said which save folder it uses; not going on blind." }
-                        Say "$Name`: world started; measuring for $RunSeconds s"
+                        Say "$Name`: world started; measuring for $secs s"
                     }
                 }
             }
@@ -690,7 +700,7 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
                 Read-Host "$Name`: $($Run.Prompt) -- press Enter when there"
                 $promptDone = $true; $worldAt = Get-Date
                 $world = (Get-Date).ToUniversalTime().ToString('o')
-                Say "$Name`: measuring from now for $RunSeconds s"
+                Say "$Name`: measuring from now for $secs s"
             }
             # The measured stretch (after the first SkipSeconds, like the frame-log numbers).
             if ($world -and $promptDone -and ($now - $worldAt).TotalSeconds -ge $SkipSeconds -and ($now - $lastPc).TotalSeconds -ge 5) {
@@ -709,7 +719,22 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
                 break
             }
             if (-not $world -and ($now - $began).TotalSeconds -gt $StartTimeout) { $r.Status = 'NO WORLD'; break }
-            if ($world -and $promptDone -and ($now - $worldAt).TotalSeconds -ge $RunSeconds) { $r.Status = 'OK'; break }
+            if ($early -and -not $earlyDone -and $world -and $promptDone -and ($now - $worldAt).TotalSeconds -ge $EarlyStop -and $r.Log) {
+                $earlyDone = $true
+                # The frame-log reports of the second half of the first EarlyStop seconds.
+                $mm = ConvertFrom-FrameLog $r.Log $world ($EarlyStop / 2)
+                $f = Median $mm.Usual
+                if ($f -and $mm.Usual.Count -ge 2) {
+                    $slower = 100.0 * ($f - $BestFrame) / $BestFrame
+                    if ($slower -ge $EarlySlowerPct) {
+                        $r.Status = 'STOPPED EARLY'
+                        $r.Note = ("stopped early: slower ({0:N0} ms after {1} s vs best stack {2:N0} ms, {3:+0}%)" -f $f, $EarlyStop, $BestFrame, $slower)
+                        Say "$Name`: $($r.Note)" 'Yellow'
+                        break
+                    }
+                }
+            }
+            if ($world -and $promptDone -and ($now - $worldAt).TotalSeconds -ge $secs) { $r.Status = 'OK'; break }
         }
     } finally {
         Stop-Game $proc
@@ -725,8 +750,9 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
         throw "SAVE SAFETY STOP: a file of the real save changed during run $Name ($stamp). Check C:\xcl save backups before anything else."
     }
 
-    $m = ConvertFrom-FrameLog $r.Log $world
-    $crashed = ($r.Status -ne 'OK' -and $r.Status -ne 'not run') -or $m.Crash
+    $stoppedEarly = $r.Status -eq 'STOPPED EARLY'
+    $m = if ($stoppedEarly) { ConvertFrom-FrameLog $r.Log $world ($EarlyStop / 2) } else { ConvertFrom-FrameLog $r.Log $world }
+    $crashed = ($r.Status -ne 'OK' -and $r.Status -ne 'not run' -and -not $stoppedEarly) -or $m.Crash
     if ($m.Crash -and $r.Status -ne 'OK') { $r.Status = 'CRASH' }
     if ($crashed) { try { Save-CrashInfo $r $m $data $began } catch { Say "crash details incomplete: $($_.Exception.Message)" 'Yellow' } }
     # The save copy is not needed any more (pictures and logs stay; kept after a crash).
@@ -743,7 +769,8 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     if ($m.Free.Count) { $r.FreeMbMin = ($m.Free | Measure-Object -Minimum).Minimum }
     if ($m.Seconds -gt 0) { $r.Fps = [Math]::Round($m.Frames / $m.Seconds, 2) }
     if ($m.Frames -gt 0) { $r.LongPct = [Math]::Round(100.0 * $m.Long / $m.Frames, 1) }
-    if ($m.Crash) { $r.Note = $m.Crash; if ($r.Status -ne 'OK') { $r.Status = 'CRASH' } }
+    if ($m.Crash) { $r.Note = ($m.Crash + ' ' + $r.Note).Trim(); if ($r.Status -ne 'OK') { $r.Status = 'CRASH' } }
+    $r.Seconds = $secs
     # Phases: the frame line's timings, then the extra phase lines.
     $ph = [ordered]@{}
     foreach ($k in $m.Fields.Keys) { $v = Median $m.Fields[$k].ToArray(); if ($null -ne $v) { $ph[$k] = [Math]::Round($v, 1) } }
@@ -898,23 +925,29 @@ function Get-RunDetails($R) {
 # ------------------------------------------------------------------ the table
 
 function Write-Table {
-    $rows = @($Results.Values | Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-again$', '')); if ($i -lt 0) { $i = 999 }; 2 * $i + [int]($_.Name -like '*-again') })
+    $rows = @($Results.Values | Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-(again|long)$', '')); if ($i -lt 0) { $i = 999 }; 2 * $i + [int]($_.Name -match '-(again|long)$') })
     $csv = Join-Path $PlanDir 'results.csv'
     $rows | Select-Object Name, Build, Sets, Status, FrameMs, Fps, MedianMs, PrepMs, GpuMs, CopyBackMs, FreeMbMin, LongPct, VsBase, Helped, Pictures, Noisy, CpuAllPct, BusyCores, CpuMsPerFrame, PeakWsGB, PeakCommitGB, PeakVramGB, PeakSharedGB, MinFreeRamGB, SwitchFlags, @{ n = 'NoisyWhy'; e = { $_.NoisyWhy -join '; ' } }, Note, Switches, PictureNote, Dir |
         Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# Test plan $planName")
     $md.Add('')
-    $md.Add("Started $($script:PlanStart). Each run: $RunSeconds s after the game world started; numbers are medians of the frame-log reports after the first $SkipSeconds s. Frame = usual frame (long frames left out), fps = all frames / time. GPU = frame minus card idle. vs base = frame against $Baseline (negative = faster). Close = within $MarginPct%.")
+    $noiseFile = Join-Path $PlanDir 'picture-noise.txt'
+    $picLimits = if (Test-Path $noiseFile) { "calibrated from $($Calibrate -join ' vs ') (picture-noise.txt)" } else { 'fixed defaults, no calibration run: detail +-3%, light 2%, colour 2.5%, tile similarity drop 0.25 or tile light 6/255, black area 0.3%, regions in 15% of pictures (CHECK above, FAIL above twice)' }
+    $md.Add("Picture limits: $picLimits.")
     $md.Add('')
-    $md.Add('| Run | Build | Sets | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Flags | Pictures | Noisy | Note |')
-    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    if ($EarlyStop -gt 0) { $md.Add("Early stop: a Try run $EarlySlowerPct% or more slower than the best stack after $EarlyStop s (reports from $($EarlyStop / 2) s on) is stopped and not kept; its numbers are from that stretch.") ; $md.Add('') }
+    if ($CloseCallPct -gt 0) { $md.Add("Close calls: Try runs within +-$CloseCallPct% of the stack before them and shorter than $RerunSeconds s ran again at $RerunSeconds s (name-long); 'best' follows the rerun.") ; $md.Add('') }
+    $md.Add("Started $($script:PlanStart). Each run: its own Seconds (else $RunSeconds s) after the game world started; numbers are medians of the frame-log reports after the first $SkipSeconds s. Frame = usual frame (long frames left out), fps = all frames / time. GPU = frame minus card idle. vs base = frame against $Baseline (negative = faster). Close = within $MarginPct%.")
+    $md.Add('')
+    $md.Add('| Run | Build | Sets | s | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Flags | Pictures | Noisy | Note |')
+    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($r in $rows) {
         $vs = if ($null -ne $r.VsBase) { '{0:+0.0;-0.0}%' -f $r.VsBase } else { '-' }
         $helped = if ($r.Helped -eq $true) { ' (kept)' } else { '' }
         $nz = if ($r.Noisy) { 'yes: ' + ($r.NoisyWhy -join '; ') } else { '' }
         if ($r.Name -eq $PicRef) { $r.Pictures = 'reference' }
-        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $(if ($null -ne $r.CpuAllPct) { "$($r.CpuAllPct) ($($r.BusyCores))" }) | $(if ($null -ne $r.PeakWsGB) { "$($r.PeakWsGB) / $($r.PeakVramGB)" }) | $($r.SwitchFlags) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
+        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $(if ($r.PSObject.Properties.Name -contains 'Seconds') { $r.Seconds }) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $(if ($null -ne $r.CpuAllPct) { "$($r.CpuAllPct) ($($r.BusyCores))" }) | $(if ($null -ne $r.PeakWsGB) { "$($r.PeakWsGB) / $($r.PeakVramGB)" }) | $($r.SwitchFlags) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
     }
     $md.Add('')
     $md.Add("Best stack at the end: $(if ($BestSets.Count) { $BestSets -join ' + ' } else { '(none helped)' })")
@@ -985,7 +1018,7 @@ if ($Check) {
     foreach ($run in $AllRuns) {
         if ($Only -and $Only -notcontains $run.Name) { continue }
         $e = Expand-Env $run
-        $t += $RunSeconds + 180
+        $t += $(if ($run.ContainsKey('Seconds')) { [int]$run.Seconds } else { $RunSeconds }) + 180
         Write-Host ("  {0,-8} {1,-5} {2}" -f $run.Name, $run.Build, (($e.Env.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' '))
     }
     Write-Host ("about {0:N0} min plus warm-ups ('best' stacks show only what is known now)" -f ($t / 60))
@@ -1014,7 +1047,7 @@ if ($ReferencePics) { Say "pictures are compared with $ReferencePics" }
 # Earlier results of a resumed plan.
 if ($Resume) {
     $done = @(Get-ChildItem -Path $PlanDir -Filter result.json -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } |
-        Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-again$', '')); if ($i -lt 0) { 999 } else { $i } })
+        Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-(again|long)$', '')); if ($i -lt 0) { 999 } else { $i } })
     foreach ($o in $done) {
         $Results[$o.Name] = $o
         if ($o.Helped -eq $true) { $own = $AllRuns | Where-Object { $_.Name -eq $o.Name } | Select-Object -First 1; foreach ($s in (Get-OwnSets $own)) { if (-not $BestSets.Contains($s)) { $BestSets.Add($s) } }; $BestFrame = $o.FrameMs }
@@ -1064,7 +1097,7 @@ try {
                 $r.Helped = $false
                 Say ("{0}: {1:N1}% against the stack so far{2}; not kept" -f $run.Name, $gain, $(if ($r.Pictures -eq 'FAIL') { ', picture FAIL' } else { '' }))
             }
-        }
+        } elseif ($r.Status -eq 'STOPPED EARLY') { $r.Helped = $false }
         $Results[$run.Name] = $r
         Save-Result $r
         Update-Calibration
@@ -1073,10 +1106,54 @@ try {
 
     Update-Calibration
 
+    # Close calls: Try runs within CloseCallPct of the stack before them that
+    # ran shorter than RerunSeconds run again at RerunSeconds; 'best' follows the rerun.
+    $rerunLong = @()
+    if ($CloseCallPct -gt 0 -and -not $NoRerun) {
+        $close = @($Results.Values | Where-Object {
+                $_.Status -eq 'OK' -and $_.Name -notmatch '-(again|long)$' -and ($_.PSObject.Properties.Name -contains 'ComparedTo') -and $_.ComparedTo -and
+                $_.Seconds -and $_.Seconds -lt $RerunSeconds -and [Math]::Abs(100.0 * ($_.ComparedTo - $_.FrameMs) / $_.ComparedTo) -le $CloseCallPct
+            } | Sort-Object { [array]::IndexOf($names, $_.Name) })
+        foreach ($old in $close) {
+            $run = $AllRuns | Where-Object { $_.Name -eq $old.Name } | Select-Object -First 1
+            Say ("{0} was a close call ({1:+0.0;-0.0}% against the stack before it, {2} s): running it again at {3} s" -f $old.Name, (100.0 * ($old.ComparedTo - $old.FrameMs) / $old.ComparedTo), $old.Seconds, $RerunSeconds) 'Cyan'
+            $e = @{ Env = [ordered]@{}; Sets = @($old.Sets -split '\+') }
+            foreach ($kv in ($old.Switches -split ' ')) { if ($kv -match '^(.+?)=(.*)$') { $e.Env["VICTORY_$($matches[1])"] = $matches[2] } }
+            $r = Invoke-Run $run "$($old.Name)-long" $e $RerunSeconds
+            Compare-Pictures $r
+            $base = if ($Results.Contains($Baseline)) { $Results[$Baseline].FrameMs } else { $null }
+            if ($base -and $r.FrameMs) { $r.VsBase = [Math]::Round(100.0 * ($r.FrameMs - $base) / $base, 1) }
+            $r | Add-Member -NotePropertyName ComparedTo -NotePropertyValue $old.ComparedTo -Force
+            $gain = if ($r.FrameMs) { 100.0 * ($old.ComparedTo - $r.FrameMs) / $old.ComparedTo } else { $null }
+            $helpedNow = $r.Status -eq 'OK' -and $null -ne $gain -and $gain -gt $MarginPct -and $r.Pictures -ne 'FAIL'
+            $r.Helped = $helpedNow
+            $own = @(Get-OwnSets $run)
+            if ($helpedNow -and -not $old.Helped) {
+                foreach ($s in $own) { if (-not $BestSets.Contains($s)) { $BestSets.Add($s) } }
+                Say ("{0}-long: {1:N1}% faster than the stack before it: now kept. Best stack: {2}" -f $old.Name, $gain, ($BestSets -join ' + ')) 'Green'
+            } elseif (-not $helpedNow -and $old.Helped) {
+                # Out of best, except sets another kept run also brought in.
+                $others = @($Results.Values | Where-Object { $_.Helped -eq $true -and $_.Name -ne $old.Name -and $_.Name -notmatch '-(again|long)$' } |
+                    ForEach-Object { $n = $_.Name; Get-OwnSets ($AllRuns | Where-Object { $_.Name -eq $n } | Select-Object -First 1) })
+                foreach ($s in $own) { if ($others -notcontains $s) { [void]$BestSets.Remove($s) } }
+                Say ("{0}-long: {1} against the stack before it: taken out of best. Best stack: {2}" -f $old.Name, $(if ($null -ne $gain) { '{0:N1}%' -f $gain } else { $r.Status }), ($BestSets -join ' + ')) 'Yellow'
+            } else {
+                Say ("{0}-long: {1}; decision unchanged ({2})" -f $old.Name, $(if ($null -ne $gain) { '{0:N1}%' -f $gain } else { $r.Status }), $(if ($helpedNow) { 'kept' } else { 'not kept' }))
+            }
+            $old.Helped = $false
+            $old.Note = ($old.Note + " | close call: decided by $($old.Name)-long").Trim(' |')
+            Save-Result $old
+            $rerunLong += $old.Name
+            $Results[$r.Name] = $r
+            Save-Result $r
+            Write-Table
+        }
+    }
+
     # Noisy runs whose result is close: once more, at the end.
     if (-not $NoRerun) {
         $again = @($Results.Values | Where-Object {
-                $_.Noisy -and $_.Status -eq 'OK' -and $_.Name -notlike '*-again' -and (
+                $_.Noisy -and $_.Status -eq 'OK' -and $_.Name -notmatch '-(again|long)$' -and $rerunLong -notcontains $_.Name -and (
                     ($null -ne $_.VsBase -and [Math]::Abs($_.VsBase) -lt 2 * $MarginPct) -or
                     (($_.PSObject.Properties.Name -contains 'ComparedTo') -and $_.ComparedTo -and [Math]::Abs(100.0 * ($_.ComparedTo - $_.FrameMs) / $_.ComparedTo) -lt 2 * $MarginPct))
             })

@@ -83,6 +83,15 @@ also checks that no file of the real save (`RealDataDirs`) changed.
 - `OnlyIfCrashed`: a fallback that runs only if the named run did not finish.
 - `Prompt`: beeps when the world has started and waits for Enter before measuring.
 - `Env`: extra switches for one run.
+- `Seconds`: this run's measured time (else `RunSeconds`).
+
+Plan-level options for shorter plans:
+- `EarlyStopSeconds` / `EarlyStopSlowerPct`: a Try run (not the baseline) is stopped after that many seconds
+  if the frame-log reports of the second half of that time are at least that much slower than the best stack.
+  It shows as `STOPPED EARLY` with "stopped early: slower" and is never kept.
+- `CloseCallPct` / `RerunSeconds`: after the last run, every Try run within that many percent of the stack before
+  it that ran shorter than `RerunSeconds` runs again at `RerunSeconds` as `<name>-long`, and 'best' follows the rerun.
+- With `Calibrate = @()` the picture check uses its fixed limits; results.md says which limits were used.
 - `SetsFile`: a `run-switches.ps1` whose `$VictoryRuns` sets are read (not run); `Sets` in the plan win over it.
 
 ## Noisy runs (using the PC during a run)
