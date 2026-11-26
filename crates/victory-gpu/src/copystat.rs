@@ -1152,6 +1152,24 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    // The same times again, one label each, for the test runner (each
+    // `label value ms` is a row of its phase table).
+    tracing::info!(
+        "prep split: change checks {:.1} ms | guards {:.1} ms | moves {:.1} ms | runs {:.1} ms | queries {:.1} ms | snapshots {:.1} ms | sparse reads {:.1} ms | copied whole {:.1} ms | dynamic slot search {:.1} ms | notes {:.1} ms | recording {:.1} ms | pipeline wait {:.1} ms | frame waits {:.1} ms",
+        ms(c[C::WatchUs as usize]),
+        ms(c[C::GuardUs as usize]),
+        ms(c[C::MoveUs as usize]),
+        ms(c[C::RunUs as usize]),
+        ms(c[C::QueryUs as usize]),
+        ms(c[C::SnapshotUs as usize]),
+        ms(c[C::SparseUs as usize]),
+        ms(c[C::WholeUs as usize]),
+        c[C::DynamicNs as usize] / 1e6,
+        c[C::NoteNs as usize] / 1e6,
+        c[C::RecordNs as usize] / 1e6,
+        ms(c[C::PipelineWaitUs as usize]),
+        ms(c[C::PaceUs as usize]),
+    );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
