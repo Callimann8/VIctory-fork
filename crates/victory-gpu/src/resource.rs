@@ -1770,7 +1770,14 @@ pub(crate) fn let_go_idle() {
     let pct = *PCT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_SWEEP_PCT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
     });
-    if !sweep_due(video_memory, pct) {
+    // `VICTORY_TEXTURE_SWEEP_FULL=1`: also while the textures have no room
+    // ([`room_lately`]: `VICTORY_TEXTURE_BUDGET_MB` reached), whatever the
+    // card's share. With a texture budget the card stays under the sweep's
+    // share: the copies of shots long past were never let go, and the
+    // intro's later textures (2,150, 4.9 GB in SC1) never had a copy.
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let full = *FULL.get_or_init(|| std::env::var("VICTORY_TEXTURE_SWEEP_FULL").is_ok_and(|v| v.trim() == "1"));
+    if !sweep_due(video_memory, pct) && !(full && !room_lately()) {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(video_memory);
