@@ -41,7 +41,7 @@
     NoisyLimits = @{ VideoPct = 1.0; GpuPct = 4.0; CpuPct = 5.0 }
 
     # Switches the shader translator reads: a run that sets one gets its own warm-up.
-    ShaderSwitches = @('VICTORY_CODE_TABLE_AFTER', 'VICTORY_TRACER_GUARDS')
+    ShaderSwitches = @('VICTORY_CODE_TABLE_AFTER', 'VICTORY_TRACER_GUARDS', 'VICTORY_LDS_PRUNE')
 
     # Key presses to get from the title screen into the save, if a run needs
     # them (SendKeys syntax), e.g. @(@{ AfterSeconds = 90; Keys = '{ENTER}' }).
