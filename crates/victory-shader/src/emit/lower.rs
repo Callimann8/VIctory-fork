@@ -1846,6 +1846,29 @@ impl<'a> Lower<'a> {
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                // `VICTORY_CODE_TABLE_AFTER=1`: the table starts no earlier
+                // than the end of the instructions (after Marvisak e04c078).
+                // A load whose base offset is inside the code (an index added
+                // to a low base) made a table of the whole program, up to
+                // 64 KiB, which NVIDIA's compiler keeps per thread in local
+                // memory: slow to fill and gigabytes of video memory
+                // reserved. Constants live after the code; an index that
+                // reads below the table's start is clamped as one past it.
+                let first = if code_table_after() {
+                    let end = self
+                        .x
+                        .p
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .map(|i| (i.machine.offset + 4 * i.machine.words.len()) as u32)
+                        .max()
+                        .unwrap_or(0)
+                        .next_multiple_of(4);
+                    first.max(end)
+                } else {
+                    first
+                };
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -12490,4 +12513,10 @@ mod tests {
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
+}
+
+/// `VICTORY_CODE_TABLE_AFTER=1` (see `Lower::code_dword`).
+fn code_table_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_TABLE_AFTER").is_some_and(|v| v == "1"))
 }
