@@ -1798,6 +1798,32 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    forget_guards(at, len);
+}
+
+/// The runtime mapped `[at, at + len)` anew with the very pages it showed
+/// before (`xmem` maps again what stays of a view it cut,
+/// `VICTORY_REMAP_KEEP`): the bytes are the same, so what is in place
+/// there, the textures and the readbacks stay; only the guards go, since
+/// the new view is read-write (as [`title_memory_remapped`] leaves them).
+/// Called before the old view is unmapped and again once the new one is
+/// mapped.
+pub fn title_memory_reshown(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = RESHOWN[1].fetch_add(len as u64, Relaxed) + len as u64;
+    let n = RESHOWN[0].fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_power_of_two() {
+        tracing::info!(calls = n, mb = bytes >> 20, "title memory mapped again with the pages it showed: what is in place there kept, guards opened (VICTORY_REMAP_KEEP); since the start, each range told twice");
+    }
+    forget_guards(at, len);
+}
+
+/// Calls of [`title_memory_reshown`] and their bytes, since the start.
+static RESHOWN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`title_memory_remapped`]'s guard part: the blocks of `[at, at + len)`
+/// are no longer guarded (nor known unmapped).
+fn forget_guards(at: usize, len: usize) {
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();

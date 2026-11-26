@@ -539,6 +539,19 @@ fn map_runs() -> bool {
     *ON
 }
 
+/// `VICTORY_REMAP_KEEP=1` (on by default with `VICTORY_MAP_RUNS=1`; `0`
+/// off): when a mapping cuts a view, the GPU side is told only the cut part
+/// is new; what stays of the view, mapped again with the same pages, keeps
+/// its windows in place, textures and readbacks. A run mapped as one view
+/// (`VICTORY_MAP_RUNS`) is cut more often than a page.
+fn remap_keep() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| match std::env::var("VICTORY_REMAP_KEEP") {
+        Ok(v) => v.trim() == "1",
+        Err(_) => map_runs(),
+    });
+    *ON
+}
+
 /// `VICTORY_POOL_CHUNK_MB=N` (with `VICTORY_POOL_COMMIT=1`): pages per
 /// section of the pool (256 MiB by default); `None` for one section (0).
 fn pool_chunk_pages() -> Option<usize> {
@@ -922,6 +935,13 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    map_as(physical, base, len, slice, false)
+}
+
+/// [`map`]; `again`: the range showed these very pages until a moment ago
+/// (what stays of a view [`unmap`] cut, `VICTORY_REMAP_KEEP`), so the GPU
+/// side keeps what it holds there and only opens its guards.
+fn map_as(physical: &mut Physical, base: usize, len: usize, slice: Slice, again: bool) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -958,7 +978,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    if again {
+        victory_gpu::title_memory_reshown(base, len);
+    } else {
+        victory_gpu::title_memory_remapped(base, len);
+    }
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     for k in 0..len.div_ceil(PAGE) {
@@ -1051,7 +1075,21 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        // `VICTORY_REMAP_KEEP`: what stays of the view is mapped again
+        // below with the same pages, so only the cut part is told as new;
+        // the rest only loses its guards (the new view is read-write).
+        let (cut_from, cut_to) = (at.max(base), (at + size).min(end));
+        if remap_keep() {
+            victory_gpu::title_memory_remapped(cut_from, cut_to - cut_from);
+            if at < cut_from {
+                victory_gpu::title_memory_reshown(at, cut_from - at);
+            }
+            if at + size > cut_to {
+                victory_gpu::title_memory_reshown(cut_to, at + size - cut_to);
+            }
+        } else {
+            victory_gpu::title_memory_remapped(at, size);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1062,12 +1100,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        let again = remap_keep();
         if at < base {
-            map(physical, at, base - at, slice.clone());
+            map_as(physical, at, base - at, slice.clone(), again);
         }
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map_as(physical, end, at + size - end, Slice { index, ..slice }, again);
         }
     }
 }
