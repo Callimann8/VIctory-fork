@@ -1495,7 +1495,7 @@ pub(crate) fn targets_room_kept() -> u64 {
 
 /// What [`room`] counts as used beyond the card's own number: room kept
 /// for card copies of title buffers and for render targets not made yet.
-/// `VICTORY_ROOM_KEPT_SECS=<n>`: once neither has changed for n seconds,
+/// `VICTORY_ROOM_KEPT_SECS=<n>`: once neither has moved by 64 MiB for n seconds,
 /// none (the copies and targets of the world's first frames are made; a
 /// copy limit never reached kept its rest from textures for the run). Off
 /// (unset or 0): kept as before.
@@ -1510,10 +1510,14 @@ pub(crate) fn room_kept() -> u64 {
     if secs == 0 || kept == 0 {
         return kept;
     }
-    // The kept bytes at the last look, and when they last changed.
+    // The kept bytes when they last moved by 64 MiB or more, and when:
+    // render targets made and dropped every frame move them a little all
+    // the time, which must not hold the room for the run.
     static LAST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
     let now = crate::host::now_ms();
-    if LAST[0].swap(kept, Relaxed) != kept {
+    let at_last = LAST[0].load(Relaxed);
+    if at_last == 0 || at_last.abs_diff(kept) >= 64 << 20 {
+        LAST[0].store(kept, Relaxed);
         LAST[1].store(now, Relaxed);
         return kept;
     }
