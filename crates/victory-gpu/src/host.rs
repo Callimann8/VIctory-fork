@@ -3282,7 +3282,7 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3305,9 +3305,22 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = merge_runs();
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans;
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    spans
+}
+
+/// `VICTORY_SETTLE_STALE=1` (after Belobug 007fe55): for title memory changed
+/// under shader writes, wait only until no flight in the air may still
+/// write the stale spans, ask again and look again (three times), and only
+/// then settle everything as before.
+static SETTLE_STALE_SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn settle_stale_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_STALE").is_some_and(|v| v == "1"))
 }
 
 /// With [`late_exact`]: the most changed runs one submission sends up to
@@ -3828,6 +3841,12 @@ fn late_line(frames: f64) {
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
+        );
+    }
+    if settle_stale_on() {
+        tracing::info!(
+            "settles under shader writes spared per frame (VICTORY_SETTLE_STALE=1): {:.2}",
+            SETTLE_STALE_SPARED.swap(0, Ordering::Relaxed) as f64 / frames
         );
     }
 }
@@ -5800,6 +5819,33 @@ impl Host {
     /// Everything in the air is settled, never the first flights alone:
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
+    /// For a submission of `runs` whose refreshes leave `stale` spans
+    /// behind ([`stale_under_flights`]): with [`settle_stale_on`] (and
+    /// [`relay_exact`]) only the flights that may write those spans land
+    /// first, up to three times; what is left settles everything. The
+    /// submission's asking (`ranges`) is made again after each.
+    fn settle_stale(
+        &self,
+        submitted: &mut u64,
+        runs: &[&HostList],
+        mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        ranges: &[(usize, usize)],
+    ) {
+        if settle_stale_on() && relay_exact() {
+            for _ in 0..3 {
+                relay_wait(WHY_STALE, |line| stale.iter().all(|(_, from, to)| !touches(&line.written, *from, *to)));
+                crate::watch::ask_once(ranges);
+                stale = stale_under_flights(runs);
+                if stale.is_empty() {
+                    SETTLE_STALE_SPARED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        self.settle(submitted, WHY_STALE);
+        crate::watch::ask_once(ranges);
+    }
+
     fn settle(&self, submitted: &mut u64, why: usize) {
         if !late() {
             return;
@@ -6031,13 +6077,13 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
+                self.settle_stale(&mut submitted, runs, stale, &ranges);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && !stale_under_flights(runs).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
