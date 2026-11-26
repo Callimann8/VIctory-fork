@@ -207,6 +207,19 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// How long after the last sweep a submission behind flights settles them
+/// for one (`VICTORY_SWEEP_SETTLE_MS`; 1500 by default): a whole settle,
+/// some 80 ms at 5 frames a second, every seven frames. While the card's
+/// memory is short of room it stays 1500 whatever is asked, so that idle
+/// textures still go in time.
+fn sweep_settle_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_SWEEP_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1500)
+    });
+    if ms > 1500 && !crate::resource::room_lately() { 1500 } else { ms }
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -3376,8 +3389,19 @@ fn merge_runs() -> usize {
 /// its changed runs (hundreds to 16,000 a page, each a range to handle on
 /// the CPU); the scatter pass compares per dword on the card.
 pub(crate) fn merge_pages() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| merge_scatter() && std::env::var_os("VICTORY_MERGE_PAGES").is_some_and(|v| v == "1"))
+    merge_pages_stage() > 0
+}
+
+/// `VICTORY_MERGE_PAGES`: 1 merges every page whole, 2 all but the pages a
+/// landing found card writes in (those as changed runs).
+pub(crate) fn merge_pages_stage() -> u8 {
+    static STAGE: OnceLock<u8> = OnceLock::new();
+    *STAGE.get_or_init(|| {
+        if !merge_scatter() {
+            return 0;
+        }
+        std::env::var("VICTORY_MERGE_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
 }
 
 /// Most changed runs one page may have to be merged under shader writes
@@ -6145,7 +6169,7 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_settle_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);

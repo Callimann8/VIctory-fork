@@ -3225,7 +3225,7 @@ impl Shadow {
                     // anyway), without finding the runs.
                     if crate::host::merge_pages()
                         && let Some(card) = &self.card
-                        && !card.written_pages.lock().unwrap_or_else(|e| e.into_inner()).contains(&(lo / PAGE))
+                        && !(crate::host::merge_pages_stage() > 1 && card.written_pages.lock().unwrap_or_else(|e| e.into_inner()).contains(&(lo / PAGE)))
                     {
                         if title[..] == held[..] {
                             continue;
@@ -3768,7 +3768,7 @@ impl Shadow {
             let (a, b) = (a - at, b - at);
             // Where the card wrote (outside what the title changed and
             // sent up since): pages to merge as changed runs from now on.
-            if crate::host::merge_pages()
+            if crate::host::merge_pages_stage() > 1
                 && let (Some(f), Some(l)) = (first_difference(&gpu[a..b], &held[a..b]), last_difference(&gpu[a..b], &held[a..b]))
             {
                 let mut pages = card.written_pages.lock().unwrap_or_else(|e| e.into_inner());
