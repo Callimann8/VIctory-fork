@@ -307,6 +307,31 @@ function Get-Usage([int[]]$GamePids) {
     return $r
 }
 
+# Per-core processor use, the game's memory and graphics memory, free RAM
+# (WMI classes: their names are not translated on a German Windows).
+function Get-Sample([int[]]$GamePids) {
+    $r = @{ Cores = @(); Ws = 0.0; PeakWs = 0.0; Commit = 0.0; Dedicated = 0.0; Shared = 0.0; FreeRam = $null; CpuMs = $null }
+    try {
+        $cpu = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Property Name, PercentProcessorTime -ErrorAction Stop |
+            Where-Object { $_.Name -ne '_Total' } | Sort-Object { [int]($_.Name -replace '\D', '') }
+        $r.Cores = @($cpu | ForEach-Object { [double]$_.PercentProcessorTime })
+    } catch { }
+    foreach ($id in $GamePids) {
+        $p = Get-Process -Id $id -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $r.Ws += $p.WorkingSet64; $r.PeakWs += $p.PeakWorkingSet64; $r.Commit += $p.PrivateMemorySize64
+        try { $r.CpuMs += $p.TotalProcessorTime.TotalMilliseconds } catch { }
+    }
+    try {
+        $gm = Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -Property Name, DedicatedUsage, SharedUsage -ErrorAction Stop
+        foreach ($g in $gm) {
+            if ($g.Name -match '^pid_(\d+)_' -and $GamePids -contains [int]$matches[1]) { $r.Dedicated += $g.DedicatedUsage; $r.Shared += $g.SharedUsage }
+        }
+    } catch { }
+    try { $r.FreeRam = [double](Get-CimInstance -ClassName Win32_OperatingSystem -Property FreePhysicalMemory -ErrorAction Stop).FreePhysicalMemory * 1KB } catch { }
+    return $r
+}
+
 # ------------------------------------------------------------------ the save
 
 $script:RealSaveStamp = $null
@@ -346,21 +371,74 @@ function New-RunData([string]$Dest) {
 
 # ------------------------------------------------------------------ the frame log
 
+# Per-frame timings of the frame line ("usual frame ..."), medians per run.
+$FrameFields = [ordered]@{
+    'render thread ran'         = 'render thread: ran ([\d.]+) ms'
+    'render: in present call'   = 'in the present call ([\d.]+)'
+    'render: in submit calls'   = 'in submit calls ([\d.]+)'
+    'render: paced'             = ', paced ([\d.]+)'
+    'submit thread at work'     = 'submit thread: at work ([\d.]+) ms'
+    'submit: preparing'         = 'preparing ([\d.]+)'
+    'submit: waiting for card'  = 'waiting for the card ([\d.]+)'
+    'submit: copies'            = '; copies ([\d.]+) ms'
+    'copy-back'                 = 'copy-back ([\d.]+) ms'
+    'card idle'                 = 'card: idle ([\d.]+) ms'
+    'card: send-and-hash lists' = 'send-and-hash lists ([\d.]+) ms'
+    'card: compare lists'       = 'compare lists ([\d.]+) ms'
+    'card: all other lists'     = 'all other lists ([\d.]+) ms'
+    'recording, all threads'    = 'recording, all threads: ([\d.]+) ms'
+    'textures: refresh'         = 'textures: refresh ([\d.]+) ms'
+    'remapping'                 = 'remapping: [\d.]+ calls ([\d.]+) ms'
+    'pipelines: waited'         = '([\d.]+) ms waited'
+    'process: user'             = 'process: ([\d.]+) user'
+    'process: kernel'           = 'user ([\d.]+) kernel ms'
+}
+# Further lines of "label N ms | label N ms" made with the frame line (e.g. a
+# split of the preparing time); every label becomes a phase of its own.
+$PhaseLines = @(Get-Setting 'PhaseLines' @('prep split:'))
+
 function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
     $m = @{ Usual = @(); Prep = @(); Idle = @(); Back = @(); Free = @(); Medians = @(); Frames = 0; Seconds = 0.0; Long = 0; Lines = 0
-        Crash = ''; Slots = 0; Warmup = '' }
+        Crash = ''; Slots = 0; Warmup = ''; Fields = [ordered]@{}; Phases = [ordered]@{}; SwitchLines = @(); Unmapped = ''
+        Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = '' }
     if (-not (Test-Path $Path)) { return $m }
+    foreach ($k in $FrameFields.Keys) { $m.Fields[$k] = New-Object System.Collections.Generic.List[double] }
     $world = $null
     if ($WorldStamp) { $world = Get-Stamp $WorldStamp }
     foreach ($raw in [IO.File]::ReadLines($Path)) {
         $line = Clear-Line $raw
-        if ($line -match 'unhandled exception|DEVICE_REMOVED|device removed|device was removed|Present answered|panicked at') { if (-not $m.Crash) { $m.Crash = $line.Substring(0, [Math]::Min(200, $line.Length)) } }
+        if (-not $line.Trim()) { continue }
+        $m.Tail.Enqueue($line); if ($m.Tail.Count -gt 40) { [void]$m.Tail.Dequeue() }
+        if ($line -match 'unhandled exception|DEVICE_REMOVED|device removed|device was removed|Present answered|panicked at') { if (-not $m.Crash) { $m.Crash = $line.Substring(0, [Math]::Min(300, $line.Length)) } }
         if ($line -match 'no free dynamic descriptor slots') { $m.Slots++ }
         if ($line -match 'warm-up\s+\d+ hashes asked') { $m.Warmup = $line.Trim() }
-        if ($line -notmatch 'framelog: (usual frame|frame times)') { continue }
+        if ($line -match 'crash|dump|minidump' -and $line -match '([A-Za-z]:[\\/][^\s"'']+\.(?:dmp|bin))\b') { $dp = $matches[1]; if ($m.Dumps -notcontains $dp) { $m.Dumps += $dp } }
+        if (-not $m.CacheDir -and $line -match 'path=(.+?)[\\/]images[\\/]') { $m.CacheDir = $matches[1] }
+        if (-not $m.Unmapped -and $line -match 'switch map: .* \|\| set, no counter: (.*?)(?: frames=\d+)?$') { $m.Unmapped = $matches[1].Trim() }
+        $isFrame = $line -match 'framelog: (usual frame|frame times)'
+        $isMap = $line -match 'switch map: '
+        $phase = $null
+        foreach ($p in $PhaseLines) { if ($line.Contains($p)) { $phase = $p; break } }
+        if (-not ($isFrame -or $isMap -or $phase)) { continue }
         if ($world) {
             $t = Get-Stamp $line
             if ($t -and ($t - $world).TotalSeconds -lt $SkipSeconds) { continue }
+        }
+        if ($isMap) {
+            $text = ($line -replace '^.*?switch map: ', '') -replace ' frames=\d+\s*$', ''
+            $m.SwitchLines += ($text -split ' \|\| ')[0]
+            continue
+        }
+        if ($phase) {
+            $text = ($line.Substring($line.IndexOf($phase) + $phase.Length)) -replace ' frames=\d+\s*$', ''
+            foreach ($seg in ($text -split '\|')) {
+                if ($seg -match '^\s*(.+?)\s+([\d.]+)\s*ms\b') {
+                    $label = "$($phase.TrimEnd(':')) $($matches[1].Trim())"
+                    if (-not $m.Phases.Contains($label)) { $m.Phases[$label] = New-Object System.Collections.Generic.List[double] }
+                    $m.Phases[$label].Add([double]$matches[2])
+                }
+            }
+            continue
         }
         if ($line -match 'usual frame \(the mean of \d+ not long\): ([\d.]+) ms') {
             $m.Lines++
@@ -369,12 +447,35 @@ function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
             if ($line -match 'card: idle ([\d.]+) ms') { $m.Idle += [double]$matches[1] }
             if ($line -match 'copy-back ([\d.]+) ms') { $m.Back += [double]$matches[1] }
             if ($line -match '\| (\d+) MB free') { $m.Free += [double]$matches[1] }
+            foreach ($k in $FrameFields.Keys) { if ($line -match $FrameFields[$k]) { $m.Fields[$k].Add([double]$matches[1]) } }
         } elseif ($line -match 'frame times: (\d+) frames in ([\d.]+) s: shortest \d+ ms, median (\d+), longest \d+; (\d+) long') {
             $m.Frames += [int]$matches[1]; $m.Seconds += [double]$matches[2]
             $m.Medians += [double]$matches[3]; $m.Long += [int]$matches[4]
         }
     }
     return $m
+}
+
+# The switch map's last lines of the measured stretch, per switch: what the
+# last line says, refusals over those lines, and whether it never acted.
+function ConvertFrom-SwitchMap([string[]]$Lines, $RunEnv) {
+    $rows = [ordered]@{}
+    foreach ($text in $Lines) {
+        if ($text -match '^no mapped switch set') { continue }
+        foreach ($part in ($text -split ' \| ')) {
+            if ($part -notmatch '^(VICTORY_[A-Z0-9_]+)=(.*?): (.*)$') { continue }
+            $n = $matches[1]; $v = $matches[2]; $what = $matches[3]
+            if (-not $rows.Contains($n)) { $rows[$n] = [ordered]@{ Switch = $n; Value = $v; Last = ''; Never = $false; Refused = 0; Why = '' } }
+            $row = $rows[$n]
+            $row.Last = $what; $row.Value = $v
+            $row.Never = $what -like 'NEVER ACTED*'
+            if ($what -match 'refused (\d+) \((.*)\)\s*$') { $row.Refused += [int]$matches[1]; $row.Why = $matches[2] }
+        }
+    }
+    # Switches of the run the map does not name at all (an older build, or not wired in yet).
+    $missing = @()
+    if ($Lines.Count) { foreach ($k in $RunEnv.Keys) { if (-not $rows.Contains($k)) { $missing += $k } } }
+    return @{ Rows = @($rows.Values | ForEach-Object { [pscustomobject]$_ }); Missing = $missing }
 }
 
 $TimeRx = '(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)'
@@ -511,6 +612,8 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     $pics = Join-Path $dir 'frames'
     New-Item -ItemType Directory -Force -Path $pics | Out-Null
     $r = [ordered]@{ Name = $Name; Build = $Run.Build; Sets = ($Expanded.Sets -join '+'); Switches = (($Expanded.Env.GetEnumerator() | ForEach-Object { "$($_.Key -replace '^VICTORY_','')=$($_.Value)" }) -join ' ')
+        Phases = $null; SwitchMap = @(); SwitchMissing = @(); SwitchUnmapped = ''; SwitchFlags = ''; CpuCores = @(); CpuAllPct = $null; BusyCores = $null; CpuMsPerFrame = $null
+        PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
         Status = 'not run'; FrameMs = $null; Fps = $null; MedianMs = $null; PrepMs = $null; GpuMs = $null; CopyBackMs = $null; FreeMbMin = $null; LongPct = $null
         VsBase = $null; Helped = $null; Pictures = ''; PictureNote = ''; Noisy = [bool]$Noisy; NoisyWhy = @($(if ($Noisy) { 'whole plan marked noisy (-Noisy)' })); Note = ''; Dir = $dir; Pics = $pics; Log = ''; World = ''; Started = (Get-Date).ToString('s') }
     Say "copying the test save for $Name..."
@@ -536,7 +639,8 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     $logs = @($out, $err)
     $world = $null; $worldAt = $null; $storageOk = $false; $gamePids = @()
     $usage = New-Object System.Collections.Generic.List[object]
-    $lastSample = Get-Date; $lastWin = -1
+    $samples = New-Object System.Collections.Generic.List[object]
+    $lastSample = Get-Date; $lastWin = -1; $lastPc = Get-Date
     $keysSent = 0
     if ($Run.ContainsKey('Prompt')) { $promptDone = $false } else { $promptDone = $true }
     try {
@@ -584,6 +688,10 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
                 $world = (Get-Date).ToUniversalTime().ToString('o')
                 Say "$Name`: measuring from now for $RunSeconds s"
             }
+            # The measured stretch (after the first SkipSeconds, like the frame-log numbers).
+            if ($world -and $promptDone -and ($now - $worldAt).TotalSeconds -ge $SkipSeconds -and ($now - $lastPc).TotalSeconds -ge 5) {
+                $samples.Add((Get-Sample $gamePids)); $lastPc = $now
+            }
             if ($world -and $promptDone -and ($now - $lastSample).TotalSeconds -ge 10) {
                 $usage.Add((Get-Usage $gamePids)); $lastSample = $now
                 if (Test-Path $NoisyFlag) { if ($r.NoisyWhy -notcontains 'marked by hand') { $r.NoisyWhy += 'marked by hand' } }
@@ -613,10 +721,13 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
         throw "SAVE SAFETY STOP: a file of the real save changed during run $Name ($stamp). Check C:\xcl save backups before anything else."
     }
 
-    # The save copy is not needed any more (pictures and logs stay).
-    if (-not (Get-Setting 'KeepRunData' $false)) { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
-
     $m = ConvertFrom-FrameLog $r.Log $world
+    $crashed = ($r.Status -ne 'OK' -and $r.Status -ne 'not run') -or $m.Crash
+    if ($m.Crash -and $r.Status -ne 'OK') { $r.Status = 'CRASH' }
+    if ($crashed) { try { Save-CrashInfo $r $m $data $began } catch { Say "crash details incomplete: $($_.Exception.Message)" 'Yellow' } }
+    # The save copy is not needed any more (pictures and logs stay; kept after a crash).
+    if (-not (Get-Setting 'KeepRunData' $false) -and -not $crashed) { Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue }
+
     $r.FrameMs = Median $m.Usual
     $r.MedianMs = Median $m.Medians
     $r.PrepMs = Median $m.Prep
@@ -629,6 +740,49 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     if ($m.Seconds -gt 0) { $r.Fps = [Math]::Round($m.Frames / $m.Seconds, 2) }
     if ($m.Frames -gt 0) { $r.LongPct = [Math]::Round(100.0 * $m.Long / $m.Frames, 1) }
     if ($m.Crash) { $r.Note = $m.Crash; if ($r.Status -ne 'OK') { $r.Status = 'CRASH' } }
+    # Phases: the frame line's timings, then the extra phase lines.
+    $ph = [ordered]@{}
+    foreach ($k in $m.Fields.Keys) { $v = Median $m.Fields[$k].ToArray(); if ($null -ne $v) { $ph[$k] = [Math]::Round($v, 1) } }
+    if ($null -ne $r.GpuMs) { $ph['GPU busy (frame - card idle)'] = [Math]::Round($r.GpuMs, 1) }
+    foreach ($k in $m.Phases.Keys) { $ph[$k] = [Math]::Round((Median $m.Phases[$k].ToArray()), 1) }
+    $r.Phases = [pscustomobject]$ph
+    # Switch map: the last 3 lines of the measured stretch.
+    $last3 = @($m.SwitchLines | Select-Object -Last 3)
+    $sm = ConvertFrom-SwitchMap $last3 $Expanded.Env
+    $r.SwitchMap = $sm.Rows
+    $r.SwitchMissing = $sm.Missing
+    $r.SwitchUnmapped = $m.Unmapped
+    $never = @($sm.Rows | Where-Object { $_.Never }).Count
+    $refused = @($sm.Rows | Where-Object { $_.Refused -gt 0 }).Count
+    $flags = @()
+    if (-not $last3.Count -and $Expanded.Env.Count) { $flags += 'no switch map' }
+    if ($never) { $flags += "$never never acted" }
+    if ($refused) { $flags += "$refused refused" }
+    if ($sm.Missing.Count) { $flags += "$($sm.Missing.Count) not in map" }
+    $r.SwitchFlags = $flags -join ', '
+    # Processor and memory over the measured stretch.
+    if ($samples.Count) {
+        $nc = ($samples | ForEach-Object { $_.Cores.Count } | Measure-Object -Maximum).Maximum
+        $cores = @()
+        for ($c = 0; $c -lt $nc; $c++) { $cores += [Math]::Round((($samples | Where-Object { $_.Cores.Count -gt $c } | ForEach-Object { $_.Cores[$c] }) | Measure-Object -Average).Average, 0) }
+        $r.CpuCores = $cores
+        if ($cores.Count) { $r.CpuAllPct = [Math]::Round(($cores | Measure-Object -Average).Average, 0); $r.BusyCores = @($cores | Where-Object { $_ -ge 50 }).Count }
+        $gb = { param($x) [Math]::Round($x / 1GB, 2) }
+        $r.PeakWsGB = & $gb (($samples | ForEach-Object { [Math]::Max($_.Ws, $_.PeakWs) } | Measure-Object -Maximum).Maximum)
+        $r.PeakCommitGB = & $gb (($samples | Measure-Object -Property Commit -Maximum).Maximum)
+        $r.PeakVramGB = & $gb (($samples | Measure-Object -Property Dedicated -Maximum).Maximum)
+        $r.PeakSharedGB = & $gb (($samples | Measure-Object -Property Shared -Maximum).Maximum)
+        $free = @($samples | Where-Object { $null -ne $_.FreeRam } | ForEach-Object { $_.FreeRam })
+        if ($free.Count) { $r.MinFreeRamGB = & $gb (($free | Measure-Object -Minimum).Minimum) }
+        $cpuS = @($samples | Where-Object { $null -ne $_.CpuMs })
+        if ($cpuS.Count -ge 2 -and $m.Seconds -gt 0 -and $m.Frames -gt 0) {
+            $span = ($cpuS.Count - 1) * 5.0
+            $fps = $m.Frames / $m.Seconds
+            $r.CpuMsPerFrame = [Math]::Round(($cpuS[-1].CpuMs - $cpuS[0].CpuMs) / [Math]::Max(1, $span * $fps), 0)
+        }
+        "core," + (0..($nc - 1) -join ',') | Set-Content (Join-Path $dir 'cpu-cores.csv')
+        $samples | ForEach-Object { 'sample,' + ($_.Cores -join ',') } | Add-Content (Join-Path $dir 'cpu-cores.csv')
+    }
     if ($m.Slots) { $r.Note = ($r.Note + " | $($m.Slots)x no free dynamic descriptor slots").Trim(' |') }
     if ($r.Status -eq 'OK' -and $m.Lines -lt 5) { $r.Status = 'FEW LINES'; $r.Note = ($r.Note + " | only $($m.Lines) frame-log reports after the first $SkipSeconds s").Trim(' |') }
 
@@ -656,31 +810,96 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
 
 function Fmt($x) { if ($null -eq $x) { '-' } else { '{0:N0}' -f $x } }
 
+# On a crash or early end: the exception line, the last 40 log lines, the
+# game's crashes.log and any dump file written since the run began.
+function Save-CrashInfo($R, $M, [string]$Data, [datetime]$Began) {
+    $dumps = New-Object System.Collections.Generic.List[string]
+    foreach ($d in $M.Dumps) { if (Test-Path $d) { $dumps.Add($d) } else { $dumps.Add("$d (named in the log, not found)") } }
+    $dirs = @($Data) + @(Get-Setting 'CrashDirs' @('C:\xcl\victory-data', '%LOCALAPPDATA%\CrashDumps', '%LOCALAPPDATA%\victory') | ForEach-Object { Expand-Path $_ })
+    foreach ($d in $dirs) {
+        if (-not (Test-Path $d)) { continue }
+        Get-ChildItem -Path $d -Recurse -Depth 3 -File -Include *.dmp, crash-*.bin, crashes.log -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge $Began } | ForEach-Object { if (-not $dumps.Contains($_.FullName)) { $dumps.Add($_.FullName) } }
+    }
+    if ($M.CacheDir -and (Test-Path $M.CacheDir)) {
+        Get-ChildItem -Path $M.CacheDir -File -Filter 'crash-*.bin' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Began } |
+            ForEach-Object { if (-not $dumps.Contains($_.FullName)) { $dumps.Add($_.FullName) } }
+    }
+    $crashLog = Get-ChildItem -Path $Data -Recurse -File -Filter crashes.log -ErrorAction SilentlyContinue | Select-Object -First 1
+    $copied = ''
+    if ($crashLog) { $copied = Join-Path $R.Dir 'crashes.log'; Copy-Item $crashLog.FullName $copied -Force }
+    $tail = @($M.Tail.ToArray())
+    $R.Crash = [pscustomobject]@{ Exception = $M.Crash; Dumps = @($dumps); CrashesLog = $copied; Tail = $tail }
+    $txt = @("run $($R.Name): $($R.Status)", "exception: $(if ($M.Crash) { $M.Crash } else { '(no exception line in the log)' })", "crashes.log: $(if ($copied) { $copied } else { '(none)' })", 'dump files:') +
+        @($(if ($dumps.Count) { $dumps | ForEach-Object { "  $_" } } else { '  (none found)' })) + @('', 'last 40 log lines:') + $tail
+    $txt | Set-Content (Join-Path $R.Dir 'crash.txt') -Encoding UTF8
+}
+
+# The full picture of one run, as Markdown (also in results.md).
+function Get-RunDetails($R) {
+    $o = New-Object System.Collections.Generic.List[string]
+    $o.Add("### $($R.Name): $($R.Status), frame $(Fmt $R.FrameMs) ms, $($R.Fps) fps")
+    $o.Add('')
+    $o.Add("Switches: ``$(if ($R.Switches) { $R.Switches } else { '(launcher as is)' })``  ")
+    $o.Add("Pictures: $($R.Pictures) $($R.PictureNote)  ")
+    if ($R.Noisy) { $o.Add("Noisy: $($R.NoisyWhy -join '; ')  ") }
+    if ($R.SwitchMap -and @($R.SwitchMap).Count) {
+        $o.Add(''); $o.Add('| Switch | Value | Last switch-map report (per frame) | Flag |'); $o.Add('|---|---|---|---|')
+        foreach ($s in $R.SwitchMap) {
+            $flag = @(); if ($s.Never) { $flag += '**NEVER ACTED**' }; if ($s.Refused -gt 0) { $flag += "**refused $($s.Refused)** ($($s.Why))" }
+            $o.Add("| $($s.Switch -replace '^VICTORY_','') | $($s.Value) | $($s.Last -replace '\|','/') | $($flag -join ', ') |")
+        }
+    } elseif ($R.Switches) { $o.Add(''); $o.Add('No switch-map lines in the measured stretch (a build without the switch map?).') }
+    if ($R.SwitchMissing -and @($R.SwitchMissing).Count) { $o.Add(''); $o.Add("Set but not in the switch map: $(@($R.SwitchMissing) -join ', ')") }
+    if ($R.SwitchUnmapped) { $o.Add(''); $o.Add("Set, no counter (from the game): $($R.SwitchUnmapped)") }
+    if ($R.Phases -and @($R.Phases.PSObject.Properties).Count) {
+        $o.Add(''); $o.Add('| Phase (median ms per frame) | ms |'); $o.Add('|---|---|')
+        foreach ($p in $R.Phases.PSObject.Properties) { $o.Add("| $($p.Name) | $($p.Value) |") }
+    }
+    if ($null -ne $R.CpuAllPct) {
+        $o.Add('')
+        $o.Add("CPU: all cores $($R.CpuAllPct)% on average, $($R.BusyCores) of $(@($R.CpuCores).Count) at 50% or more; game process $(Fmt $R.CpuMsPerFrame) ms of processor time per frame.  ")
+        $o.Add("Per core (%): $((@($R.CpuCores) | ForEach-Object -Begin { $i = 0 } -Process { '{0}:{1}' -f $i, $_; $i++ }) -join ' ')  ")
+        $o.Add("Memory peaks: working set $($R.PeakWsGB) GB, commit $($R.PeakCommitGB) GB, graphics memory $($R.PeakVramGB) GB dedicated + $($R.PeakSharedGB) GB shared; lowest free RAM $($R.MinFreeRamGB) GB.")
+    }
+    if ($R.Crash) {
+        $o.Add('')
+        $o.Add("Crash: $(if ($R.Crash.Exception) { $R.Crash.Exception } else { '(no exception line)' })  ")
+        $o.Add("Dump files: $(if (@($R.Crash.Dumps).Count) { @($R.Crash.Dumps) -join ', ' } else { 'none found' }); crashes.log: $(if ($R.Crash.CrashesLog) { $R.Crash.CrashesLog } else { 'none' }); last 40 log lines in $($R.Dir)\crash.txt")
+    }
+    $o.Add('')
+    return $o
+}
+
 # ------------------------------------------------------------------ the table
 
 function Write-Table {
     $rows = @($Results.Values | Sort-Object { $i = [array]::IndexOf($names, ($_.Name -replace '-again$', '')); if ($i -lt 0) { $i = 999 }; 2 * $i + [int]($_.Name -like '*-again') })
     $csv = Join-Path $PlanDir 'results.csv'
-    $rows | Select-Object Name, Build, Sets, Status, FrameMs, Fps, MedianMs, PrepMs, GpuMs, CopyBackMs, FreeMbMin, LongPct, VsBase, Helped, Pictures, Noisy, @{ n = 'NoisyWhy'; e = { $_.NoisyWhy -join '; ' } }, Note, Switches, PictureNote, Dir |
+    $rows | Select-Object Name, Build, Sets, Status, FrameMs, Fps, MedianMs, PrepMs, GpuMs, CopyBackMs, FreeMbMin, LongPct, VsBase, Helped, Pictures, Noisy, CpuAllPct, BusyCores, CpuMsPerFrame, PeakWsGB, PeakCommitGB, PeakVramGB, PeakSharedGB, MinFreeRamGB, SwitchFlags, @{ n = 'NoisyWhy'; e = { $_.NoisyWhy -join '; ' } }, Note, Switches, PictureNote, Dir |
         Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# Test plan $planName")
     $md.Add('')
     $md.Add("Started $($script:PlanStart). Each run: $RunSeconds s after the game world started; numbers are medians of the frame-log reports after the first $SkipSeconds s. Frame = usual frame (long frames left out), fps = all frames / time. GPU = frame minus card idle. vs base = frame against $Baseline (negative = faster). Close = within $MarginPct%.")
     $md.Add('')
-    $md.Add('| Run | Build | Sets | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | Pictures | Noisy | Note |')
-    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    $md.Add('| Run | Build | Sets | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Switch flags | Pictures | Noisy | Note |')
+    $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($r in $rows) {
         $vs = if ($null -ne $r.VsBase) { '{0:+0.0;-0.0}%' -f $r.VsBase } else { '-' }
         $helped = if ($r.Helped -eq $true) { ' (kept)' } else { '' }
         $nz = if ($r.Noisy) { 'yes: ' + ($r.NoisyWhy -join '; ') } else { '' }
         if ($r.Name -eq $PicRef) { $r.Pictures = 'reference' }
-        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
+        $md.Add("| $($r.Name)$helped | $($r.Build) | $($r.Sets) | $($r.Status) | $(Fmt $r.FrameMs) | $($r.Fps) | $vs | $(Fmt $r.PrepMs) | $(Fmt $r.GpuMs) | $(Fmt $r.CopyBackMs) | $(Fmt $r.FreeMbMin) | $($r.LongPct) | $(if ($null -ne $r.CpuAllPct) { "$($r.CpuAllPct) ($($r.BusyCores))" }) | $(if ($null -ne $r.PeakWsGB) { "$($r.PeakWsGB) / $($r.PeakVramGB)" }) | $($r.SwitchFlags) | $($r.Pictures) | $nz | $($r.Note -replace '\|','/') |")
     }
     $md.Add('')
     $md.Add("Best stack at the end: $(if ($BestSets.Count) { $BestSets -join ' + ' } else { '(none helped)' })")
     $md.Add('')
     $md.Add('Picture check: PASS = no visual difference found against the main build; CHECK = look at the report; FAIL = a visual change (see <run>\pictures\report.html).')
+    $md.Add('')
+    $md.Add('## Run details')
+    $md.Add('')
+    foreach ($r in $rows) { foreach ($l in (Get-RunDetails $r)) { $md.Add($l) } }
     $md | Set-Content (Join-Path $PlanDir 'results.md') -Encoding UTF8
     $rows | Format-Table Name, Build, Status, @{ n = 'Frame'; e = { Fmt $_.FrameMs } }, Fps, @{ n = 'vsBase'; e = { if ($null -ne $_.VsBase) { '{0:+0.0;-0.0}%' -f $_.VsBase } } }, @{ n = 'Prep'; e = { Fmt $_.PrepMs } }, @{ n = 'GPU'; e = { Fmt $_.GpuMs } }, Pictures, Noisy, Sets -AutoSize | Out-String | Write-Host
 }
@@ -700,7 +919,10 @@ function Update-Calibration {
     } else { Say "picture calibration failed (see picture-noise.log); default limits stay" 'Yellow' }
 }
 
-function Save-Result($r) { $r | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $r.Dir 'result.json') -Encoding UTF8 }
+function Save-Result($r) {
+    $r | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $r.Dir 'result.json') -Encoding UTF8
+    Get-RunDetails $r | Set-Content (Join-Path $r.Dir 'details.md') -Encoding UTF8
+}
 
 # ------------------------------------------------------------------ check
 

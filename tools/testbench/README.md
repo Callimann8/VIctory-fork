@@ -33,6 +33,16 @@ Results go to `C:\xcl\runs\testbench\<plan>-<date>-<time>\`:
   CPU preparing, GPU (frame minus card idle), copy-back, lowest free memory, long frames, picture verdict and noisy mark.
 - `<run>\`: `err.log`/`out.log` (the game's log), `env.txt` (exact switches), `frames\` (pictures),
   `pictures\report.html` (side by side with main and a red difference map), `pc-use.csv`.
+- `results.md` also has a **Run details** section per run (also in `<run>\details.md`):
+  - the switch map: what each switch did per frame in the last 3 `switch map:` lines of the measured stretch,
+    with NEVER ACTED and refusals flagged, and switches the map does not name;
+  - phase timings (medians per frame) from the frame line, plus every `prep split: label N ms | ...` line
+    (more such lines: `PhaseLines` in the config);
+  - processor use per core and for all cores, the game's processor time per frame;
+  - peaks of working set, commit, and dedicated and shared graphics memory, and the lowest free RAM;
+  - on a crash: the exception line, dump files (`*.dmp`, `crash-*.bin`, named in the log or written since the
+    run began), the game's `crashes.log`, and `crash.txt` with the last 40 log lines. The run's save copy is kept.
+- `<run>\cpu-cores.csv`: per-core samples every 5 s.
 - `testbench.log`: everything the runner did.
 
 Ctrl+C stops the plan; the game is closed and `-Resume` goes on from the next run.
