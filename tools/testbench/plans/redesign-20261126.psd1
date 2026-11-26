@@ -32,6 +32,7 @@
         @{ Name = 'R4b';   Build = 'test'; Use = 'best', 'R3d', 'R4b'; Prompt = 'Load the test save and walk outside; Enter to measure' }   # compared only: WATCH_FIXED on GUARD_PRIVATE=all
         @{ Name = 'R5';    Build = 'test'; Use = 'best', 'R5'; Try = $true }
         @{ Name = 'R6';    Build = 'test'; Use = 'best', 'R6'; Try = $true }
+        @{ Name = 'R6b';   Build = 'test'; Use = 'best', 'R6b'; Try = $true }
         @{ Name = 'R7';    Build = 'test'; Use = 'best', 'R7'; Try = $true }
         @{ Name = 'R8';    Build = 'test'; Use = 'best', 'R8'; Try = $true }
         @{ Name = 'R9';    Build = 'test'; Use = 'best', 'R9'; Try = $true }
