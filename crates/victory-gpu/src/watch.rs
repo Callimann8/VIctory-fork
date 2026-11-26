@@ -764,18 +764,17 @@ pub(crate) fn guard_private(start: usize, len: usize) {
             j.ahead_asked = now;
         }
         for (from, to) in runs {
-            // Cut where a cell went back to the watch; blocks the guards
-            // hold already (a range that spans into them) keep their notes.
+            // Cut where a cell went back to the watch and around blocks
+            // the guards hold already (a range that spans into them).
             let mut pieces: Vec<(usize, usize)> = Vec::new();
             for b in from..to {
-                if g.demoted.contains(&(b / CELL_BLOCKS)) {
+                // Blocks the guards hold already are views (or noted as
+                // such): they stay as they are, not taken.
+                if g.demoted.contains(&(b / CELL_BLOCKS)) || g.back.contains(&b) || g.protected.contains(&b) || g.viewed.contains(&b) || g.absent.contains(&b) {
                     continue;
                 }
                 g.private.insert(b);
                 taken += 1;
-                if g.protected.contains(&b) {
-                    continue;
-                }
                 match pieces.last_mut() {
                     Some(r) if r.1 == b => r.1 = b + 1,
                     _ => pieces.push((b, b + 1)),
@@ -794,11 +793,23 @@ pub(crate) fn guard_private(start: usize, len: usize) {
                     GetWriteWatch(0, (a * BLOCK) as *const _, (b - a) * BLOCK, j.found.as_mut_ptr().cast(), &mut count, &mut granularity)
                 } != 0;
                 if failed {
-                    // Not write-watched (view memory, or memory the kernel
-                    // does not watch): the blocks just guarded count as
-                    // written once.
+                    // Not write-watched. View memory: the guards held it
+                    // already and keep it as a view (not taken, so its
+                    // faults never send a cell back to a watch that cannot
+                    // see it); the blocks just guarded count as written
+                    // once. Other memory (not the title's watched
+                    // reservations) is left as it was, unguarded.
+                    let view = is_view(a * BLOCK, b * BLOCK);
                     for block in a..b {
+                        g.private.remove(&block);
                         g.clean.remove(&block);
+                        if !view {
+                            g.back.insert(block);
+                        }
+                        taken -= 1;
+                    }
+                    if !view {
+                        open_here(&mut g, a * BLOCK, b * BLOCK);
                     }
                     continue;
                 }
@@ -860,12 +871,15 @@ fn private_demote(g: &mut Guards, cell: usize) {
     if !g.demoted.insert(cell) {
         return;
     }
-    let blocks = cell * CELL_BLOCKS..(cell + 1) * CELL_BLOCKS;
-    for b in blocks.clone() {
+    // Only the blocks taken: views and other memory sharing the cell keep
+    // their guards.
+    let taken: Vec<usize> = g.private.range(cell * CELL_BLOCKS..(cell + 1) * CELL_BLOCKS).copied().collect();
+    for b in taken {
         g.private.remove(&b);
         g.viewed.remove(&b);
+        g.back.insert(b);
+        open_here(g, b * BLOCK, (b + 1) * BLOCK);
     }
-    open_here(g, blocks.start * BLOCK, blocks.end * BLOCK);
     PRIVATE_COUNT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -904,6 +918,10 @@ struct Guards {
     hot: BTreeMap<usize, (u64, u32)>,
     /// With [`private_on`]: cells sent back to the write watch for good.
     demoted: BTreeSet<usize>,
+    /// With [`private_on`]: blocks [`guard_private`] took and gave back
+    /// (their cell sent back to the write watch, or memory the watch does
+    /// not see that is no view): never guarded again.
+    back: BTreeSet<usize>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -958,6 +976,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     private: BTreeSet::new(),
     hot: BTreeMap::new(),
     demoted: BTreeSet::new(),
+    back: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1576,7 +1595,7 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
                 }
             }
         }
-        if open && !g.demoted.is_empty() && !g.protected.contains(&block) && g.demoted.contains(&(block / CELL_BLOCKS)) {
+        if open && !g.back.is_empty() && !g.protected.contains(&block) && g.back.contains(&block) {
             // A cell [`private_fault`] sent back to the write watch, inside
             // a range the guards answer: the watch is asked for it, and it
             // is not guarded again (which would undo the sending back).
