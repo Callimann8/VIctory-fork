@@ -75,6 +75,7 @@ switches! {
     ParallelRefresh = "VICTORY_PARALLEL_REFRESH", "texture checks side by side", "microseconds saved";
     WideThreads = "VICTORY_WIDE_THREADS", "helper pools made", "helper threads";
     ThreadLimit = "VICTORY_THREAD_LIMIT", "shaders translated with it", "";
+    GuardOutside = "VICTORY_GUARD_OUTSIDE", "runs made read-only outside the locks", "blocks";
     RoomKeptSecs = "VICTORY_ROOM_KEPT_SECS", "room questions answered without kept room", "";
 }
 
