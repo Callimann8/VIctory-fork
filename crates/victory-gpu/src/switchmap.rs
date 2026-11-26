@@ -71,6 +71,7 @@ switches! {
     RefreshIdle = "VICTORY_MEMORY_REFRESH_IDLE", "refreshes of idle windows left out", "";
     MemoryBudget = "VICTORY_MEMORY_BUDGET_MB", "windows let go over the budget", "bytes";
     PrepWide = "VICTORY_PREP_WIDE", "stretches cut into pieces", "pieces";
+    SweepAtRoom = "VICTORY_SWEEP_AT_ROOM", "idle texture copies let go for room", "bytes";
 }
 
 const N: usize = NAMES.len();

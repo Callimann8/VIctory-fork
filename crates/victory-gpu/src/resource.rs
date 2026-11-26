@@ -1790,10 +1790,21 @@ pub(crate) fn let_go_idle() {
     let pct = *PCT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_SWEEP_PCT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
     });
+    // `VICTORY_SWEEP_AT_ROOM=1` (or a count of milliseconds, 1 meaning
+    // 5,000): also while the texture queue finds no room (`room`), which
+    // stops new copies at 90 % of the budget while `SWEEP_PCT=100` let go
+    // nothing below 100 %: between the two, textures waited for room that
+    // idle copies held. Only copies idle that long go then (fewer made
+    // again at scene changes than the 1 s of a full card).
+    let at_room = sweep_at_room_ms();
+    let mut idle_ms = crate::host::vram_idle_ms(video_memory);
     if !sweep_due(video_memory, pct) {
-        return;
+        if at_room == 0 || room_lately() {
+            return;
+        }
+        idle_ms = idle_ms.max(at_room);
     }
-    let idle_ms = crate::host::vram_idle_ms(video_memory);
+    let by_room = at_room > 0 && !sweep_due(video_memory, pct);
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1833,6 +1844,13 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    if by_room {
+        if went > 0 {
+            crate::switchmap::acts(crate::switchmap::S::SweepAtRoom, went, bytes);
+        } else {
+            crate::switchmap::refuse(crate::switchmap::S::SweepAtRoom, "card without room, no idle copy");
+        }
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -1842,6 +1860,18 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// `VICTORY_SWEEP_AT_ROOM`: 0 (unset, off), else the idle milliseconds a
+/// copy needs to be let go while the texture queue has no room (1: 5,000).
+#[cfg(windows)]
+fn sweep_at_room_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| match std::env::var("VICTORY_SWEEP_AT_ROOM").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        None | Some(0) => 0,
+        Some(1) => 5_000,
+        Some(ms) => ms.max(500),
+    })
 }
 
 /// Whether [`let_go_idle`] runs: always for `pct` 0, else while the card
