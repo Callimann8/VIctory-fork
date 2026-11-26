@@ -88,6 +88,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod lds_plan;
 mod lower;
 mod own_bits;
 mod rect;
@@ -344,8 +345,51 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// The form of a console wave64 program on a 32-lane host that the translation took.
+    static CHOSEN: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// What the last translation on this thread came out as ([`take_form`]).
+    static FORM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// A few words on the form of the last program this thread translated (diagnostics: the
+/// frame shot's lines name it): for a console wave64 compute program on a host of 32-lane
+/// waves, which form it took ("w64 as is" when the first one did), and the group barriers
+/// the translation holds (meetings around LDS of the split halves, the halves' exchanges,
+/// the title's own). Empty when there is nothing to say. Taken once.
+pub fn take_form() -> String {
+    FORM.take()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    CHOSEN.with(|c| c.borrow_mut().clear());
+    FORM.with(|f| f.borrow_mut().clear());
+    let r = emit_any(c, native, p, st, io, res);
+    if r.is_ok() {
+        use std::fmt::Write;
+        let chosen = CHOSEN.take();
+        let [lds, exchange, title] = lower::BARRIERS.get();
+        let mut form = String::new();
+        if native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+            let _ = write!(form, "w64 {}", if chosen.is_empty() { "as is" } else { &chosen });
+        }
+        if lds + exchange + title > 0 {
+            let _ = write!(form, "{}barriers lds={lds} exchange={exchange} title={title}", if form.is_empty() { "" } else { "; " });
+        }
+        FORM.set(form);
+    }
+    r
+}
+
+fn emit_any(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -372,6 +416,9 @@ pub fn emit(
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+            if matches!(r, Ok((_, wave)) if *wave != Some(64)) {
+                CHOSEN.set(what.to_owned());
+            }
             if why {
                 match r {
                     Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
@@ -526,7 +573,10 @@ pub fn emit(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
-                Ok(_) => again,
+                Ok(_) => {
+                    CHOSEN.set("wave-wide (lane mask)".to_owned());
+                    again
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }

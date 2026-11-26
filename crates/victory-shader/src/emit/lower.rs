@@ -254,6 +254,11 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// With `split_lds` and `VICTORY_LDS_PRUNE=1` ([`super::lds_plan`]): the LDS accesses
+    /// (IR block, instruction) that need no meeting before them, and the IR blocks before
+    /// whose exit the halves meet instead.
+    lds_skip: HashSet<(usize, usize)>,
+    lds_flush: HashSet<usize>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -365,6 +370,92 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// `VICTORY_LDS_PRUNE=1` (off by default): a console wave64 program run as two host waves
+/// meets only where the console's order of LDS accesses needs it ([`super::lds_plan`]), not
+/// before every access. Part of the translation (the shader cache keys on it).
+fn lds_prune_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_PRUNE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LDS_PRUNE").is_some_and(|v| v == "1") && super::group_sync() != 0
+    })
+}
+
+/// The program's blocks as [`super::lds_plan`] sees them: LDS accesses (a meeting can go before
+/// those in blocks every lane runs, outside whole-wave sections), the title's barriers that
+/// wait for the group, the meetings around lane branches (`lds_meet`), and where a meeting may
+/// be added (blocks every lane runs; in a group of several console waves only when no branch
+/// is taken wave-wide). Nothing is left out with an indirect exit.
+fn lds_prune_plan(
+    p: &crate::ir::Program,
+    st: &Structured,
+    lds_meet: Option<&(Vec<bool>, Vec<(bool, bool)>)>,
+    fence_only: &HashSet<usize>,
+    no_barrier: &HashSet<usize>,
+    group: u32,
+) -> super::lds_plan::Plan {
+    use super::lds_plan::{Block, Item, plan};
+    let n = st.exits.len();
+    if n != p.blocks.len() || st.exits.iter().any(|e| matches!(e, LaneExit::Indirect)) {
+        return Default::default();
+    }
+    let all = all_lane_blocks(st);
+    let flush_ok = st.wide.is_empty() || group <= 64;
+    let blocks: Vec<Block> = (0..n)
+        .map(|b| {
+            let mut interior = HashSet::new();
+            for (&start, sec) in &super::wave::sections(p, b) {
+                interior.extend(start + 1..sec.end);
+            }
+            let can_meet = lds_meet.is_none_or(|(all, _)| all[b]);
+            let items = p.blocks[b]
+                .insts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, inst)| {
+                    let name = inst.name();
+                    if name == "s_barrier" {
+                        let waits = match super::group_sync() {
+                            0 => false,
+                            1 => !fence_only.contains(&b),
+                            _ => true,
+                        };
+                        return (waits && !no_barrier.contains(&b) && !interior.contains(&i)).then_some(Item::Sync);
+                    }
+                    if !matches!(inst.fields, Fields::Ds { .. })
+                        || name.starts_with("ds_swizzle")
+                        || name.contains("permute")
+                    {
+                        return None;
+                    }
+                    Some(Item::Lds {
+                        at: i,
+                        write: !name.starts_with("ds_read"),
+                        meet: can_meet && !interior.contains(&i),
+                    })
+                })
+                .collect();
+            let succ = match st.exits[b] {
+                LaneExit::Jump(t) => vec![t],
+                LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+                LaneExit::End | LaneExit::Indirect => Vec::new(),
+            };
+            let (start_meet, end_meet) = lds_meet.map_or((false, false), |(_, meet)| meet[b]);
+            Block {
+                items,
+                succ,
+                start_meet,
+                end_meet,
+                can_flush: flush_ok && all.as_ref().is_some_and(|a| a.get(b).copied().unwrap_or(false)),
+            }
+        })
+        .collect();
+    plan(&blocks)
+}
+
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
@@ -1241,6 +1332,23 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's `VICTORY_LDS_PRUNE`, for its thread only.
+    pub(super) static TEST_LDS_PRUNE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// Group barriers of the last lowering on this thread: meetings around LDS of a console
+    /// wave split into host waves, meetings of the exchanges between those halves, and the
+    /// title's own `s_barrier`s. For the shot's lines ([`super::take_form`]).
+    pub(super) static BARRIERS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn count_barrier(kind: usize) {
+    BARRIERS.with(|c| {
+        let mut v = c.get();
+        v[kind] += 1;
+        c.set(v);
+    });
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1440,6 +1548,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, partial: bool) -> Self {
+        BARRIERS.set([0; 3]);
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1708,7 +1817,27 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let lds_plan = if split_lds && lds_prune_on() {
+            let group = match x.native.io {
+                StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+                _ => u32::MAX,
+            };
+            let plan = lds_prune_plan(p, x.st, lds_meet.as_ref(), &fence_only, &no_barrier, group);
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!(
+                    "LDS-PRUNE meetings before accesses: {} kept, {} left out; {} block-end meetings added",
+                    plan.kept,
+                    plan.skip.len(),
+                    plan.flush.len()
+                );
+            }
+            plan
+        } else {
+            super::lds_plan::Plan::default()
+        };
         Lower {
+            lds_skip: lds_plan.skip,
+            lds_flush: lds_plan.flush,
             s,
             x,
             bad,
@@ -2537,7 +2666,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
-            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
+            if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) || self.lds_flush.contains(&b) {
                 self.lds_meeting();
             }
             self.tail[b] = Some(self.cur);
@@ -4047,6 +4176,7 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        count_barrier(1);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5221,9 +5351,11 @@ impl<'a> Lower<'a> {
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+            && !self.lds_skip.contains(&(b, i))
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            count_barrier(0);
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5246,6 +5378,7 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                count_barrier(2);
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -5288,6 +5421,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        count_barrier(0);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -12016,6 +12150,122 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    /// Meetings around LDS when `body` (after `s_load_dwordx4 s[8:11]` of the UAV table in
+    /// s4) runs as a console wave64 program of 64 threads with 512 bytes of LDS on a host of
+    /// 32-lane waves, without and with `VICTORY_LDS_PRUNE`.
+    fn split_lds_meetings(body: &[u32]) -> [u32; 2] {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        words.extend_from_slice(body);
+        words.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 5 << 1, threads: [64, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io");
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let mut out = [0; 2];
+        for (n, prune) in [false, true].into_iter().enumerate() {
+            super::TEST_LDS_PRUNE.set(Some(prune));
+            let l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("lower");
+            assert_eq!(l.wave_size, Some(32), "runs as host waves of 32");
+            out[n] = super::BARRIERS.get()[0];
+        }
+        super::TEST_LDS_PRUNE.set(None);
+        super::TEST_HOST_WAVE.set(was);
+        out
+    }
+
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+
+    /// `VICTORY_LDS_PRUNE`: each thread writes its id to its dword, reads it back three times
+    /// (sums them), and lane 32's sum (a lane of the other host half: the program crosses
+    /// halves, so it runs as two host waves that meet around LDS) is stored. Without the plan
+    /// the halves meet before all four accesses; with it only before the first read (nothing
+    /// comes before the write, and the reads after it share that meeting).
+    #[test]
+    fn split_waves_meet_only_where_lds_order_needs_it() {
+        let mut words = vec![0x1A << 25 | 1 << 17 | 0x82]; // v_lshlrev_b32 v1, 2, v0
+        words.extend(ds(0x0D, 0, 1, 0)); // ds_write_b32 v1, v0
+        words.extend(ds(0x36, 2, 1, 0)); // ds_read_b32 v2, v1
+        words.extend(ds(0x36, 3, 1, 0)); // ds_read_b32 v3, v1
+        words.extend(ds(0x36, 4, 1, 0)); // ds_read_b32 v4, v1
+        words.extend([
+            0x25 << 25 | 2 << 17 | 3 << 9 | 258, // v_add_nc_u32 v2, v2, v3
+            0x25 << 25 | 2 << 17 | 4 << 9 | 258, // v_add_nc_u32 v2, v2, v4
+            0x35 << 26 | 0x360 << 16 | 7,
+            258 | 0xA0 << 9, // v_readlane_b32 s7, v2, 32
+            0x7E00_0207,     // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        assert_eq!(split_lds_meetings(&words), [4, 1], "meetings around LDS without and with the plan");
+    }
+
+    /// The reads in a loop of s1 rounds after the write: without the plan the halves meet
+    /// before the read in every round; with it once, at the end of the block before the loop.
+    #[test]
+    fn a_read_loop_after_an_lds_write_meets_once_before_it() {
+        let mut words = vec![0x1A << 25 | 1 << 17 | 0x82]; // v_lshlrev_b32 v1, 2, v0
+        words.extend(ds(0x0D, 0, 1, 0)); // ds_write_b32 v1, v0
+        words.extend([
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+        ]);
+        // loop: v3 = LDS[v1]; v2 += v3; s6 -= 1; while s6 != 0
+        words.extend(ds(0x36, 3, 1, 0)); // ds_read_b32 v3, v1
+        words.extend([
+            0x25 << 25 | 2 << 17 | 3 << 9 | 258, // v_add_nc_u32 v2, v2, v3
+            0x8086_8106,                         // s_sub_u32 s6, s6, 1
+            0xBF07_8006,                         // s_cmp_lg_u32 s6, 0
+            0xBF85_FFFA,                         // s_cbranch_scc1 back to the read
+            0x35 << 26 | 0x360 << 16 | 7,
+            258 | 0xA0 << 9, // v_readlane_b32 s7, v2, 32
+            0x7E00_0207,     // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        // (static counts: without the plan the write's and the loop read's; with it the flush
+        // before the loop only)
+        assert_eq!(split_lds_meetings(&words), [2, 1], "meetings around LDS without and with the plan");
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
