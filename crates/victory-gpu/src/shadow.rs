@@ -110,6 +110,11 @@ struct Card {
     /// still holds that byte: one a shader in the air stored stays, as on
     /// the console, where the card runs after the CPU's write.
     old_pages: Mutex<Vec<(usize, Vec<u8>)>>,
+    /// With `crate::host::merge_pages`: the title pages (address / PAGE)
+    /// a landing of the card's writes changed. Those keep being merged as
+    /// changed runs: a whole page marked changed would keep the card's
+    /// later writes in it from landing.
+    written_pages: Mutex<std::collections::HashSet<usize>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -3220,6 +3225,7 @@ impl Shadow {
                     // anyway), without finding the runs.
                     if crate::host::merge_pages()
                         && let Some(card) = &self.card
+                        && !card.written_pages.lock().unwrap_or_else(|e| e.into_inner()).contains(&(lo / PAGE))
                     {
                         if title[..] == held[..] {
                             continue;
@@ -3740,6 +3746,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -3759,6 +3766,16 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
+            // Where the card wrote (outside what the title changed and
+            // sent up since): pages to merge as changed runs from now on.
+            if crate::host::merge_pages()
+                && let (Some(f), Some(l)) = (first_difference(&gpu[a..b], &held[a..b]), last_difference(&gpu[a..b], &held[a..b]))
+            {
+                let mut pages = card.written_pages.lock().unwrap_or_else(|e| e.into_inner());
+                for page in (start + at + a + f) / PAGE..=(start + at + a + l) / PAGE {
+                    pages.insert(page);
+                }
+            }
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
@@ -3943,6 +3960,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     old_pages: Mutex::default(),
+                written_pages: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -4174,6 +4192,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 old_pages: Mutex::default(),
+                written_pages: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -4454,6 +4473,7 @@ mod card_merge_tests {
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 old_pages: Mutex::default(),
+                written_pages: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
