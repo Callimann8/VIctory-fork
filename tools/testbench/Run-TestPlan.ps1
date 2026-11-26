@@ -815,7 +815,7 @@ function Fmt($x) { if ($null -eq $x) { '-' } else { '{0:N0}' -f $x } }
 function Save-CrashInfo($R, $M, [string]$Data, [datetime]$Began) {
     $dumps = New-Object System.Collections.Generic.List[string]
     foreach ($d in $M.Dumps) { if (Test-Path $d) { $dumps.Add($d) } else { $dumps.Add("$d (named in the log, not found)") } }
-    $dirs = @($Data) + @(Get-Setting 'CrashDirs' @('C:\xcl\victory-data', '%LOCALAPPDATA%\CrashDumps', '%LOCALAPPDATA%\victory') | ForEach-Object { Expand-Path $_ })
+    $dirs = @($Data) + @(Get-Setting 'CrashDirs' @('C:\xcl\runs\dumps', 'C:\xcl\victory-data', '%LOCALAPPDATA%\CrashDumps', '%LOCALAPPDATA%\victory') | ForEach-Object { Expand-Path $_ })
     foreach ($d in $dirs) {
         if (-not (Test-Path $d)) { continue }
         Get-ChildItem -Path $d -Recurse -Depth 3 -File -Include *.dmp, crash-*.bin, crashes.log -ErrorAction SilentlyContinue |

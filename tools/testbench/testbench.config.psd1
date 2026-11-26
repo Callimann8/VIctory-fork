@@ -47,6 +47,10 @@
     # them (SendKeys syntax), e.g. @(@{ AfterSeconds = 90; Keys = '{ENTER}' }).
     StartKeys = @()
 
+    # Where crash dumps may appear (Windows Error Reporting LocalDumps for victory.exe
+    # writes to C:\xcl\runs\dumps); files written since a run began go into its crash details.
+    CrashDirs = @('C:\xcl\runs\dumps', 'C:\xcl\victory-data', '%LOCALAPPDATA%\CrashDumps', '%LOCALAPPDATA%\victory')
+
     # Keep each run's save copy after the run (off: only pictures and logs stay).
     KeepRunData = $false
 }

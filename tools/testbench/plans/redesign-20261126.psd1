@@ -38,6 +38,8 @@
         @{ Name = 'R9';    Build = 'test'; Use = 'best', 'R9'; Try = $true }
         @{ Name = 'R10';   Build = 'test'; Use = 'best', 'R10'; Try = $true }   # own warm-up (shader switch)
         @{ Name = 'R11';   Build = 'test'; Use = 'best', 'R11'; Try = $true }   # Belobug per-draw CPU savings
+        @{ Name = 'W0';    Build = 'test'; Use = 'best', 'W0' }               # PREP_WIDE=serial, compared only ("prepared in stretches" estimate)
+        @{ Name = 'W1';    Build = 'test'; Use = 'best', 'W1'; Try = $true }  # PREP_WIDE=1 on helper threads; picture must match
         @{ Name = 'TRACER'; Build = 'test'; Use = 'best', 'TRACER' }           # own warm-up; the real test (WAVE_WIDE without b5b83854) is set up by hand
         @{ Name = 'G2';    Build = 'test'; Use = 'best', 'G2' }               # LDS_PRUNE, own warm-up; compared only, picture must match (GPU thread)
         @{ Name = 'BUSY';  Build = 'test'; Use = 'best', 'BUSY'; Prompt = 'Walk out of the cell into the crowded area' }
