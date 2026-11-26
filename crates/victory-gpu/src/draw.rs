@@ -434,7 +434,10 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, usize)>,
+    /// With [`quick_tables`]: the record words of the fresh tables, one
+    /// after the other (the `usize` of their entry is where theirs begin).
+    fresh_records: Vec<[u32; 3]>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -477,6 +480,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_records.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -765,9 +769,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill_from(to, address as *const u8, len as usize, crate::host::FILL_ROOT);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len, crate::host::FILL_ROOT)
 }
 
 macro_rules! once {
@@ -1282,10 +1284,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
         for stage in &p.stages {
@@ -1320,7 +1320,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A root signature holds at most 64 dwords: on the stack, no
+                // allocation per draw (Belobug PR #33).
+                let mut stack = [0u32; 64];
+                let mut heap = Vec::new();
+                let values: &mut [u32] = if dwords as usize <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap.resize(dwords as usize, 0);
+                    &mut heap
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -3066,17 +3075,26 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
+            let quick = quick_tables();
+            let key = if quick {
+                (table, n, table_hash(table, n))
+            } else {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    table_record(table, k).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // With the quick hash the records are compared too: a collision
+            // costs a fresh table, not wrong descriptors.
+            let same = self.fresh_tables.get(&key).copied().filter(|&(_, at)| {
+                !quick
+                    || self.fresh_records.get(at..at + n as usize).is_some_and(|records| {
+                        records.iter().enumerate().all(|(k, r)| *r == table_record(table, k as u32))
+                    })
+            });
+            if let Some((first, _)) = same {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3103,7 +3121,14 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let at = if quick {
+                let at = self.fresh_records.len();
+                self.fresh_records.extend((0..n).map(|k| table_record(table, k)));
+                at
+            } else {
+                usize::MAX
+            };
+            self.fresh_tables.insert(key, (first, at));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4095,4 +4120,34 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
+}
+
+/// `VICTORY_TABLE_QUICK_HASH=1` (Belobug PR #34): a table made afresh is
+/// found again by a quick hash of its records, which are then compared,
+/// instead of by a SipHash over them alone (off by default).
+fn quick_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_TABLE_QUICK_HASH").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("fresh tables are found again by a quick hash, records compared (VICTORY_TABLE_QUICK_HASH)");
+        }
+        on
+    })
+}
+
+/// A quick hash of `table` and its `n` records ([`quick_tables`]).
+fn table_hash(table: u64, n: u32) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let h = (0..n).fold(table, |h, k| {
+        let [a, b, c] = table_record(table, k);
+        mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
+    });
+    h ^ h >> 32
+}
+
+/// The record words of entry `k` of `table`.
+fn table_record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }

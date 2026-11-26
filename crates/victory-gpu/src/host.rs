@@ -2408,9 +2408,21 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// With [`pipeline_once`]: the host pipelines [`HostList::bind_pipeline`]
+    /// kept (by address), so a pipeline the list binds again is not kept,
+    /// cast and named again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`gpu_write_once`]: buffer ranges declared written by shaders
+    /// since the last title copy or run (host copy, address, bytes):
+    /// declaring them again would snapshot the same bytes.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`fill_once`]: upload memory filled from title memory since the
+    /// last title copy or run (source, bytes, kind): its host GPU address,
+    /// which a second fill would find holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize, u8), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2829,6 +2841,58 @@ static FETCH_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::ato
 /// The copies (source buffer, source offset, bytes, offset in the fetch's
 /// buffer) that bring down `pieces` (copy, from, to, offset in the fetch's
 /// buffer), joined where [`fetch_join`] allows.
+/// `VICTORY_GPU_WRITE_ONCE=1`: [`HostList::defer_gpu_write`] records a
+/// range once until the next title copy or run (off by default).
+fn gpu_write_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_GPU_WRITE_ONCE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("a range shaders write is declared once until the title's memory next changes (VICTORY_GPU_WRITE_ONCE)");
+        }
+        on
+    })
+}
+
+/// `VICTORY_UPLOAD_POOLED=1`: [`HostList::upload_at`] takes footprint
+/// staging from the list's scratch chunks (off by default).
+fn upload_pooled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_UPLOAD_POOLED").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("buffer-to-texture staging comes from the lists' pooled scratch chunks (VICTORY_UPLOAD_POOLED)");
+        }
+        on
+    })
+}
+
+/// `VICTORY_FILL_ONCE=1`: [`HostList::fill_scratch`] fills a source once
+/// per list until a title copy or run (off by default).
+fn fill_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_FILL_ONCE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("upload memory filled from the same title memory is shared by a list's draws until it next changes (VICTORY_FILL_ONCE)");
+        }
+        on
+    })
+}
+
+/// `VICTORY_PIPELINE_ONCE=1`: [`HostList::bind_pipeline`] keeps and names
+/// a pipeline the first time a list binds it only (off by default).
+fn pipeline_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_PIPELINE_ONCE").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("a pipeline a list binds again is not kept and named again (VICTORY_PIPELINE_ONCE)");
+        }
+        on
+    })
+}
+
 fn fetch_copies(pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)]) -> Vec<(&ID3D12Resource, u64, u64, u64)> {
     let join = fetch_join();
     let mut copies: Vec<(&ID3D12Resource, u64, u64, u64)> = Vec::with_capacity(pieces.len());
@@ -7750,6 +7814,36 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// A pipeline the list binds: noted, and kept with its root signature
+    /// until the list is reset (the title may release them before it
+    /// submits). With [`pipeline_once`] (Belobug PR #25), only the first
+    /// time since the reset: the list keeps that one, so its address names
+    /// the same pipeline from then on, and a switch back costs one lookup
+    /// instead of two casts, three locks and a name search.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        if !pipeline_once() {
+            self.used_pipeline(&p.name);
+            self.keep(&p.pso);
+            self.keep(&p.root);
+            return;
+        }
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(p.pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(p.pso.clone().into());
+                deferred.kept.push(p.root.clone().into());
+            }
+            first
+        };
+        if first {
+            self.used_pipeline(&p.name);
+        } else if crate::cardmeter::pipelines() {
+            crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
+            self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, &p.name).raw(), Ordering::Relaxed);
+        }
+    }
+
     /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
         {
@@ -7789,6 +7883,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7826,7 +7922,14 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        // Belobug PR #29: once until the title's memory next changes by a
+        // copy or a run of ours; thousands of draws of a list declare the
+        // same ranges, each a flush and a snapshot at submission.
+        if gpu_write_once() && !deferred.gpu_written.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+            return;
+        }
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -7863,6 +7966,52 @@ impl HostList {
         name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
+    }
+
+    /// The host GPU address of `len` bytes of scratch upload memory holding
+    /// the title memory at `src` as of the list's submission (`kind` as for
+    /// [`Self::defer_fill_from`]). With `VICTORY_FILL_ONCE=1` (Belobug PR
+    /// #24) one copy serves every ask of the list until a title copy or run
+    /// intervenes (a root constant buffer that is not 256-byte aligned,
+    /// bound by many draws).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64, kind: u8) -> Option<u64> {
+        let once = fill_once();
+        let key = (src as usize, len as usize, kind);
+        if once && let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill_from(to, src, len as usize, kind);
+        if once {
+            self.deferred().filled.insert(key, gpu);
+        }
+        Some(gpu)
+    }
+
+    /// `size` bytes of mapped upload memory for a placed footprint, alive
+    /// until the list is reset: the buffer, the offset in it (512-byte
+    /// aligned) and the CPU pointer. With `VICTORY_UPLOAD_POOLED=1` (Belobug
+    /// PR #30) taken from the list's scratch chunks when it fits one,
+    /// instead of a committed buffer made and mapped for each copy.
+    pub(crate) fn upload_at(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        if upload_pooled() && size.max(1).next_multiple_of(512) <= SCRATCH_CHUNK {
+            let len = size.max(1).next_multiple_of(512);
+            let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            while s.current < s.chunks.len() && s.used.next_multiple_of(512) + len > s.chunks[s.current].1 {
+                (s.current, s.used) = (s.current + 1, 0);
+            }
+            if s.current == s.chunks.len() {
+                let chunk = take_chunk(host, SCRATCH_CHUNK)?;
+                s.chunks.push((chunk, SCRATCH_CHUNK));
+                s.used = 0;
+            }
+            let at = s.used.next_multiple_of(512);
+            s.used = at + len;
+            let chunk = &s.chunks[s.current].0;
+            return Some((chunk._buffer.clone(), at, (chunk.data + at as usize) as *mut u8));
+        }
+        let (buffer, data) = self.upload(host, size)?;
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -8110,8 +8259,11 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
