@@ -203,6 +203,12 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// Its list has run: the dynamic descriptor slots its commands name go
+    /// back now (`VICTORY_LANDED_TABLES`), not when it is let go.
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

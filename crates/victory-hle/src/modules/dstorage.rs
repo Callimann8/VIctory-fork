@@ -219,10 +219,21 @@ extern "system" fn create_queue(
 }
 
 /// The title asks for 32 MiB and stops if this fails.
+/// `VICTORY_DSTORAGE_STAGING_MB=N` (off by default): at least N MiB, so that
+/// the reads of several multi-MB chunks can be in flight at once on the
+/// PC's worker threads (DoubleGhosty/cool_fox e05d463 takes 256 by
+/// default; unmeasured here).
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    tracing::info!(size, "dstorage: staging buffer size");
+    static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let floor = *FLOOR_MB.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }) << 20;
+    tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(floor);
     }
     S_OK
 }

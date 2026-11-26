@@ -2803,6 +2803,16 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
     fetched.len() as u64
 }
 
+/// `VICTORY_LANDED_TABLES=1`: a flight's lists give their dynamic descriptor
+/// slots back when it lands (the card has run them), not when the landed
+/// lists are let go later; fewer tables refused for want of free slots
+/// ("no free dynamic descriptor slots"). After DoubleGhosty/cool_fox
+/// f4b48ad.
+fn landed_tables() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_TABLES").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_FETCH_JOIN=1`: the pieces a fetch of what shaders wrote to card
 /// copies brings down are copied one copy per run of pieces that follow one
 /// another in one buffer and in the fetch's own buffer, not one per piece
@@ -5866,13 +5876,18 @@ impl Host {
         let mut landed = Vec::new();
         for item in items {
             match item {
-                Late::Run(flight) => {
+                Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    if landed_tables() {
+                        for list in &mut flight.lists {
+                            list.release_tables();
+                        }
                     }
                     landed.push((flight.lists, flight.order));
                 }
@@ -6315,13 +6330,18 @@ impl Host {
             let mut landed = Vec::new();
             for item in items {
                 match item {
-                    Late::Run(flight) => {
+                    Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
                             read_backs(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if landed_tables() {
+                            for list in &mut flight.lists {
+                                list.release_tables();
+                            }
                         }
                         landed.push((flight.lists, flight.order));
                     }
