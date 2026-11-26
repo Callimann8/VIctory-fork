@@ -1341,6 +1341,9 @@ thread_local! {
     /// wave split into host waves, meetings of the exchanges between those halves, and the
     /// title's own `s_barrier`s. For the shot's lines ([`super::take_form`]).
     pub(super) static BARRIERS: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Meetings around LDS the last lowering on this thread left out with
+    /// `VICTORY_LDS_PRUNE=1` (those left out less the block-end ones added).
+    pub(super) static LDS_PRUNED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn count_barrier(kind: usize) {
@@ -1549,6 +1552,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, partial: bool) -> Self {
         BARRIERS.set([0; 3]);
+        LDS_PRUNED.set(0);
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1831,6 +1835,7 @@ impl<'a> Lower<'a> {
                     plan.flush.len()
                 );
             }
+            LDS_PRUNED.set(plan.skip.len().saturating_sub(plan.flush.len()) as u32);
             plan
         } else {
             super::lds_plan::Plan::default()

@@ -196,6 +196,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let form = crate::shader_cache::take_form();
+    // `VICTORY_LDS_PRUNE=1`: the shader's meetings left out (its form says so, from the
+    // cache too), counted once per shader the run takes up
+    if let Some(n) = form.split("lds-pruned=").nth(1).and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u64>().ok()) {
+        crate::switchmap::act(crate::switchmap::S::LdsPrune, n);
+    }
     let stores = programs.is_empty() || programs.iter().any(stores);
     let compute_threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),

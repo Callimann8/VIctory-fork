@@ -363,6 +363,18 @@ pub fn take_form() -> String {
     FORM.take()
 }
 
+static LDS_PRUNED_SHADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LDS_PRUNED_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_LDS_PRUNE=1`: programs translated in this process that it left meetings out of,
+/// and how many in all (static counts: barriers in the code, not barriers run). Shaders
+/// that come from the shader cache are not translated, so they are not counted here; the
+/// form text ([`take_form`], kept in the cache) carries `lds-pruned=N` for those.
+pub fn lds_prune_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (LDS_PRUNED_SHADERS.load(Relaxed), LDS_PRUNED_BARRIERS.load(Relaxed))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -385,6 +397,13 @@ pub fn emit(
         }
         if lds + exchange + title > 0 {
             let _ = write!(form, "{}barriers lds={lds} exchange={exchange} title={title}", if form.is_empty() { "" } else { "; " });
+        }
+        let pruned = lower::LDS_PRUNED.get();
+        if pruned > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            LDS_PRUNED_SHADERS.fetch_add(1, Relaxed);
+            LDS_PRUNED_BARRIERS.fetch_add(u64::from(pruned), Relaxed);
+            let _ = write!(form, "; lds-pruned={pruned}");
         }
         FORM.set(form);
     }
