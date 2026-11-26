@@ -7752,6 +7752,13 @@ impl HostList {
         self.note(what, None);
     }
 
+    /// A frame shot's timestamp with the line `text` and nothing else (`list::shot_mark`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn shot_mark(&self, text: &str) {
+        crate::shot::stamp(self);
+        crate::shot::line(std::ptr::from_ref(self) as usize, text);
+    }
+
     /// As [`HostList::note_op`], for a copy that reads the host GPU range
     /// `(address, bytes)`: the report places the faulting address in it.
     #[cfg(feature = "diagnostics")]

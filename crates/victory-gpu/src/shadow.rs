@@ -2815,6 +2815,27 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Where the memory shaders reach through this copy lies (diagnostics: the frame shot's
+    /// lines): "card" (video memory), "card-upload" (video memory the CPU writes), "PC"
+    /// (the PC's memory, which shaders reach over PCIe), or what the heap could not say.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn place(&self) -> &'static str {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: a live resource; the call only fills the properties.
+        if unsafe { self.buffer.GetHeapProperties(Some(&mut props), None) }.is_err() {
+            return "reserved";
+        }
+        match props.Type {
+            D3D12_HEAP_TYPE_DEFAULT => "card",
+            D3D12_HEAP_TYPE_UPLOAD | D3D12_HEAP_TYPE_READBACK => "PC",
+            D3D12_HEAP_TYPE_GPU_UPLOAD => "card-upload",
+            D3D12_HEAP_TYPE_CUSTOM if props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1 => "card",
+            D3D12_HEAP_TYPE_CUSTOM => "PC",
+            _ => "?",
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)

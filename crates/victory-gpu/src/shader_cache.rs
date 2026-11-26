@@ -86,7 +86,9 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        let done = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        FORM.set(victory_shader::emit::take_form());
+        done
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -94,11 +96,27 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let done = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        FORM.set(victory_shader::emit::take_form());
+        done
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+thread_local! {
+    /// The translation's form ([`victory_shader::emit::take_form`]) of the last shader this
+    /// thread got from [`host_shader`], translated or from the cache ([`take_form`]).
+    static FORM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The form of the shader [`host_shader`] last gave this thread (diagnostics: the frame
+/// shot's lines). Taken once.
+pub(crate) fn take_form() -> String {
+    FORM.take()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -119,7 +137,14 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let mut out = encode(&shader);
+        // the form after the shader (entries without one read as having none)
+        let form = FORM.with(|f| f.borrow().clone());
+        if !form.is_empty() {
+            out.extend((form.len() as u32).to_le_bytes());
+            out.extend(form.as_bytes());
+        }
+        Ok(out)
     }
 }
 
@@ -138,7 +163,8 @@ fn cached(
         let path = cache
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        if let Some((shader, form)) = std::fs::read(&path).ok().and_then(|b| decode_with_form(&b)) {
+            FORM.set(form);
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -250,7 +276,13 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn decode(bytes: &[u8]) -> Option<HostShader> {
+    decode_with_form(bytes).map(|(shader, _)| shader)
+}
+
+/// An entry: the shader, and the form written after it (empty if none).
+fn decode_with_form(bytes: &[u8]) -> Option<(HostShader, String)> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -321,7 +353,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    r.0.is_empty().then_some(HostShader {
+    let form = if r.0.is_empty() { String::new() } else { String::from_utf8(r.list()?).ok()? };
+    r.0.is_empty().then_some((HostShader {
         stage,
         dxil,
         user_data,
@@ -333,7 +366,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         written_root_uavs,
         writes_guest_memory,
         root_indexed_views,
-    })
+    }, form))
 }
 
 #[cfg(test)]

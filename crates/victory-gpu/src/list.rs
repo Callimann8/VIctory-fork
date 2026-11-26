@@ -174,6 +174,25 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
+/// A frame shot's timestamp (with the line `text`) where the title's next command begins,
+/// before the layer records anything for it (binds, uploads, clamps, state moves): the time
+/// from the last command's stamp to this one is that command's own; from here to the
+/// command's stamp it is what the layer put in front of it. Title barriers get one too.
+/// `VICTORY_SHOT_ENDS=0`: none (the stamps before each command only, as before).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn shot_mark(this: This, text: &'static str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !crate::shot::keeping_lines() || !*ON.get_or_init(|| std::env::var_os("VICTORY_SHOT_ENDS").is_none_or(|v| v != "0")) {
+        return;
+    }
+    if let Some(list) = host_list(this) {
+        list.shot_mark(text);
+    }
+}
+
+#[cfg(not(all(windows, feature = "diagnostics")))]
+fn shot_mark(_: This, _: &'static str) {}
+
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
@@ -756,6 +775,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    shot_mark(this, "TITLE BARRIER");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -1672,6 +1692,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::shot_mark(this, "NEXT");
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
@@ -1681,6 +1702,7 @@ mod state {
     }
     pub(super) fn dispatch_flags(this: This, x: u32, y: u32, z: u32, flags: Option<u32>) {
         super::count_dispatch();
+        super::shot_mark(this, "NEXT");
         with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1691,6 +1713,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
+        super::shot_mark(this, "NEXT");
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
@@ -1709,6 +1732,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
+        super::shot_mark(this, "NEXT");
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1720,6 +1744,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::shot_mark(this, "NEXT");
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1785,6 +1810,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    shot_mark(this, "NEXT");
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };

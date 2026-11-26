@@ -2638,6 +2638,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
+            if !t.form.is_empty() {
+                let _ = write!(text, " [form {}]", t.form);
+            }
             for u in &t.host.user_data {
                 let v = match u.root {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
@@ -2651,9 +2654,10 @@ impl State {
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
-                        .map(|s| (s.gpu(*address), s.left(*address)));
-                    let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                    let found = crate::shadow::find(*address, 1);
+                    let host = found.as_ref().map(|s| (s.gpu(*address), s.left(*address)));
+                    let place = found.as_ref().map_or("-", |s| s.place());
+                    let _ = write!(text, " root{slot}={address:#x} host {host:#x?} in {place}");
                 }
             }
         }

@@ -134,6 +134,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// The form the translation took (diagnostics: the frame shot's lines; empty when
+    /// there is nothing to say, see `victory_shader::emit::take_form`).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) form: String,
 }
 
 #[cfg(windows)]
@@ -191,6 +195,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
+    let form = crate::shader_cache::take_form();
     let stores = programs.is_empty() || programs.iter().any(stores);
     let compute_threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
@@ -206,7 +211,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, compute_threads, used, stores })
+    Ok(Translated { host, compute_threads, used, stores, form })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
