@@ -656,8 +656,51 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
-/// Dispatches run as one group by [`State::self_copy`].
+/// Dispatches run as one group by [`State::self_copy`], and dispatches of
+/// a listed program it turned down.
 static SELF_COPY_SHRUNK: AtomicU64 = AtomicU64::new(0);
+static SELF_COPY_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_SELF_COPY_HEAD=N` (bytes, default 4096; 0: all of it): what a
+/// self-copy dispatch ([`State::self_copy`]) brings up to date and declares
+/// written of each root view. It reads its byte count and writes its box in
+/// the first 40 bytes; the rest it stores as it was. Taken whole, each of
+/// the 63 dispatches of a lit frame refreshed, snapshotted, compared and
+/// copied back ~2 MB that cannot change (~124 MB a frame).
+fn self_copy_head() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("VICTORY_SELF_COPY_HEAD").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => u64::MAX,
+            Some(n) => n.max(64),
+            None => 4096,
+        }
+    })
+}
+
+thread_local! {
+    /// While a dispatch is bound: the most bytes of each root view that
+    /// are brought up to date and declared written (`self_copy_head`).
+    static VIEW_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// Sets [`VIEW_CAP`] for its life.
+struct ViewCap;
+impl ViewCap {
+    fn set(bytes: u64) -> ViewCap {
+        VIEW_CAP.with(|c| c.set(bytes));
+        ViewCap
+    }
+}
+impl Drop for ViewCap {
+    fn drop(&mut self) {
+        VIEW_CAP.with(|c| c.set(u64::MAX));
+    }
+}
+
+fn view_cap() -> u64 {
+    VIEW_CAP.with(std::cell::Cell::get)
+}
 
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
@@ -683,7 +726,8 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
-        .min(if srv { limit } else { 1 << 16 });
+        .min(if srv { limit } else { 1 << 16 })
+        .min(view_cap());
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -1420,7 +1464,7 @@ impl State {
             Some(s)
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
-            let len = s.left(a).min(limit);
+            let len = s.left(a).min(limit).min(view_cap());
             s.refresh(list, a, len);
             if writes {
                 s.gpu_writes(list, a, len);
@@ -1567,7 +1611,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
+            s.refresh(list, *a, s.left(*a).min(view_cap()));
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -2309,6 +2353,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A copy of a range onto itself (`self_copy_shrink`): decided before
+        // the bind, which then brings up to date and declares written only
+        // the head of its views (`VIEW_CAP`).
+        let shrink = self.self_copy(p);
+        let _cap = shrink.then(|| ViewCap::set(self_copy_head()));
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -2336,7 +2385,7 @@ impl State {
             unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
         }
         // A copy of a range onto itself (`self_copy_shrink`): one group.
-        let [x, y, z] = if self.self_copy(p) {
+        let [x, y, z] = if shrink {
             SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed);
             let n = SELF_COPY_SHRUNK.load(Ordering::Relaxed);
             if n == 1 || n.is_multiple_of(8192) {
@@ -2387,25 +2436,48 @@ impl State {
         if !list.iter().any(|h| stage.shader.hash.starts_with(h.as_str())) {
             return false;
         }
+        // From here on the program is a listed one: a refusal is said, with
+        // why, so a run tells which check holds it back (run S12 never
+        // shrank one and said nothing).
+        let refuse = |why: &str, detail: String| {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let n = SELF_COPY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if SAID.fetch_add(1, Ordering::Relaxed) < 24 || n.is_power_of_two() {
+                tracing::info!(refused = n, hash = %stage.shader.hash, why, detail, "a listed self-copy program runs as the title launched it (VICTORY_SELF_COPY_SHRINK)");
+            }
+            false
+        };
         let ([(srv, _)], [(uav, _)]) = (&stage.root_srvs[..], &stage.root_uavs[..]) else {
-            return false;
+            return refuse(
+                "not one root SRV and one root UAV",
+                format!("srvs {:?} uavs {:?}", stage.root_srvs, stage.root_uavs),
+            );
         };
         let roots = self.roots_ref(true);
         let (Some(Root::View(a)), Some(Root::View(b))) = (roots.get(usize::from(*srv)), roots.get(usize::from(*uav))) else {
-            return false;
+            return refuse(
+                "a root view not set",
+                format!("srv {:?} uav {:?}", roots.get(usize::from(*srv)), roots.get(usize::from(*uav))),
+            );
         };
         if a != b {
-            return false;
+            return refuse("source and destination differ", format!("{a:#x} {b:#x}"));
         }
+        // User words 20 and 21 as the shader reads them. They are the host's
+        // own words when the translation made them so (a raw view's bias,
+        // `USER_VIEW_BIAS`): the old check took only the title's words, found
+        // none, and refused every dispatch. Equal views have equal biases.
         let t = stage.translated();
         let word = |index: u32| {
-            t.host
-                .user_data
-                .iter()
-                .find(|u| u.index == index && !matches!(u.root, RootType::Other(_)))
-                .map(|u| self.user_value(true, u.slot, u.root, u.dword))
+            t.host.user_data.iter().find(|u| u.index == index).map(|u| match u.root {
+                RootType::Other(kind) => self.host_word(true, kind, u.slot, u.dword, None),
+                _ => self.user_value(true, u.slot, u.root, u.dword),
+            })
         };
-        matches!((word(20), word(21)), (Some(s), Some(d)) if s == d)
+        match (word(20), word(21)) {
+            (Some(s), Some(d)) if s == d => true,
+            (s, d) => refuse("source and destination offsets differ", format!("u20 {s:?} u21 {d:?}")),
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
