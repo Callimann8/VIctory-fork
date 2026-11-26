@@ -1763,6 +1763,11 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// this and [`title_memory_remapped`] are the only ways a block noted
 /// uncommitted is asked about again.
 pub fn title_memory_committed(at: usize, len: usize) {
+    // Windows in place cut to a run in the same 4 MiB took what follows them
+    // for empty (`crate::shadow::run_window_usable`): they are made anew.
+    if len != 0 && crate::inplace::runs_on() {
+        crate::inplace::title_memory_freeing(at, len);
+    }
     if len == 0 || absent_mode() == 0 {
         return;
     }

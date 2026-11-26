@@ -202,10 +202,11 @@ impl Memory {
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
         // Memory outside buffers: a window in place cut to the run around the
-        // page, if its whole window cannot be in place
-        // (`VICTORY_INPLACE_RUNS=1`).
+        // page, if its whole window cannot be in place and a root view there
+        // would take it too (`VICTORY_INPLACE_RUNS=1`,
+        // `crate::shadow::run_window_usable`).
         let run = (crate::inplace::runs_on() && !crate::shadow::buffer_holds(start))
-            .then(|| crate::shadow::find(start, 1).filter(|s| s.in_place() && whole(s)).or_else(|| crate::shadow::run_window(start)))
+            .then(|| crate::shadow::find(start, 1).filter(|s| s.in_place() && whole(s)).or_else(|| crate::shadow::run_window_usable(start)))
             .flatten()
             .filter(whole);
         let shadow = run
@@ -670,6 +671,9 @@ static ONCE_SKIPPED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// first store to a page does stays on the card until the marks are read
 /// either way (`memory_marks`), so a page written again after it was
 /// dropped goes back to the title from its next frame on, as a new one.
+/// shortcut: the stores of the frame it is written again in stay on the
+/// copy (its snapshot is taken after them): the title sees them only when
+/// a later store changes the same bytes. Shaders see them either way.
 fn written_frames() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| std::env::var("VICTORY_MEMORY_WRITTEN_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))

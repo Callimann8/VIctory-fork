@@ -682,51 +682,41 @@ thread_local! {
     /// While a dispatch is bound: the most bytes of each root view that
     /// are brought up to date and declared written (`self_copy_head`).
     static VIEW_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
-    /// While a self-copy dispatch is bound: its root views take the window
-    /// in place cut to a run of memory, where there is one ([`root_find`]).
-    static PREFER_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Sets [`VIEW_CAP`] and [`PREFER_RUN`] for its life.
+/// Sets [`VIEW_CAP`] for its life.
 struct ViewCap;
 impl ViewCap {
     fn set(bytes: u64) -> ViewCap {
         VIEW_CAP.with(|c| c.set(bytes));
-        PREFER_RUN.with(|c| c.set(crate::inplace::runs_on()));
         ViewCap
     }
 }
 impl Drop for ViewCap {
     fn drop(&mut self) {
         VIEW_CAP.with(|c| c.set(u64::MAX));
-        PREFER_RUN.with(|c| c.set(false));
     }
 }
 
-fn prefer_run() -> bool {
-    PREFER_RUN.with(std::cell::Cell::get)
+/// Whether a view cap is set ([`VIEW_CAP`]): views made then are other
+/// views (shorter) than those made without, for the slot caches.
+fn capped() -> bool {
+    view_cap() != u64::MAX
 }
 
 /// The host buffer a root view at `address` binds: the copy `find` gives,
-/// or with windows cut to runs (`VICTORY_INPLACE_RUNS=1`) the run window
-/// that the directory of title memory by address gives there
-/// (`crate::memory`), so that a root view and the builder's raw addresses
-/// reach the same bytes: a copy would show what shaders store through the
-/// other only once it went back to title memory. Taken when the run holds
-/// all that the copy would from `address` on (the rest of the copy is
-/// memory that is not there), or for a self-copy dispatch, which reads and
-/// writes only its head (`State::self_copy`) and for which the run must
-/// hold 64 bytes. A root view is a one-view table
-/// (`bounded_root_srvs`): past the run's end it reads zeros and drops
-/// stores.
+/// or with windows cut to runs (`VICTORY_INPLACE_RUNS=1`) the run window,
+/// where the directory of title memory by address takes it too
+/// (`crate::shadow::run_window_usable`): a root view and the builder's raw
+/// addresses then reach the same bytes. A root view is a one-view table
+/// (`bounded_root_srvs`).
 fn root_find(address: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
     let found = crate::shadow::find(address, 1);
     if crate::inplace::runs_on()
         && crate::pipeline::host::bounded_root_srvs()
         && !found.as_ref().is_some_and(|s| s.in_place())
         && !crate::shadow::buffer_holds(address)
-        && let Some(run) = crate::shadow::run_window(address).filter(|s| s.offset_in(address).is_some() && s.left(address) >= 64)
-        && (prefer_run() || found.as_ref().is_none_or(|f| run.left(address) >= f.left(address)))
+        && let Some(run) = crate::shadow::run_window_usable(address)
     {
         return Some(run);
     }
@@ -1533,9 +1523,8 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        // (a self-copy's views on a run window are other views than the
-        // window's own, `root_find`)
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0) | u64::from(prefer_run()) << 62);
+        // (a self-copy's views are cut to its head, `VIEW_CAP`)
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0) | u64::from(capped()) << 62);
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
@@ -1554,7 +1543,10 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    // A self-copy's view ends at its head (`VIEW_CAP`): the
+                    // stores it makes past it (the bytes it read, put back)
+                    // are dropped, as nothing declares them written.
+                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit).min(view_cap()) + bias);
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -1605,7 +1597,7 @@ impl State {
         // (title addresses stay below bit 63).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(prefer_run()) << 62,
+            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(capped()) << 62,
         );
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
@@ -2437,11 +2429,11 @@ impl State {
             unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
         }
         // A copy of a range onto itself (`self_copy_shrink`): one group.
-        let [x, y, z] = if shrink {
-            SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed);
-            let n = SELF_COPY_SHRUNK.load(Ordering::Relaxed);
+        let [x, y, z] = if shrink && x != 0 && y != 0 && z != 0 {
+            let n = SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed) + 1;
             if n == 1 || n.is_multiple_of(8192) {
-                tracing::info!(shrunk = n, groups = x * y * z, "a copy of title memory onto itself runs as one group (VICTORY_SELF_COPY_SHRINK)");
+                let groups = u64::from(x) * u64::from(y) * u64::from(z);
+                tracing::info!(shrunk = n, groups, "a copy of title memory onto itself runs as one group (VICTORY_SELF_COPY_SHRINK)");
             }
             [1, 1, 1]
         } else {
@@ -2499,6 +2491,12 @@ impl State {
             }
             false
         };
+        // Its root UAV must be a table view with a size, cut to the head
+        // (`VIEW_CAP`): a root descriptor has none, and the one group's
+        // stores past the head would go undeclared.
+        if !crate::pipeline::host::bounded_root_srvs() {
+            return refuse("root views are root descriptors (VICTORY_ROOT_SRV_DIRECT)", String::new());
+        }
         let ([(srv, _)], [(uav, _)]) = (&stage.root_srvs[..], &stage.root_uavs[..]) else {
             return refuse(
                 "not one root SRV and one root UAV",

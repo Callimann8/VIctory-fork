@@ -80,6 +80,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// In place on a section of the page pool (`crate::inplace`): counted
+    /// apart from what is in place over private memory.
+    on_section: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2500,9 +2503,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if let Some((heap, _)) = &self.place {
+        if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len, heap);
+            crate::inplace::gone(self.window, self.len, self.on_section);
             if let Some(written) = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id) {
                 for (at, bytes) in written.spans {
                     in_place_span(at, at + bytes, false);
@@ -2900,6 +2903,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.on_section = placed.on_section;
         shadow
     }
 
@@ -2937,6 +2941,7 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            on_section: false,
         }
     }
 
@@ -4273,13 +4278,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
+        // Every run in the cells the range touches: what was found empty
+        // after a run may be there now.
+        let (lo, hi) = (at & !(WINDOW - 1), end.next_multiple_of(WINDOW));
         let mut map = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, _)| key.0 + key.1 > at)
-            .map(|(key, _)| *key)
-            .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        let keys: Vec<(u64, u64)> = map.range((lo, 0)..(hi, 0)).map(|(key, _)| *key).collect();
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key).map(|v| v.0)));
     }
     // (pages that could not be placed may be placeable now)
     NO_RUN.lock().unwrap_or_else(|e| e.into_inner()).retain(|&page, _| page + PAGE as u64 <= at || page >= end);
@@ -4317,7 +4321,9 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// is given one (a root view reads on to its window's end, and such a
 /// window ends where the run does). Taken out with the others when their
 /// memory is remapped ([`in_place_let_go`]).
-static RUNS: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// With each: whether it is usable for root views and the directory
+/// ([`run_window_usable`]).
+static RUNS: Mutex<BTreeMap<(u64, u64), (Arc<Shadow>, bool)>> = Mutex::new(BTreeMap::new());
 
 /// Whether a title buffer holds the 64 KiB page at `page` (its copy is what
 /// a shader's raw address must reach there).
@@ -4328,7 +4334,7 @@ pub(crate) fn buffer_holds(page: u64) -> bool {
 /// A window in place over the run of memory around the page at `page`
 /// within its 4 MiB cell (`crate::inplace::runs_on`), made on first ask;
 /// `None` if runs are off or the page cannot be placed.
-pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
+fn run_window(page: u64) -> Option<(Arc<Shadow>, bool)> {
     if !crate::inplace::runs_on() {
         return None;
     }
@@ -4341,7 +4347,7 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
         .find(|(key, _)| key.0 + key.1 >= page + PAGE as u64)
         .map(|(_, s)| s.clone())
     {
-        found.used.store(crate::host::moment(), Ordering::Relaxed);
+        found.0.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(found);
     }
     // A page that could not be placed lately is not asked about again for
@@ -4353,7 +4359,7 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
     }
     let cell = page & !(WINDOW - 1);
     let Some(placed) = crate::inplace::run_around(page, cell, cell + WINDOW)
-        .and_then(|(start, len)| Some((start, len, crate::inplace::place_for(start, len, true)?)))
+        .and_then(|(start, len, tail)| Some((start, len, tail, crate::inplace::place_for(start, len, true)?)))
     else {
         if no.len() >= 65_536 {
             no.clear();
@@ -4363,9 +4369,13 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
     };
     no.remove(&page);
     drop(no);
-    let (start, len, placed) = placed;
+    let (start, len, tail, placed) = placed;
     let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-    map.insert((start, len), shadow.clone());
+    // Usable where a copy of the cell from any address in the run would
+    // hold nothing more: the run goes to the cell's end, or nothing is
+    // committed after it.
+    let usable = start + len >= cell + WINDOW || tail;
+    map.insert((start, len), (shadow.clone(), usable));
     drop(map);
     // The directory's pages there may still name a copy (numbered when no
     // run could be placed): it looks at them again, so that it and root
@@ -4375,7 +4385,16 @@ pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
     if n == 1 || n.is_power_of_two() {
         tracing::info!(windows = n, start = format_args!("{start:#x}"), len, "title memory in place: windows cut to a run of memory, made since the start (VICTORY_INPLACE_RUNS=1)");
     }
-    Some(shadow)
+    Some((shadow, usable))
+}
+
+/// The run window ([`run_window`]) over the page at `page`, if it can
+/// stand for the copy of its cell: for a root view, which reads on from
+/// its address to its window's end, and so for the directory too, so that
+/// both reach the same bytes. At least 64 bytes from `page` on.
+pub(crate) fn run_window_usable(page: u64) -> Option<Arc<Shadow>> {
+    let (run, usable) = run_window(page)?;
+    (usable && run.offset_in(page).is_some() && run.left(page) >= 64).then_some(run)
 }
 
 /// Windows [`run_window`] made since the start.

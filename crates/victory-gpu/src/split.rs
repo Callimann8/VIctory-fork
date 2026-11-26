@@ -62,13 +62,21 @@ unsafe impl Sync for Work {}
 
 impl Work {
     fn piece(&self, at: usize, len: usize) {
+        /// Counts the piece done however the call ends (a piece that
+        /// unwound would leave the asking thread waiting for good).
+        struct Done<'a>(&'a Work, bool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.ok.store(false, Ordering::Relaxed);
+                }
+                self.0.left.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let mut done = Done(self, false);
         // SAFETY: alive until `left` reaches 0, which this piece's end does
         // only after the call.
-        let ok = unsafe { (*self.run)(at, len) };
-        if !ok {
-            self.ok.store(false, Ordering::Relaxed);
-        }
-        self.left.fetch_sub(1, Ordering::AcqRel);
+        done.1 = unsafe { (*self.run)(at, len) };
     }
 }
 

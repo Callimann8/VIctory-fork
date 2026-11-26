@@ -112,6 +112,8 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// On a section of the page pool ([`place_on_section`]).
+    pub(crate) on_section: bool,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -128,7 +130,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, on_section: false })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -208,9 +210,6 @@ static SECTION_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// more than one run, with holes, one run but placing on sections off.
 static VIEW_COVER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// Every heap opened on a section, by its interface pointer (for [`gone`]).
-static SECTION_PTRS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
-
 /// The heap of `section` (opened on first ask) and its bytes; `None` if
 /// the section is not committed or the host refused it.
 fn section_heap(section: usize) -> Option<(ID3D12Heap, u64)> {
@@ -228,7 +227,6 @@ fn section_heap(section: usize) -> Option<(ID3D12Heap, u64)> {
             let size = unsafe { heap.GetDesc() }.SizeInBytes.min(bytes);
             tracing::info!(section, mb = size >> 20, "title memory in place: a section of the page pool opened as a host heap (VICTORY_POOL_COMMIT)");
             heaps.insert(section, (heap.clone(), size));
-            SECTION_PTRS.lock().unwrap_or_else(|e| e.into_inner()).insert(heap.as_raw() as usize);
             Some((heap, size))
         }
         Err(e) => {
@@ -279,7 +277,7 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
                     "title memory in place: windows over the page pool placed on its sections since the start (no copy, no refresh, no copy-back)"
                 );
             }
-            Some(Placed { buffer, heap, gpu, bias })
+            Some(Placed { buffer, heap, gpu, bias, on_section: true })
         }
         Err(e) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
@@ -304,8 +302,10 @@ pub(crate) fn runs_on() -> bool {
 /// The longest stretch of `[lo, hi)` around the 64 KiB page at `at` that
 /// can be placed: one run of one section in view memory (with sections
 /// placed, [`views_in_place`]), or private memory committed whole and
-/// read-write; cut to 64 KiB lines. `None` if not even the page can.
-pub(crate) fn run_around(at: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+/// read-write; cut to 64 KiB lines. `None` if not even the page can. With
+/// it, whether nothing is committed from its end to `hi` (a copy of
+/// `[lo, hi)` would hold zeros there too).
+pub(crate) fn run_around(at: u64, lo: u64, hi: u64) -> Option<(u64, u64, bool)> {
     let page = at & !(K64 as u64 - 1);
     let (start, end) = {
         let v = views();
@@ -342,7 +342,34 @@ pub(crate) fn run_around(at: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
     };
     let start = start.max(lo).next_multiple_of(K64 as u64);
     let end = end.min(hi) & !(K64 as u64 - 1);
-    (start <= page && page + K64 as u64 <= end).then_some((start, end - start))
+    if !(start <= page && page + K64 as u64 <= end) {
+        return None;
+    }
+    Some((start, end - start, nothing_committed(end, hi)))
+}
+
+/// Whether no page of `[lo, hi)` is committed (regions as Windows reports
+/// them; a view of reserved section pages counts as not committed).
+fn nothing_committed(lo: u64, hi: u64) -> bool {
+    let mut at = lo;
+    while at < hi {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        if info.State == mem::MEM_COMMIT {
+            return false;
+        }
+        let end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if end <= at {
+            return false;
+        }
+        at = end;
+    }
+    true
 }
 
 /// The stretch of private memory, committed and read-write, around `page`
@@ -371,9 +398,9 @@ fn private_run(page: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64, heap: &ID3D12Heap) {
+pub(crate) fn gone(window: bool, bytes: u64, on_section: bool) {
     // On a section of the page pool: counted apart ([`place_on_section`]).
-    if SECTION_PTRS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(heap.as_raw() as usize)) {
+    if on_section {
         SECTION_STATS[3].fetch_sub(bytes, Ordering::Relaxed);
         return;
     }
