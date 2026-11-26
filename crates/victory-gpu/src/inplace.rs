@@ -323,6 +323,10 @@ fn say() {
         );
     }
     tracing::info!(
+        mb = crate::shadow::in_place_recopied() >> 20,
+        "title memory in place: copies that overlap it taken whole there at their refreshes since the start (shaders write it with nothing to tell them)"
+    );
+    tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
         s[0],

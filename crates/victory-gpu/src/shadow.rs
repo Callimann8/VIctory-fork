@@ -2429,6 +2429,55 @@ mod merge_tests {
     }
 }
 
+/// Title memory reached in place by some host buffer (`crate::inplace`), as
+/// (start, end) with how many placed buffers have that span; the merged
+/// runs of it, rebuilt when it changes (asked at every refresh); and
+/// whether there is any. A copy of memory that overlaps it cannot learn of
+/// what shaders write there in place (no write watch, no guard sees the
+/// card), so [`Shadow::update_free`] takes the overlap whole.
+static IN_PLACE_SPANS: Mutex<BTreeMap<(usize, usize), u32>> = Mutex::new(BTreeMap::new());
+static IN_PLACE_MERGED: std::sync::RwLock<Vec<(usize, usize)>> = std::sync::RwLock::new(Vec::new());
+static IN_PLACE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Bytes of copies taken whole because memory in place overlaps them,
+/// since the start.
+static IN_PLACE_RECOPIED: AtomicU64 = AtomicU64::new(0);
+
+fn in_place_span(start: usize, end: usize, add: bool) {
+    let mut spans = IN_PLACE_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    if add {
+        *spans.entry((start, end)).or_insert(0) += 1;
+    } else if let Some(n) = spans.get_mut(&(start, end)) {
+        *n -= 1;
+        if *n == 0 {
+            spans.remove(&(start, end));
+        }
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for &(a, b) in spans.keys() {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    IN_PLACE_ANY.store(!merged.is_empty(), Ordering::Release);
+    *IN_PLACE_MERGED.write().unwrap_or_else(|e| e.into_inner()) = merged;
+}
+
+/// The runs of memory in place that overlap `[from, to)`, in order.
+fn in_place_overlaps(from: usize, to: usize) -> Vec<(usize, usize)> {
+    if !IN_PLACE_ANY.load(Ordering::Acquire) || from >= to {
+        return Vec::new();
+    }
+    let merged = IN_PLACE_MERGED.read().unwrap_or_else(|e| e.into_inner());
+    let first = merged.partition_point(|&(_, end)| end <= from);
+    merged[first..].iter().take_while(|&&(start, _)| start < to).copied().collect()
+}
+
+/// Since the start: bytes of copies taken whole for memory in place.
+pub(crate) fn in_place_recopied() -> u64 {
+    IN_PLACE_RECOPIED.load(Ordering::Relaxed)
+}
+
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -2438,6 +2487,7 @@ impl Drop for Shadow {
         if let Some((heap, _)) = &self.place {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len, heap);
+            in_place_span(self.start as usize, (self.start + self.len) as usize, false);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2793,6 +2843,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        in_place_span(start as usize, (start + len) as usize, true);
         shadow
     }
 
@@ -3587,6 +3638,33 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // Title memory another host buffer reaches in place (`crate::inplace`):
+        // shaders write it there with nothing to tell this copy, so its part
+        // of the range is taken whole every time; the rest as usual.
+        let overlaps = in_place_overlaps(from, to);
+        if overlaps.is_empty() {
+            return self.update_watched(from, to);
+        }
+        let (mut at, mut bytes) = (from, 0);
+        for (a, b) in overlaps {
+            let (a, b) = (a.max(from), b.min(to));
+            if a > at {
+                bytes += self.update_watched(at, a);
+            }
+            if b > a {
+                IN_PLACE_RECOPIED.fetch_add((b - a) as u64, Ordering::Relaxed);
+                bytes += self.copy(a, b);
+            }
+            at = at.max(b);
+        }
+        if at < to {
+            bytes += self.update_watched(at, to);
+        }
+        bytes
+    }
+
+    /// [`Shadow::update_free`] of `[from, to)` outside memory in place.
+    fn update_watched(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
             // range was written that the copy does not hold, and the
