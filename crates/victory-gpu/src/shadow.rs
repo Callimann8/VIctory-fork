@@ -2447,7 +2447,16 @@ static IN_PLACE_RECOPIED: AtomicU64 = AtomicU64::new(0);
 /// [`IN_PLACE_SPANS`].
 /// With the title ranges each one's span covers (itself and other views of
 /// its pages, `crate::inplace::aliases`).
-static IN_PLACE_WRITTEN: Mutex<BTreeMap<u64, Vec<(usize, usize)>>> = Mutex::new(BTreeMap::new());
+static IN_PLACE_WRITTEN: Mutex<BTreeMap<u64, InPlaceWritten>> = Mutex::new(BTreeMap::new());
+
+/// Of a copy in place: the ranges of it shaders were declared to write
+/// (joined, in order), and the spans registered for them
+/// ([`in_place_span`], with their other views).
+#[derive(Default)]
+struct InPlaceWritten {
+    own: Vec<(usize, usize)>,
+    spans: Vec<(usize, usize)>,
+}
 
 fn in_place_span(start: usize, end: usize, add: bool) {
     let mut spans = IN_PLACE_SPANS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2494,8 +2503,8 @@ impl Drop for Shadow {
         if let Some((heap, _)) = &self.place {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len, heap);
-            if let Some(spans) = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id) {
-                for (at, bytes) in spans {
+            if let Some(written) = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id) {
+                for (at, bytes) in written.spans {
                     in_place_span(at, at + bytes, false);
                 }
             }
@@ -2831,16 +2840,36 @@ impl Shadow {
     /// ([`Shadow::update_free`]). Memory in place only read leaves them as
     /// they were (the write watch sees the title's own writes).
     /// Other views of the same physical pages (view memory) count as well.
-    fn in_place_written(&self) {
-        let mut written = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        if written.contains_key(&self.id) {
+    /// Only the ranges declared: the directory declares the pages shaders
+    /// marked, which are pages no title buffer holds (`crate::memory`), so
+    /// a buffer's copy inside the window is not taken whole for them.
+    fn in_place_written(&self, address: u64, len: u64) {
+        let (start, end) = (self.start, self.start + self.len);
+        let (from, to) = (address.max(start) as usize, address.saturating_add(len).min(end) as usize);
+        if from >= to {
             return;
         }
-        let spans = crate::inplace::aliases(self.start, self.len);
-        for &(at, bytes) in &spans {
-            in_place_span(at, at + bytes, true);
+        let mut all = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let written = all.entry(self.id).or_default();
+        let at = written.own.partition_point(|r| r.1 <= from);
+        if written.own.get(at).is_some_and(|r| r.0 <= from && to <= r.1) {
+            return;
         }
-        written.insert(self.id, spans);
+        let spans = crate::inplace::aliases(from as u64, (to - from) as u64);
+        for &(a, bytes) in &spans {
+            in_place_span(a, a + bytes, true);
+        }
+        written.spans.extend(spans);
+        written.own.push((from, to));
+        written.own.sort_unstable();
+        let mut joined: Vec<(usize, usize)> = Vec::with_capacity(written.own.len());
+        for &(a, b) in &written.own {
+            match joined.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => joined.push((a, b)),
+            }
+        }
+        written.own = joined;
     }
 
     pub(crate) fn unwatched(&self) -> bool {
@@ -2939,7 +2968,7 @@ impl Shadow {
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
             if len != 0 {
-                self.in_place_written();
+                self.in_place_written(address, len);
             }
             return;
         }
