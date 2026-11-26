@@ -1563,9 +1563,20 @@ fn workers() -> &'static Workers {
     workers
 }
 
-/// The threads kept for [`wide`] (the caller makes one more).
+/// The threads kept for [`wide`] (the caller makes one more): a quarter
+/// of the processors, 2 to 6 (6 on a 32-thread processor);
+/// `VICTORY_WIDE_THREADS=<n>` (1-16) sets how many (p3n1cillin/yuriko
+/// 97876cb9, GPL-3.0-or-later), for the wide refreshes, `VICTORY_PREP_WIDE`
+/// and `VICTORY_PARALLEL_REFRESH` on processors with more cores to give.
 pub(crate) fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let set = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|n| n.clamp(1, 16));
+        if let Some(n) = set {
+            crate::switchmap::act(crate::switchmap::S::WideThreads, n as u64);
+        }
+        set.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+    })
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
