@@ -850,8 +850,16 @@ fn private_fault(g: &mut Guards, block: usize) {
     if hot.1 <= private_hot() {
         return;
     }
+    private_demote(g, cell);
+}
+
+/// A 4 MiB cell [`guard_private`] took goes back to the write watch for
+/// good, opened whole.
+fn private_demote(g: &mut Guards, cell: usize) {
     g.hot.remove(&cell);
-    g.demoted.insert(cell);
+    if !g.demoted.insert(cell) {
+        return;
+    }
     let blocks = cell * CELL_BLOCKS..(cell + 1) * CELL_BLOCKS;
     for b in blocks.clone() {
         g.private.remove(&b);
@@ -1832,6 +1840,26 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+}
+
+/// [`writing`] before a write the kernel itself does into title memory
+/// (`ReadFile`, which may be overlapped and land later). With
+/// [`private_on`], the cells [`guard_private`] took under it go back to
+/// the write watch for good first: a guard put back over a block before
+/// the kernel writes it would fail the read (the write watch sees kernel
+/// writes, the guards do not). View memory is as before.
+pub fn kernel_writing(at: usize, len: usize) {
+    if private_on() && len != 0 {
+        let mut g = guards();
+        if !g.private.is_empty() {
+            let end = at.saturating_add(len);
+            let cells: BTreeSet<usize> = g.private.range(at / BLOCK..end.div_ceil(BLOCK)).map(|&b| b / CELL_BLOCKS).collect();
+            for cell in cells {
+                private_demote(&mut g, cell);
+            }
+        }
+    }
+    writing(at, len);
 }
 
 /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
