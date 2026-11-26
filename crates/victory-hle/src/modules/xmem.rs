@@ -521,9 +521,19 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     1
 }
 
+/// Whether page numbers `a` and `b` (`b` = `a` + `k` pages) are slices
+/// `k` apart of one section: one view can show both.
+fn pages_follow(a: usize, b: usize, k: usize) -> bool {
+    let physical = physical();
+    match (physical.pages.get(&a), physical.pages.get(&b)) {
+        (Some(x), Some(y)) => Arc::ptr_eq(&x.section, &y.section) && y.index == x.index + k,
+        _ => false,
+    }
+}
+
 /// `VICTORY_MAP_RUNS=1`: the GPU's page-mapping copies ([`map_alias`]) map
 /// a view per run of pages that follow one another in a section, not one
-/// per page.
+/// per page; so do runs of `XMemMapPhysicalPagesScatter`.
 fn map_runs() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_some_and(|v| v == "1"));
     *ON
@@ -799,6 +809,42 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 ) -> BOOL {
     if addresses.is_null() {
         return 0;
+    }
+    // With `VICTORY_MAP_RUNS=1`: consecutive addresses that map pages
+    // following one another (or that all unmap) go as one call, which maps
+    // them as one view; each call is an unmapping and a mapping under the
+    // remapping lock, and each unmapping flushes every core's TLB.
+    if map_runs() {
+        let mut i = 0;
+        while i < n {
+            // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+            let page_at = |k: usize| unsafe { if pages.is_null() { 0 } else { *pages.add(k) } };
+            // SAFETY: as above.
+            let address_at = |k: usize| unsafe { *addresses.add(k) } as usize;
+            let (first_address, first_page) = (address_at(i), page_at(i));
+            let mut run = 1;
+            while i + run < n
+                && address_at(i + run) == first_address + run * PAGE
+                && match (first_page, page_at(i + run)) {
+                    (0, 0) => true,
+                    (0, _) | (_, 0) => false,
+                    (a, b) => b == a + run * FRAMES && pages_follow(a, b, run),
+                }
+            {
+                run += 1;
+            }
+            let mapped = if first_page == 0 {
+                XMemMapPhysicalPages(first_address as *mut c_void, run, std::ptr::null())
+            } else {
+                // SAFETY: `run` page numbers from `i` on, all in range.
+                XMemMapPhysicalPages(first_address as *mut c_void, run, unsafe { pages.add(i) })
+            };
+            if mapped.is_null() {
+                return 0;
+            }
+            i += run;
+        }
+        return 1;
     }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
