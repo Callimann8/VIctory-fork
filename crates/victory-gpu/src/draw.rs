@@ -656,6 +656,9 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Dispatches run as one group by [`State::self_copy`].
+static SELF_COPY_SHRUNK: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -2332,6 +2335,17 @@ impl State {
             // SAFETY: the translated shader declares this root word.
             unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
         }
+        // A copy of a range onto itself (`self_copy_shrink`): one group.
+        let [x, y, z] = if self.self_copy(p) {
+            SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed);
+            let n = SELF_COPY_SHRUNK.load(Ordering::Relaxed);
+            if n == 1 || n.is_multiple_of(8192) {
+                tracing::info!(shrunk = n, groups = x * y * z, "a copy of title memory onto itself runs as one group (VICTORY_SELF_COPY_SHRINK)");
+            }
+            [1, 1, 1]
+        } else {
+            [x, y, z]
+        };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         if let Some((param, word)) = tail {
@@ -2340,6 +2354,58 @@ impl State {
             unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether this dispatch is a title program that copies a range onto
+    /// itself (`VICTORY_SELF_COPY_SHRINK`): its shader is one of the listed
+    /// ones (hash prefixes; default `c42a31951201f9a0`, `0` = none), its
+    /// root SRV and root UAV are the same address, and its source and
+    /// destination offsets (user words 20 and 21) are equal.
+    ///
+    /// c42a31951201f9a0 (made by the title at run time; 63 dispatches a lit
+    /// frame, 200-335 ms of the card's time with ray tracing on): each
+    /// thread copies 16 bytes and steps by user word 4 (the threads the
+    /// title launched) x 16 until the byte count in the source's header,
+    /// then lane 0 of group 0 writes an empty box at +16..+39 if word 5 is
+    /// 0. The step does not depend on the groups launched, so one group
+    /// copies a subset of the range onto itself (which changes nothing)
+    /// and still writes the box. Binding, refresh and copy-back stay as
+    /// they are.
+    fn self_copy(&self, p: &crate::pipeline::host::HostPipeline) -> bool {
+        static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let list = LIST.get_or_init(|| {
+            let v = std::env::var("VICTORY_SELF_COPY_SHRINK").unwrap_or_else(|_| "c42a31951201f9a0".to_owned());
+            if v.trim() == "0" {
+                return Vec::new();
+            }
+            v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+        });
+        if list.is_empty() {
+            return false;
+        }
+        let [stage] = &p.stages[..] else { return false };
+        if !list.iter().any(|h| stage.shader.hash.starts_with(h.as_str())) {
+            return false;
+        }
+        let ([(srv, _)], [(uav, _)]) = (&stage.root_srvs[..], &stage.root_uavs[..]) else {
+            return false;
+        };
+        let roots = self.roots_ref(true);
+        let (Some(Root::View(a)), Some(Root::View(b))) = (roots.get(usize::from(*srv)), roots.get(usize::from(*uav))) else {
+            return false;
+        };
+        if a != b {
+            return false;
+        }
+        let t = stage.translated();
+        let word = |index: u32| {
+            t.host
+                .user_data
+                .iter()
+                .find(|u| u.index == index && !matches!(u.root, RootType::Other(_)))
+                .map(|u| self.user_value(true, u.slot, u.root, u.dword))
+        };
+        matches!((word(20), word(21)), (Some(s), Some(d)) if s == d)
     }
 
     /// What a draw or dispatch runs, for the device-removed report

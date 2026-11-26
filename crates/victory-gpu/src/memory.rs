@@ -95,6 +95,9 @@ struct Memory {
     /// Per copy: the frame something last named, faulted or marked a page
     /// of it.
     touched: Vec<u64>,
+    /// Per copy: the frame it was last brought up to date in by a bind
+    /// (`VICTORY_MEMORY_REFRESH_ONCE`).
+    refreshed: Vec<u64>,
     /// Per view heap: every run of copy views it has had (base, length).
     runs: HashMap<usize, Vec<(u32, u32)>>,
     /// Per host view heap (by address): the first slot of its current run,
@@ -169,6 +172,7 @@ impl Memory {
             faults: make(fault_dwords(), "faults")?,
             copies: Vec::new(),
             touched: Vec::new(),
+            refreshed: Vec::new(),
             runs: HashMap::new(),
             heaps: HashMap::new(),
             numbers: HashMap::new(),
@@ -226,6 +230,7 @@ impl Memory {
         self.numbers.insert(shadow.id(), self.copies.len());
         self.copies.push(Some(shadow.clone()));
         self.touched.push(self.frame);
+        self.refreshed.push(u64::MAX);
         self.numbered_by[self.source] += 1;
         if self.copies.len() % 256 == 0 {
             let [view, pair, unit, fault, inside] = self.numbered_by;
@@ -599,6 +604,21 @@ fn refresh_idle() -> u64 {
     *N.get_or_init(|| std::env::var("VICTORY_MEMORY_REFRESH_IDLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_MEMORY_REFRESH_ONCE=1`: a numbered copy is brought up to date
+/// by the first list of a frame that binds a shader reaching it, not by
+/// every such list (off by default: every list refreshes every copy). A
+/// copy numbered, remapped or given pages since is refreshed as before;
+/// the refresh itself copies only what the write watch or the guards say
+/// the title wrote. shortcut: title writes later in the same frame reach
+/// the copy at the next frame's first list.
+fn refresh_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Refreshes left out by [`refresh_once`], and done, since the start.
+static ONCE_SKIPPED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 /// `VICTORY_MEMORY_BUDGET_MB=N`: numbered windows past N MiB in all are
 /// let go, those reached longest ago first (0, the default: no limit).
 fn budget_bytes() -> u64 {
@@ -755,6 +775,8 @@ pub(crate) fn ready(
     let changed = std::mem::take(&mut m.recalculate);
     m.recalculate.clone_from(&changed);
     m.update_ranges();
+    let now = crate::frame::current();
+    let mut refreshed_now = Vec::new();
     for (n, shadow) in m.copies.iter().enumerate().take(count as usize) {
         let Some(shadow) = shadow else { continue };
         if m.owned[n] == 0 {
@@ -776,10 +798,16 @@ pub(crate) fn ready(
             && victory_shader::emit::memory_read_marks()
             && shadow.is_window()
             && m.frame.saturating_sub(m.touched[n]) > idle;
-        if read && !asleep {
+        let done = refresh_once() && !fresh && m.refreshed[n] == now;
+        if read && !asleep && done {
+            ONCE_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+        }
+        if read && !asleep && !done {
             for &(start, len) in &m.ranges[n] {
                 shadow.refresh(list, start, len);
             }
+            refreshed_now.push(n);
+            ONCE_SKIPPED[1].fetch_add(1, Ordering::Relaxed);
         }
         if write {
             // Only pages shaders marked as stored to; a page's first
@@ -789,6 +817,21 @@ pub(crate) fn ready(
             for &(start, len) in ranges {
                 shadow.gpu_writes(list, start, len);
             }
+        }
+    }
+    for n in refreshed_now {
+        m.refreshed[n] = now;
+    }
+    if refresh_once() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if now >= SAID.load(Ordering::Relaxed) + 300 {
+            SAID.store(now, Ordering::Relaxed);
+            tracing::info!(
+                skipped = ONCE_SKIPPED[0].load(Ordering::Relaxed),
+                refreshed = ONCE_SKIPPED[1].load(Ordering::Relaxed),
+                frame = now,
+                "title memory by address: copy refreshes left out as already done this frame (VICTORY_MEMORY_REFRESH_ONCE), since the start"
+            );
         }
     }
     if first_read {
