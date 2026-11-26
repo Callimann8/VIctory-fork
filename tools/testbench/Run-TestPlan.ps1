@@ -400,7 +400,7 @@ $PhaseLines = @(Get-Setting 'PhaseLines' @('prep split:'))
 function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
     $m = @{ Usual = @(); Prep = @(); Idle = @(); Back = @(); Free = @(); Medians = @(); Frames = 0; Seconds = 0.0; Long = 0; Lines = 0
         Crash = ''; Slots = 0; Warmup = ''; Fields = [ordered]@{}; Phases = [ordered]@{}; SwitchLines = @(); Unmapped = ''
-        Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = '' }
+        Tail = (New-Object System.Collections.Generic.Queue[string]); Dumps = @(); CacheDir = ''; TexLine = ''; Accounting = @() }
     if (-not (Test-Path $Path)) { return $m }
     foreach ($k in $FrameFields.Keys) { $m.Fields[$k] = New-Object System.Collections.Generic.List[double] }
     $world = $null
@@ -417,13 +417,17 @@ function ConvertFrom-FrameLog([string]$Path, [string]$WorldStamp) {
         if (-not $m.Unmapped -and $line -match 'switch map: .* \|\| set, no counter: (.*?)(?: frames=\d+)?$') { $m.Unmapped = $matches[1].Trim() }
         $isFrame = $line -match 'framelog: (usual frame|frame times)'
         $isMap = $line -match 'switch map: '
+        $isTex = $line -match 'texture problems: '
+        $isAcc = $line -match 'card accounting: '
         $phase = $null
         foreach ($p in $PhaseLines) { if ($line.Contains($p)) { $phase = $p; break } }
-        if (-not ($isFrame -or $isMap -or $phase)) { continue }
+        if (-not ($isFrame -or $isMap -or $phase -or $isTex -or $isAcc)) { continue }
         if ($world) {
             $t = Get-Stamp $line
             if ($t -and ($t - $world).TotalSeconds -lt $SkipSeconds) { continue }
         }
+        if ($isTex) { $m.TexLine = ($line -replace '^.*?texture problems: ', '') -replace ' frames=\d+\s*$', ''; continue }
+        if ($isAcc) { $m.Accounting += (($line -replace '^.*?card accounting: ', '') -replace ' frames=\d+\s*$', ''); continue }
         if ($isMap) {
             $text = ($line -replace '^.*?switch map: ', '') -replace ' frames=\d+\s*$', ''
             $m.SwitchLines += ($text -split ' \|\| ')[0]
@@ -613,7 +617,7 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     New-Item -ItemType Directory -Force -Path $pics | Out-Null
     $r = [ordered]@{ Name = $Name; Build = $Run.Build; Sets = ($Expanded.Sets -join '+'); Switches = (($Expanded.Env.GetEnumerator() | ForEach-Object { "$($_.Key -replace '^VICTORY_','')=$($_.Value)" }) -join ' ')
         Phases = $null; SwitchMap = @(); SwitchMissing = @(); SwitchUnmapped = ''; SwitchFlags = ''; CpuCores = @(); CpuAllPct = $null; BusyCores = $null; CpuMsPerFrame = $null
-        PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
+        TexLine = ''; TexFlags = ''; Accounting = @(); PeakWsGB = $null; PeakCommitGB = $null; PeakVramGB = $null; PeakSharedGB = $null; MinFreeRamGB = $null; Crash = $null
         Status = 'not run'; FrameMs = $null; Fps = $null; MedianMs = $null; PrepMs = $null; GpuMs = $null; CopyBackMs = $null; FreeMbMin = $null; LongPct = $null
         VsBase = $null; Helped = $null; Pictures = ''; PictureNote = ''; Noisy = [bool]$Noisy; NoisyWhy = @($(if ($Noisy) { 'whole plan marked noisy (-Noisy)' })); Note = ''; Dir = $dir; Pics = $pics; Log = ''; World = ''; Started = (Get-Date).ToString('s') }
     Say "copying the test save for $Name..."
@@ -759,6 +763,19 @@ function Invoke-Run($Run, [string]$Name, $Expanded) {
     if ($never) { $flags += "$never never acted" }
     if ($refused) { $flags += "$refused refused" }
     if ($sm.Missing.Count) { $flags += "$($sm.Missing.Count) not in map" }
+    # Texture problems (last line of the measured stretch) and card accounting.
+    $r.TexLine = $m.TexLine
+    $r.Accounting = @($m.Accounting | Select-Object -Last 5)
+    if ($m.Accounting.Count) { $m.Accounting | Set-Content (Join-Path $dir 'card-accounting.txt') -Encoding UTF8 }
+    $tex = @()
+    if ($m.TexLine -match '([\d.]+) slots refused/f' -and [double]$matches[1] -gt 0) { $tex += "slots refused $($matches[1])/f" }
+    if ($m.TexLine -match 'skipped: ([\d.]+)/f unknown layout, ([\d.]+)/f XOR mode') {
+        if ([double]$matches[1] -gt 0) { $tex += "unknown-layout uploads skipped $($matches[1])/f" }
+        if ([double]$matches[2] -gt 0) { $tex += "XOR uploads skipped $($matches[2])/f" }
+    }
+    if ($m.TexLine -match 'card refused to make ([\d.]+)/f' -and [double]$matches[1] -gt 0) { $tex += "card refused $($matches[1])/f" }
+    $r.TexFlags = $tex -join ', '
+    if ($tex.Count) { $flags += "TEXTURES: $($r.TexFlags)" }
     $r.SwitchFlags = $flags -join ', '
     # Processor and memory over the measured stretch.
     if ($samples.Count) {
@@ -852,6 +869,13 @@ function Get-RunDetails($R) {
     } elseif ($R.Switches) { $o.Add(''); $o.Add('No switch-map lines in the measured stretch (a build without the switch map?).') }
     if ($R.SwitchMissing -and @($R.SwitchMissing).Count) { $o.Add(''); $o.Add("Set but not in the switch map: $(@($R.SwitchMissing) -join ', ')") }
     if ($R.SwitchUnmapped) { $o.Add(''); $o.Add("Set, no counter (from the game): $($R.SwitchUnmapped)") }
+    if ($R.PSObject.Properties.Name -contains 'TexLine' -and $R.TexLine) {
+        $o.Add(''); $o.Add("Texture problems (last report)$(if ($R.TexFlags) { ', **flagged: ' + $R.TexFlags + '**' }): $($R.TexLine)")
+    }
+    if ($R.PSObject.Properties.Name -contains 'Accounting' -and @($R.Accounting).Count) {
+        $o.Add(''); $o.Add("Card accounting (last $(@($R.Accounting).Count) reports; all in card-accounting.txt):"); $o.Add('')
+        foreach ($a in $R.Accounting) { $o.Add("- $($a -replace '\|','/')") }
+    }
     if ($R.Phases -and @($R.Phases.PSObject.Properties).Count) {
         $o.Add(''); $o.Add('| Phase (median ms per frame) | ms |'); $o.Add('|---|---|')
         foreach ($p in $R.Phases.PSObject.Properties) { $o.Add("| $($p.Name) | $($p.Value) |") }
@@ -883,7 +907,7 @@ function Write-Table {
     $md.Add('')
     $md.Add("Started $($script:PlanStart). Each run: $RunSeconds s after the game world started; numbers are medians of the frame-log reports after the first $SkipSeconds s. Frame = usual frame (long frames left out), fps = all frames / time. GPU = frame minus card idle. vs base = frame against $Baseline (negative = faster). Close = within $MarginPct%.")
     $md.Add('')
-    $md.Add('| Run | Build | Sets | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Switch flags | Pictures | Noisy | Note |')
+    $md.Add('| Run | Build | Sets | Status | Frame ms | fps | vs base | Prep ms | GPU ms | Copy-back ms | Min free MB | Long % | CPU % (cores >=50%) | Peak RAM / VRAM GB | Flags | Pictures | Noisy | Note |')
     $md.Add('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     foreach ($r in $rows) {
         $vs = if ($null -ne $r.VsBase) { '{0:+0.0;-0.0}%' -f $r.VsBase } else { '-' }

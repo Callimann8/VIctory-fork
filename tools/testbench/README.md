@@ -34,6 +34,7 @@ Results go to `C:\xcl\runs\testbench\<plan>-<date>-<time>\`:
 - `<run>\`: `err.log`/`out.log` (the game's log), `env.txt` (exact switches), `frames\` (pictures),
   `pictures\report.html` (side by side with main and a red difference map), `pc-use.csv`.
 - `results.md` also has a **Run details** section per run (also in `<run>\details.md`):
+  - texture problems (last report; flagged when slots are refused or uploads skipped) and the last 5 `card accounting:` lines (all in `card-accounting.txt`);
   - the switch map: what each switch did per frame in the last 3 `switch map:` lines of the measured stretch,
     with NEVER ACTED and refusals flagged, and switches the map does not name;
   - phase timings (medians per frame) from the frame line, plus every `prep split: label N ms | ...` line

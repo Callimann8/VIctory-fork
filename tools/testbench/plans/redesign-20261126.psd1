@@ -43,5 +43,7 @@
         @{ Name = 'TRACER'; Build = 'test'; Use = 'best', 'TRACER' }           # own warm-up; the real test (WAVE_WIDE without b5b83854) is set up by hand
         @{ Name = 'G2';    Build = 'test'; Use = 'best', 'G2' }               # LDS_PRUNE, own warm-up; compared only, picture must match (GPU thread)
         @{ Name = 'BUSY';  Build = 'test'; Use = 'best', 'BUSY'; Prompt = 'Walk out of the cell into the crowded area' }
+        @{ Name = 'ROOM';  Build = 'test'; Use = 'best', 'ROOM' }   # more card room for textures: fewer missing textures? watch 'texture problems' and the card budget line
+        @{ Name = 'TEX';   Build = 'test'; Use = 'best'; Env = @{ VICTORY_CARD_ACCOUNTING = '1' } }   # missing textures: what waits for room / is not mapped yet (5-s line); not timed against others
     )
 }
