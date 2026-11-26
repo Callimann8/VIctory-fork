@@ -8466,6 +8466,11 @@ impl HostList {
                     if batch.texture_due(staging) {
                         if prep_wide() {
                             batch.seg.texture(staging.clone());
+                        } else if parallel_refresh() {
+                            // Checked with the others of the batch, several
+                            // at a time, before the next step that writes
+                            // title memory ([`Batch::check_textures`]).
+                            batch.due_textures.push(staging.clone());
                         } else {
                             staging.refresh();
                         }
@@ -8595,10 +8600,27 @@ struct Batch {
     /// With [`crate::prep_wide`]: the steps since the last barrier, sorted
     /// into pieces that may run beside one another.
     seg: crate::prep_wide::Segment<std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::texture::Staging>>,
+    /// With [`parallel_refresh`]: textures due a check, not checked yet
+    /// ([`Batch::check_textures`], before any write of ours and at every
+    /// flush).
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 /// The pieces of a stretch ([`crate::prep_wide`]).
 type PrepPiece = crate::prep_wide::Piece<std::sync::Arc<crate::shadow::Shadow>, std::sync::Arc<crate::texture::Staging>>;
+
+/// Whether a submission's texture checks (`crate::texture::Staging::refresh`)
+/// are gathered between writes of ours and run on the helper threads side
+/// by side (`VICTORY_PARALLEL_REFRESH=1`; off by default). Measured by
+/// fxceless (ceb9e1f): -8.7 / -9.4 ms of the preparing thread. A check
+/// moves from its step to the next write of ours or flush: it reads title
+/// memory a little later, never after a write of ours its lists come
+/// before. `VICTORY_PREP_WIDE` takes precedence (it runs the checks in its
+/// own pieces).
+fn parallel_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_REFRESH").is_some_and(|v| v == "1"))
+}
 
 /// Whether a submission's steps are cut into stretches ([`crate::prep_wide`]).
 fn prep_wide() -> bool {
@@ -8609,6 +8631,7 @@ impl Drop for Batch {
     fn drop(&mut self) {
         // (Every submission flushes its batch; this only makes sure no
         // step is ever left out.)
+        self.check_textures();
         if !self.seg.is_empty() {
             self.run_segment();
         }
@@ -8830,6 +8853,7 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
@@ -8841,6 +8865,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         let end = at + len;
@@ -8859,7 +8884,41 @@ impl Batch {
         });
     }
 
+    /// With [`parallel_refresh`]: checks the textures due
+    /// ([`Batch::due_textures`]) on the helper threads
+    /// (`crate::shadow::wide_run`), all done before it returns. Each check
+    /// takes its texture's own lock, the journal's for its asking and a
+    /// buffer of its thread's own; the hashing and detiling run side by
+    /// side. "textures N ms" counts the time it took, not the threads' sum.
+    /// Ported from fxceless ceb9e1f (GPL-3.0-or-later).
+    fn check_textures(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        if due.len() < 2 {
+            for staging in due {
+                staging.refresh();
+            }
+            return;
+        }
+        let n = due.len() as u64;
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[2].fetch_sub(summed.saturating_sub(wall), Relaxed);
+        crate::switchmap::acts(crate::switchmap::S::ParallelRefresh, n, summed.saturating_sub(wall));
+    }
+
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         if prep_wide() {
             // The pending refreshes join their copies' chains, and the

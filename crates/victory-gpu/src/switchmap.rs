@@ -72,6 +72,7 @@ switches! {
     MemoryBudget = "VICTORY_MEMORY_BUDGET_MB", "windows let go over the budget", "bytes";
     PrepWide = "VICTORY_PREP_WIDE", "stretches cut into pieces", "pieces";
     SweepAtRoom = "VICTORY_SWEEP_AT_ROOM", "idle texture copies let go for room", "bytes";
+    ParallelRefresh = "VICTORY_PARALLEL_REFRESH", "texture checks side by side", "microseconds saved";
     RoomKeptSecs = "VICTORY_ROOM_KEPT_SECS", "room questions answered without kept room", "";
 }
 
