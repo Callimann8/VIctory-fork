@@ -24,11 +24,12 @@
         @{ Name = 'R1';    Build = 'test'; Use = 'R1'; Try = $true }
         @{ Name = 'R2';    Build = 'test'; Use = 'best', 'R2'; Try = $true }
         @{ Name = 'R2b';   Build = 'test'; Use = 'best', 'R3'; Env = @{ VICTORY_INPLACE_MB = '0' }; Try = $true; OnlyIfCrashed = 'R2' }   # fallback: sections only
-        @{ Name = 'R3';    Build = 'test'; Use = 'best', 'R3'; Try = $true }
-        @{ Name = 'R3b';   Build = 'test'; Use = 'best', 'R3b'; Try = $true }
+        @{ Name = 'R3';    Build = 'test'; Use = 'best', 'R2', 'R3'; Try = $true }           # POOL_COMMIT only means something with INPLACE
+        @{ Name = 'R3b';   Build = 'test'; Use = 'best', 'R2', 'R3', 'R3b'; Try = $true }    # INPLACE_RUNS on top of in-place + pool
         @{ Name = 'R3c';   Build = 'test'; Use = 'best', 'R3c'; Try = $true }
         @{ Name = 'R3d';   Build = 'test'; Use = 'best', 'R3d' }                # compared only, not stacked (R4 must not sit on R3d)
-        @{ Name = 'R4';    Build = 'test'; Use = 'best', 'R4'; Try = $true }
+        @{ Name = 'R4';    Build = 'test'; Use = 'best', 'R4'; Try = $true; Prompt = 'Walk out of the cell and back, then check RT shadows and reflections; Enter to measure' }
+        @{ Name = 'R4b';   Build = 'test'; Use = 'best', 'R3d', 'R4b'; Prompt = 'Load the test save and walk outside; Enter to measure' }   # compared only: WATCH_FIXED on GUARD_PRIVATE=all
         @{ Name = 'R5';    Build = 'test'; Use = 'best', 'R5'; Try = $true }
         @{ Name = 'R6';    Build = 'test'; Use = 'best', 'R6'; Try = $true }
         @{ Name = 'R7';    Build = 'test'; Use = 'best', 'R7'; Try = $true }
@@ -36,6 +37,7 @@
         @{ Name = 'R9';    Build = 'test'; Use = 'best', 'R9'; Try = $true }
         @{ Name = 'R10';   Build = 'test'; Use = 'best', 'R10'; Try = $true }   # own warm-up (shader switch)
         @{ Name = 'R11';   Build = 'test'; Use = 'best', 'R11'; Try = $true }   # Belobug per-draw CPU savings
+        @{ Name = 'TRACER'; Build = 'test'; Use = 'best', 'TRACER' }           # own warm-up; the real test (WAVE_WIDE without b5b83854) is set up by hand
         @{ Name = 'BUSY';  Build = 'test'; Use = 'best', 'BUSY'; Prompt = 'Walk out of the cell into the crowded area' }
     )
 }
