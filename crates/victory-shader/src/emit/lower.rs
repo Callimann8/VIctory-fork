@@ -1853,7 +1853,9 @@ impl<'a> Lower<'a> {
                 // 64 KiB, which NVIDIA's compiler keeps per thread in local
                 // memory: slow to fill and gigabytes of video memory
                 // reserved. Constants live after the code; an index that
-                // reads below the table's start is clamped as one past it.
+                // reads below the table's start reads its last dword (as
+                // one past its end does). A program with nothing after its
+                // code keeps the table it had.
                 let first = if code_table_after() {
                     let end = self
                         .x
@@ -1865,7 +1867,7 @@ impl<'a> Lower<'a> {
                         .max()
                         .unwrap_or(0)
                         .next_multiple_of(4);
-                    first.max(end)
+                    if (end as usize) < self.x.native.code.len() { first.max(end) } else { first }
                 } else {
                     first
                 };

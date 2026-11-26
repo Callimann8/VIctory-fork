@@ -842,8 +842,7 @@ pub(crate) fn ready(
     let idle_bind = !first_read && !first_write && !remapped && changed.is_empty() && numbered >= count as usize && made >= count;
     for (n, shadow) in m.copies.iter().enumerate().take(if idle_bind { 0 } else { count as usize }) {
         let Some(shadow) = shadow else { continue };
-        // In place: the title's own bytes; nothing to bring up or copy back.
-        if m.owned[n] == 0 || shadow.in_place() {
+        if m.owned[n] == 0 {
             continue;
         }
         // (also copies whose view this bind made: a run grew)
@@ -851,6 +850,19 @@ pub(crate) fn ready(
         let read = first_read || fresh;
         let write = writes && (first_write || fresh);
         if !(read || write) {
+            continue;
+        }
+        // In place: the title's own bytes; nothing to bring up or copy back.
+        // Stores are still declared: the list's prelude takes no record of
+        // it, and copies overlapping it take the overlap whole from then on
+        // (`Shadow::gpu_writes`).
+        if shadow.in_place() {
+            if write {
+                let ranges = if victory_shader::emit::memory_marks() { &m.written_ranges[n] } else { &m.ranges[n] };
+                for &(start, len) in ranges {
+                    shadow.gpu_writes(list, start, len);
+                }
+            }
             continue;
         }
         // A window no shader reached for a while (read marks say so exactly) is left as

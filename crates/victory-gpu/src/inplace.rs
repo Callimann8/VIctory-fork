@@ -389,7 +389,9 @@ pub(crate) fn gone(window: bool, bytes: u64, heap: &ID3D12Heap) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    // (windows on sections of the page pool are counted apart, and are let
+    // go too when their view is unmapped or mapped anew)
+    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 && SECTION_STATS[3].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -605,6 +607,37 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
         return Vec::new();
     }
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+}
+
+/// The title address ranges that show the bytes of `[start, start + len)`:
+/// the range itself, and where it is view memory, every other view of the
+/// same physical pages (a shader's write in place through one view is a
+/// write of what all of them show).
+pub(crate) fn aliases(start: u64, len: u64) -> Vec<(usize, usize)> {
+    let (start, end) = (start as usize, start.saturating_add(len) as usize);
+    let parts: Vec<(usize, u64, usize)> = {
+        let v = views();
+        if v.views.is_empty() {
+            return vec![(start, end - start)];
+        }
+        let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+        first
+            .into_iter()
+            .chain(v.views.range(start.saturating_add(1)..end).map(|(base, _)| *base))
+            .filter_map(|base| {
+                let &(bytes, section, offset) = v.views.get(&base)?;
+                let (a, b) = (base.max(start), (base + bytes).min(end));
+                (b > a).then(|| (section, offset + (a - base) as u64, b - a))
+            })
+            .collect()
+    };
+    let mut all = vec![(start, end - start)];
+    for (section, offset, bytes) in parts {
+        all.extend(views_of_section(section, offset, bytes));
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +

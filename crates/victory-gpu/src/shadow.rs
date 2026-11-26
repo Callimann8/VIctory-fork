@@ -2429,7 +2429,8 @@ mod merge_tests {
     }
 }
 
-/// Title memory reached in place by some host buffer (`crate::inplace`), as
+/// Title memory reached in place by some host buffer that shaders write
+/// (`crate::inplace`, [`Shadow::in_place_written`]), as
 /// (start, end) with how many placed buffers have that span; the merged
 /// runs of it, rebuilt when it changes (asked at every refresh); and
 /// whether there is any. A copy of memory that overlaps it cannot learn of
@@ -2441,6 +2442,12 @@ static IN_PLACE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Bytes of copies taken whole because memory in place overlaps them,
 /// since the start.
 static IN_PLACE_RECOPIED: AtomicU64 = AtomicU64::new(0);
+/// The copies in place (by id) that shaders were declared to write
+/// ([`Shadow::in_place_written`]); only their spans are in
+/// [`IN_PLACE_SPANS`].
+/// With the title ranges each one's span covers (itself and other views of
+/// its pages, `crate::inplace::aliases`).
+static IN_PLACE_WRITTEN: Mutex<BTreeMap<u64, Vec<(usize, usize)>>> = Mutex::new(BTreeMap::new());
 
 fn in_place_span(start: usize, end: usize, add: bool) {
     let mut spans = IN_PLACE_SPANS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2487,7 +2494,11 @@ impl Drop for Shadow {
         if let Some((heap, _)) = &self.place {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len, heap);
-            in_place_span(self.start as usize, (self.start + self.len) as usize, false);
+            if let Some(spans) = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id) {
+                for (at, bytes) in spans {
+                    in_place_span(at, at + bytes, false);
+                }
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2815,6 +2826,23 @@ impl Shadow {
         self.place.is_some()
     }
 
+    /// Memory in place that a shader is declared to write: from now on
+    /// copies that overlap it take the overlap whole at their refreshes
+    /// ([`Shadow::update_free`]). Memory in place only read leaves them as
+    /// they were (the write watch sees the title's own writes).
+    /// Other views of the same physical pages (view memory) count as well.
+    fn in_place_written(&self) {
+        let mut written = IN_PLACE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if written.contains_key(&self.id) {
+            return;
+        }
+        let spans = crate::inplace::aliases(self.start, self.len);
+        for &(at, bytes) in &spans {
+            in_place_span(at, at + bytes, true);
+        }
+        written.insert(self.id, spans);
+    }
+
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
@@ -2843,7 +2871,6 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
-        in_place_span(start as usize, (start + len) as usize, true);
         shadow
     }
 
@@ -2911,6 +2938,9 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            if len != 0 {
+                self.in_place_written();
+            }
             return;
         }
         let len = len.min(self.left(address));
