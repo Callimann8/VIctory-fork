@@ -2999,9 +2999,42 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// `VICTORY_SETTLE_ROOM=1` (fxceless 06702fe; off by default): flights get
+/// twice the lists in the air ([`late_most`]) and eight times the changed
+/// runs the merge under shaders' writes takes ([`merge_runs`]) before they
+/// are settled. Measured there: -11.5 ms of the preparing thread's work at
+/// equal draws; here the 512-run cap settled 0.4 times a frame, 48 ms of
+/// waiting in the cell (profile 43d375b). `alt`: twenty seconds with,
+/// twenty without, in turn. Watch the tables line ("N refused": dynamic
+/// slots are held while lists fly) and the card's time.
+fn settle_room() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "flights get more room (lists in the air x2, changed runs merged x8) before they are settled from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, the caps as set" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3868,12 +3901,13 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// 48 ms of waiting in the cell, profile of 43d375b).
 fn merge_runs() -> usize {
     static RUNS: OnceLock<usize> = OnceLock::new();
-    *RUNS.get_or_init(|| {
+    let runs = *RUNS.get_or_init(|| {
         std::env::var("VICTORY_MERGE_RUNS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(512)
-    })
+    });
+    if settle_room() { runs.saturating_mul(8).min(1 << 16) } else { runs }
 }
 
 /// Whether the list that brings copies in the card's memory up to date
