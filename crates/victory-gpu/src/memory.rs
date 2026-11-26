@@ -349,6 +349,7 @@ impl Memory {
         } else {
             Vec::new()
         };
+        crate::switchmap::acts(crate::switchmap::S::ReleaseFrames, old.len() as u64, 0);
         // Over `VICTORY_MEMORY_BUDGET_MB`: the windows reached longest ago go
         // too, oldest first, until the rest fit (never one reached in the
         // last two frames). A busy street held 12.1 GB of windows and the
@@ -370,6 +371,10 @@ impl Memory {
                     }
                     live -= size(n);
                     old.push(n);
+                    crate::switchmap::act(crate::switchmap::S::MemoryBudget, size(n));
+                }
+                if live > budget {
+                    crate::switchmap::refuse(crate::switchmap::S::MemoryBudget, "still over: the rest were reached in the last two frames");
                 }
                 static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if SAID.fetch_add(1, Ordering::Relaxed) < 30 {
@@ -880,6 +885,9 @@ pub(crate) fn ready(
             && shadow.is_window()
             && m.frame.saturating_sub(m.touched[n]) > idle;
         let done = refresh_once() && !fresh && m.refreshed[n] == now;
+        if read && asleep {
+            crate::switchmap::act(crate::switchmap::S::RefreshIdle, 0);
+        }
         if read && !asleep && done {
             ONCE_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
             crate::switchmap::amount(crate::switchmap::S::RefreshOnce, 1);

@@ -67,6 +67,9 @@ switches! {
     DstorageStaging = "VICTORY_DSTORAGE_STAGING_MB", "staging sizes raised", "bytes";
     RemapKeep = "VICTORY_REMAP_KEEP", "remainders kept", "bytes";
     CardRehashRuns = "VICTORY_CARD_REHASH_RUNS", "rehash runs", "";
+    ReleaseFrames = "VICTORY_MEMORY_RELEASE_FRAMES", "idle windows let go", "";
+    RefreshIdle = "VICTORY_MEMORY_REFRESH_IDLE", "refreshes of idle windows left out", "";
+    MemoryBudget = "VICTORY_MEMORY_BUDGET_MB", "windows let go over the budget", "bytes";
     PrepWide = "VICTORY_PREP_WIDE", "stretches cut into pieces", "pieces";
 }
 
