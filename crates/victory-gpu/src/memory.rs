@@ -581,6 +581,7 @@ impl Memory {
                         self.recalculate.insert(owner);
                     }
                 }
+                crate::switchmap::acts(crate::switchmap::S::WrittenFrames, self.written.len() as u64, gone.len() as u64);
                 if !gone.is_empty() {
                     WRITTEN_DROPPED.fetch_add(gone.len() as u64, Ordering::Relaxed);
                     static SAID: AtomicU64 = AtomicU64::new(0);
@@ -881,6 +882,7 @@ pub(crate) fn ready(
         let done = refresh_once() && !fresh && m.refreshed[n] == now;
         if read && !asleep && done {
             ONCE_SKIPPED[0].fetch_add(1, Ordering::Relaxed);
+            crate::switchmap::amount(crate::switchmap::S::RefreshOnce, 1);
         }
         if read && !asleep && !done {
             for &(start, len) in &m.ranges[n] {
@@ -890,6 +892,9 @@ pub(crate) fn ready(
             }
             refreshed_now.push(n);
             ONCE_SKIPPED[1].fetch_add(1, Ordering::Relaxed);
+            if refresh_once() {
+                crate::switchmap::act(crate::switchmap::S::RefreshOnce, 0);
+            }
         }
         if write {
             // Only pages shaders marked as stored to; a page's first

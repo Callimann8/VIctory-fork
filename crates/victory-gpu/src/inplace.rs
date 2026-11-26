@@ -157,12 +157,18 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 Cover::Holes => VIEW_COVER[1].fetch_add(1, Ordering::Relaxed),
                 _ => VIEW_COVER[2].fetch_add(1, Ordering::Relaxed),
             };
+            crate::switchmap::refuse(crate::switchmap::S::Inplace, match other {
+                Cover::Scattered => "view memory over several pool runs",
+                Cover::Holes => "view memory with holes",
+                _ => "view memory, sections not placeable (POOL_COMMIT off?)",
+            });
             STATS[4].fetch_add(1, Ordering::Relaxed);
             return None;
         }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
+        crate::switchmap::refuse(crate::switchmap::S::Inplace, "over VICTORY_INPLACE_MB");
         return None;
     }
     let host = crate::host::host()?;
@@ -171,13 +177,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            crate::switchmap::act(crate::switchmap::S::Inplace, len);
             Some(placed)
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            crate::switchmap::refuse(crate::switchmap::S::Inplace, "not private memory committed whole");
             None
         }
         Err(Some(e)) => {
+            crate::switchmap::refuse(crate::switchmap::S::Inplace, "host refused to open the pages");
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
             }
@@ -253,6 +262,7 @@ fn section_heap(section: usize) -> Option<(ID3D12Heap, u64)> {
 fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option<Placed> {
     let (heap, size) = section_heap(section).or_else(|| {
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        crate::switchmap::refuse(crate::switchmap::S::PoolCommit, "section not committed or not opened");
         None
     })?;
     let at = offset & !(K64 as u64 - 1);
@@ -260,6 +270,7 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
     let bytes = (bias + len.max(1)).next_multiple_of(K64 as u64);
     if at + bytes > size {
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        crate::switchmap::refuse(crate::switchmap::S::PoolCommit, "window past the section's end");
         return None;
     }
     let host = crate::host::host()?;
@@ -268,6 +279,7 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
             SECTION_STATS[3].fetch_add(len, Ordering::Relaxed);
+            crate::switchmap::act(crate::switchmap::S::PoolCommit, len);
             let n = SECTION_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
             SECTION_STATS[1].fetch_add(len, Ordering::Relaxed);
             if n == 1 || n.is_power_of_two() {

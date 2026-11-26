@@ -136,6 +136,7 @@ pub(crate) fn split(len: usize, run: &(dyn Fn(usize, usize) -> bool + Sync)) -> 
     }
     COUNT[0].fetch_add(1, Ordering::Relaxed);
     COUNT[1].fetch_add(len as u64, Ordering::Relaxed);
+    crate::switchmap::act(crate::switchmap::S::CopyThreads, len as u64);
     // SAFETY: only the lifetime is changed; `Wait` below keeps `run` alive
     // until every piece is done.
     let run_static: *const (dyn Fn(usize, usize) -> bool + Sync) = unsafe { std::mem::transmute(run as *const (dyn Fn(usize, usize) -> bool + Sync + '_)) };

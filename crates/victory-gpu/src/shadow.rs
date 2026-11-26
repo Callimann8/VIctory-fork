@@ -394,6 +394,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         // 32nd.
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+        crate::switchmap::refuse(crate::switchmap::S::CardBuffersMb, "card memory budget");
         if n <= 64 || n.is_multiple_of(32) {
             tracing::info!(
                 "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
@@ -4034,7 +4035,9 @@ impl Shadow {
         if *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_none_or(|v| v != "1")) {
             return Some(size);
         }
-        Some(self.len.next_multiple_of(16).min(size))
+        let hashed = self.len.next_multiple_of(16).min(size);
+        crate::switchmap::act(crate::switchmap::S::CardHashLen, size - hashed);
+        Some(hashed)
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4413,6 +4416,7 @@ fn run_window(page: u64) -> Option<(Arc<Shadow>, bool)> {
     let Some(placed) = crate::inplace::run_around(page, cell, cell + WINDOW)
         .and_then(|(start, len, tail)| Some((start, len, tail, crate::inplace::place_for(start, len, true)?)))
     else {
+        crate::switchmap::refuse(crate::switchmap::S::InplaceRuns, "page's run cannot be placed");
         if no.len() >= 65_536 {
             no.clear();
         }
@@ -4433,6 +4437,7 @@ fn run_window(page: u64) -> Option<(Arc<Shadow>, bool)> {
     // run could be placed): it looks at them again, so that it and root
     // views reach the same bytes.
     crate::memory::ownership_changed(start, len);
+    crate::switchmap::act(crate::switchmap::S::InplaceRuns, len);
     let n = RUN_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 || n.is_power_of_two() {
         tracing::info!(windows = n, start = format_args!("{start:#x}"), len, "title memory in place: windows cut to a run of memory, made since the start (VICTORY_INPLACE_RUNS=1)");
@@ -4626,6 +4631,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     // this moment can still be alive for the weak handle.)
     if let Some(shadow) = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes) {
         LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        crate::switchmap::act(crate::switchmap::S::LookupCache, 0);
         if shadow.window {
             // As `loose` notes an ask of a window it hands out.
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
@@ -4638,6 +4644,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return Some(shadow);
     }
     LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    crate::switchmap::amount(crate::switchmap::S::LookupCache, 1);
     let shadow = lookup_tables(address, len, any)?;
     FOUND.with(|f| {
         let f = &mut *f.borrow_mut();
@@ -4706,6 +4713,13 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             None => (buffer, None),
         };
         placed_count(size, card.is_some());
+        if card.is_some() {
+            crate::switchmap::act(crate::switchmap::S::CardBuffersMb, size);
+            if size < 1 << 20 {
+                // Below the default least size: there by `VICTORY_CARD_BUFFERS_MIN_KB`.
+                crate::switchmap::act(crate::switchmap::S::CardBuffersMinKb, size);
+            }
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {

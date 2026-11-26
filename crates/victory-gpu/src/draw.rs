@@ -2496,6 +2496,7 @@ impl State {
         // A copy of a range onto itself (`self_copy_shrink`): one group.
         let [x, y, z] = if shrink && x != 0 && y != 0 && z != 0 {
             let n = SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::switchmap::act(crate::switchmap::S::SelfCopyShrink, 0);
             if n == 1 || n.is_multiple_of(8192) {
                 let groups = u64::from(x) * u64::from(y) * u64::from(z);
                 tracing::info!(shrunk = n, groups, "a copy of title memory onto itself runs as one group (VICTORY_SELF_COPY_SHRINK)");
@@ -2548,7 +2549,8 @@ impl State {
         // From here on the program is a listed one: a refusal is said, with
         // why, so a run tells which check holds it back (run S12 never
         // shrank one and said nothing).
-        let refuse = |why: &str, detail: String| {
+        let refuse = |why: &'static str, detail: String| {
+            crate::switchmap::refuse(crate::switchmap::S::SelfCopyShrink, why);
             static SAID: AtomicU64 = AtomicU64::new(0);
             let n = SELF_COPY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
             if SAID.fetch_add(1, Ordering::Relaxed) < 24 || n.is_power_of_two() {
@@ -3092,12 +3094,20 @@ impl State {
             };
             // With the quick hash the records are compared too: a collision
             // costs a fresh table, not wrong descriptors.
-            let same = self.fresh_tables.get(&key).copied().filter(|&(_, at)| {
+            let found = self.fresh_tables.get(&key).copied();
+            let same = found.filter(|&(_, at)| {
                 !quick
                     || self.fresh_records.get(at..at + n as usize).is_some_and(|records| {
                         records.iter().enumerate().all(|(k, r)| *r == table_record(table, k as u32))
                     })
             });
+            if quick && found.is_some() {
+                if same.is_some() {
+                    crate::switchmap::act(crate::switchmap::S::TableQuickHash, 0);
+                } else {
+                    crate::switchmap::amount(crate::switchmap::S::TableQuickHash, 1);
+                }
+            }
             if let Some((first, _)) = same {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;

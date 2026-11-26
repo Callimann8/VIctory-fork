@@ -29,10 +29,10 @@ macro_rules! switches {
 }
 
 switches! {
-    SelfCopyShrink = "VICTORY_SELF_COPY_SHRINK", "groups shrunk", "bytes left out";
+    SelfCopyShrink = "VICTORY_SELF_COPY_SHRINK", "dispatches shrunk to one group", "";
     RefreshOnce = "VICTORY_MEMORY_REFRESH_ONCE", "refreshes", "copies skipped";
     Inplace = "VICTORY_INPLACE", "windows placed", "bytes";
-    PoolCommit = "VICTORY_POOL_COMMIT", "sections committed whole", "bytes";
+    PoolCommit = "VICTORY_POOL_COMMIT", "windows placed on sections", "bytes";
     InplaceRuns = "VICTORY_INPLACE_RUNS", "windows cut to a run", "bytes";
     GuardPrivate = "VICTORY_GUARD_PRIVATE", "blocks taken", "faults";
     WrittenFrames = "VICTORY_MEMORY_WRITTEN_FRAMES", "pages kept marked", "pages dropped";
@@ -48,13 +48,13 @@ switches! {
     FillsPlain = "VICTORY_FILLS_PLAIN", "fills copied plainly", "bytes";
     FillWaitPieces = "VICTORY_FILL_WAIT_PIECES", "pieces whose fills wait", "";
     MergeRuns = "VICTORY_MERGE_RUNS", "merges under writes", "runs merged";
-    SettleRoom = "VICTORY_SETTLE_ROOM", "settles avoided", "";
+    SettleRoom = "VICTORY_SETTLE_ROOM", "submissions past the old caps", "";
     Queue2 = "VICTORY_QUEUE2", "lists on the second queue", "";
     CardBuffersMinKb = "VICTORY_CARD_BUFFERS_MIN_KB", "buffers put on the card", "bytes";
     CardBuffersMb = "VICTORY_CARD_BUFFERS_MB", "buffers kept on the card", "bytes";
     CardSyncBatch = "VICTORY_CARD_SYNC_BATCH", "batched syncs", "copies";
     CardHashWide = "VICTORY_CARD_HASH_WIDE", "wide hashes", "bytes";
-    CardHashLen = "VICTORY_CARD_HASH_LEN", "hashes cut to length", "bytes";
+    CardHashLen = "VICTORY_CARD_HASH_LEN", "hashes cut to length", "bytes not hashed";
     CodeTableAfter = "VICTORY_CODE_TABLE_AFTER", "shaders translated with it", "";
     TracerGuards = "VICTORY_TRACER_GUARDS", "shaders translated with it", "";
     LdsPrune = "VICTORY_LDS_PRUNE", "shaders translated with it", "barriers removed";
@@ -137,8 +137,12 @@ pub(crate) fn line(frames: f64) {
     let (before, reasons_before) = last.take().unwrap_or_else(|| (vec![[0; 3]; N], BTreeMap::new()));
     let mut parts = Vec::new();
     for (i, &(env, acts, unit)) in NAMES.iter().enumerate() {
-        let Ok(value) = std::env::var(env) else { continue };
-        let value = value.trim().to_owned();
+        // Set, or on by default and counting.
+        let value = match std::env::var(env) {
+            Ok(v) => v.trim().to_owned(),
+            Err(_) if now[i] != [0; 3] => "(default)".to_owned(),
+            Err(_) => continue,
+        };
         let d = [now[i][0] - before[i][0], now[i][1] - before[i][1], now[i][2] - before[i][2]];
         let mut part = format!("{env}={value}: ");
         if now[i] == [0; 3] {

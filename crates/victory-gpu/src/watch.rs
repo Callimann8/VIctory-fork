@@ -822,6 +822,7 @@ pub(crate) fn guard_private(start: usize, len: usize) {
     if taken == 0 {
         return;
     }
+    crate::switchmap::acts(crate::switchmap::S::GuardPrivate, taken, 0);
     let before = PRIVATE_COUNT[0].fetch_add(taken, std::sync::atomic::Ordering::Relaxed);
     let n = before + taken;
     if before == 0 || (n >> 10).is_power_of_two() && (before >> 10) != (n >> 10) {
@@ -851,6 +852,7 @@ fn private_fault(g: &mut Guards, block: usize) {
         return;
     }
     PRIVATE_COUNT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::switchmap::amount(crate::switchmap::S::GuardPrivate, 1);
     let cell = block / CELL_BLOCKS;
     let frame = crate::frame::current();
     let hot = g.hot.entry(cell).or_insert((frame, 0));
@@ -878,6 +880,7 @@ fn private_demote(g: &mut Guards, cell: usize) {
     // cells nothing was taken in yet)
     if !taken.is_empty() {
         PRIVATE_COUNT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::switchmap::refuse(crate::switchmap::S::GuardPrivate, "4 MiB cell given back to the write watch");
     }
     for b in taken {
         g.private.remove(&b);

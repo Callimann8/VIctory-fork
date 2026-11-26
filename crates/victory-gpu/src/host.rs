@@ -2910,6 +2910,7 @@ fn fetch_copies(pieces: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize, 
         copies.push((&shadow.buffer, lo, n, *at));
     }
     if join {
+        crate::switchmap::acts(crate::switchmap::S::FetchJoin, copies.len() as u64, (pieces.len() - copies.len()) as u64);
         let n = FETCH_JOINED[0].fetch_add(copies.len() as u64, Ordering::Relaxed) + copies.len() as u64;
         let p = FETCH_JOINED[1].fetch_add(pieces.len() as u64, Ordering::Relaxed) + pieces.len() as u64;
         if (n - copies.len() as u64) >> 14 != n >> 14 {
@@ -3887,8 +3888,20 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = merge_runs();
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let cap = merge_runs();
+        let mut runs_left = cap;
+        let stale = spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        let used = cap.saturating_sub(runs_left);
+        if used != 0 {
+            crate::switchmap::act(crate::switchmap::S::MergeRuns, used as u64);
+        }
+        if stale {
+            crate::switchmap::refuse(crate::switchmap::S::MergeRuns, "run cap reached or no merge: settled");
+        } else if settle_room() && used > cap / 8 {
+            // Past the cap without the room: a settle the room saved.
+            crate::switchmap::act(crate::switchmap::S::SettleRoom, 0);
+        }
+        return stale;
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -5983,6 +5996,7 @@ impl Host {
                         self.card_done(card);
                     }
                     if landed_tables() {
+                        crate::switchmap::act(crate::switchmap::S::LandedTables, flight.lists.len() as u64);
                         for list in &mut flight.lists {
                             list.release_tables();
                         }
@@ -6249,7 +6263,12 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-            *flying >= late_most()
+            let most = late_most();
+            if settle_room() && *flying >= most / 2 && *flying < most {
+                // Past the lists-in-the-air cap without the room.
+                crate::switchmap::act(crate::switchmap::S::SettleRoom, 0);
+            }
+            *flying >= most
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
@@ -6437,6 +6456,7 @@ impl Host {
                             self.card_done(card);
                         }
                         if landed_tables() {
+                            crate::switchmap::act(crate::switchmap::S::LandedTables, flight.lists.len() as u64);
                             for list in &mut flight.lists {
                                 list.release_tables();
                             }
@@ -7877,6 +7897,7 @@ impl HostList {
             }
             first
         };
+        crate::switchmap::act(crate::switchmap::S::PipelineOnce, u64::from(!first));
         if first {
             self.used_pipeline(&p.name);
         } else if crate::cardmeter::pipelines() {
@@ -7967,8 +7988,12 @@ impl HostList {
         // Belobug PR #29: once until the title's memory next changes by a
         // copy or a run of ours; thousands of draws of a list declare the
         // same ranges, each a flush and a snapshot at submission.
-        if gpu_write_once() && !deferred.gpu_written.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
-            return;
+        if gpu_write_once() {
+            let repeat = !deferred.gpu_written.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len));
+            crate::switchmap::act(crate::switchmap::S::GpuWriteOnce, u64::from(repeat));
+            if repeat {
+                return;
+            }
         }
         deferred
             .copies
@@ -8019,7 +8044,11 @@ impl HostList {
         let once = fill_once();
         let key = (src as usize, len as usize, kind);
         if once && let Some(&gpu) = self.deferred().filled.get(&key) {
+            crate::switchmap::act(crate::switchmap::S::FillOnce, 1);
             return Some(gpu);
+        }
+        if once {
+            crate::switchmap::act(crate::switchmap::S::FillOnce, 0);
         }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill_from(to, src, len as usize, kind);
@@ -8049,7 +8078,11 @@ impl HostList {
             let at = s.used.next_multiple_of(512);
             s.used = at + len;
             let chunk = &s.chunks[s.current].0;
+            crate::switchmap::act(crate::switchmap::S::UploadPooled, len);
             return Some((chunk._buffer.clone(), at, (chunk.data + at as usize) as *mut u8));
+        }
+        if upload_pooled() {
+            crate::switchmap::refuse(crate::switchmap::S::UploadPooled, "larger than a scratch chunk");
         }
         let (buffer, data) = self.upload(host, size)?;
         Some((buffer, 0, data))
