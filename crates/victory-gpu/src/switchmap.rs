@@ -74,6 +74,7 @@ switches! {
     SweepAtRoom = "VICTORY_SWEEP_AT_ROOM", "idle texture copies let go for room", "bytes";
     ParallelRefresh = "VICTORY_PARALLEL_REFRESH", "texture checks side by side", "microseconds saved";
     WideThreads = "VICTORY_WIDE_THREADS", "helper pools made", "helper threads";
+    ThreadLimit = "VICTORY_THREAD_LIMIT", "shaders translated with it", "";
     RoomKeptSecs = "VICTORY_ROOM_KEPT_SECS", "room questions answered without kept room", "";
 }
 

@@ -455,6 +455,27 @@ impl Structured {
     }
 }
 
+thread_local! {
+    static ENTRY_LIMITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the program structured on this thread starts with a wave whose
+/// last lanes may be outside EXEC (see [`set_entry_limited`]).
+pub fn entry_limited() -> bool {
+    ENTRY_LIMITED.get()
+}
+
+/// For the programs structured on this thread from here on: whether EXEC on
+/// entry is each lane's own bit, not every lane. The console can dispatch a
+/// compute program by thread counts (`DispatchX` with the card's "use thread
+/// dimensions" bit): the last group's wave then starts with only the lanes
+/// below the count in EXEC (`emit::USER_DISPATCH_THREADS_X`). Port of
+/// fxceless PR #1292 (4e825fb, KyleS98; GPL-3.0-or-later),
+/// `VICTORY_THREAD_LIMIT=1`.
+pub fn set_entry_limited(on: bool) {
+    ENTRY_LIMITED.set(on);
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -647,7 +668,10 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            // Every lane, or, for a program that may be dispatched by thread
+            // counts (`entry_limited`), the lane's own bit.
+            let entry = if entry_limited() { self.b.atom(Atom::Lane(lo), 0) } else { Bool::TRUE };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =

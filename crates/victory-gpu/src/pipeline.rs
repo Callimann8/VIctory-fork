@@ -205,8 +205,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // takes up while one is set (the translation, fresh or from the cache,
     // was made with it: the switches are in the cache key).
     {
-        static ON: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
-        let on = ON.get_or_init(|| ["VICTORY_TRACER_GUARDS", "VICTORY_CODE_TABLE_AFTER"].map(|k| std::env::var_os(k).is_some_and(|v| v == "1")));
+        static ON: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+        let on = ON.get_or_init(|| {
+            ["VICTORY_TRACER_GUARDS", "VICTORY_CODE_TABLE_AFTER", "VICTORY_THREAD_LIMIT"].map(|k| std::env::var_os(k).is_some_and(|v| v == "1"))
+        });
+        if on[2] {
+            crate::switchmap::act(crate::switchmap::S::ThreadLimit, 0);
+        }
         if on[0] {
             crate::switchmap::act(crate::switchmap::S::TracerGuards, 0);
         }
