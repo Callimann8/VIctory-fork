@@ -3244,6 +3244,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             continue;
                         }
                         if count {
+                            let w = if touches(written, dst, dst + len) { (dst, len) } else { (src, len) };
+                            crate::waits::trigger("buffer copy", w.0, w.1, crate::waits::touching(written, w.0, w.1));
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked_copy(written, dst, src, len);
@@ -3263,6 +3265,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             continue;
                         }
                         if count {
+                            crate::waits::trigger("fill of upload memory", src, len, crate::waits::touching(written, src, len));
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked(written, src, len);
@@ -3275,12 +3278,18 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
+                            crate::waits::trigger("texture read", at, len, crate::waits::touching(written, at, len));
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => {
+                    if count {
+                        crate::waits::trigger_plain("a step of ours (run)");
+                    }
+                    return Some(WHY_RUN);
+                }
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
@@ -3906,9 +3915,16 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             // Past the cap without the room: a settle the room saved.
             crate::switchmap::act(crate::switchmap::S::SettleRoom, 0);
         }
+        if stale && let Some((_, from, to)) = spans.first() {
+            crate::waits::trigger("title wrote memory shaders write (merge cap)", *from, to - from, (0, 0));
+        }
         return stale;
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    let stale = spans.iter().find(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
+    if let Some((_, from, to)) = stale {
+        crate::waits::trigger("title wrote memory shaders write", *from, to - from, (0, 0));
+    }
+    stale.is_some()
 }
 
 /// With [`late_exact`]: the most changed runs one submission sends up to
@@ -4027,6 +4043,7 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if !unsure {
             return false;
         }
+        crate::waits::trigger("wait for a memory value", address, bytes, crate::waits::touching(&line.written, address, bytes));
     }
     settle_now(WHY_VALUE);
     wait.met()
@@ -4176,6 +4193,7 @@ fn late_threads() {
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let mut line = line();
     if done(&line) {
+        crate::waits::clear();
         return;
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -4192,6 +4210,23 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     submission_us(1, us);
+    crate::waits::waited(why_name(why), us);
+}
+
+/// A `WHY_` place's name, for the card waits line (`crate::waits`).
+fn why_name(why: usize) -> &'static str {
+    match why {
+        WHY_SYNC => "a synchronous submission or present",
+        WHY_CARD_DONE => "the card had run them",
+        WHY_VALUE => "a wait for a memory value",
+        WHY_STALE => "title memory changed under shader writes",
+        WHY_READ => "title memory read",
+        WHY_RUN => "a step of ours",
+        WHY_MOST => "lists in the air at the cap",
+        WHY_WRITES => "bottom-of-pipe writes",
+        WHY_FENCE => "a blocking fence wait",
+        _ => "other",
+    }
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -6259,6 +6294,7 @@ impl Host {
             );
             *flying += order.len();
             *target = *submitted;
+            crate::waits::flight_sent(items.is_empty());
             items.push(Late::Run(Flight {
                 number: sent.number,
                 fence: *target,
@@ -6315,6 +6351,7 @@ impl Host {
             );
             *flying += 1;
             *target = *submitted;
+            crate::waits::flight_sent(items.is_empty());
             items.push(Late::Run(Flight {
                 number,
                 fence: *target,
@@ -6366,6 +6403,7 @@ impl Host {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
+                    crate::waits::clear();
                     break;
                 }
                 line.settling = true;
@@ -6400,6 +6438,7 @@ impl Host {
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
+                crate::waits::waited(why_name(why), gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
@@ -9490,6 +9529,7 @@ impl Meter {
     crate::watch::private_line();
         crate::switchmap::line(frames);
         crate::switchmap::texture_line(frames);
+        crate::waits::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();

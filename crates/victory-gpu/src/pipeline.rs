@@ -495,6 +495,16 @@ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
 
+/// The shaders of the title's pipeline `this`, as logged (stage #hash, by
+/// stage), for the card waits line (`crate::waits`). The pipeline is alive.
+#[cfg(windows)]
+pub(crate) fn label(this: This) -> String {
+    if this.is_null() {
+        return String::new();
+    }
+    pipeline(this).shaders.iter().map(|s| format!("{} #{}", s.stage, s.hash)).collect::<Vec<_>>().join(" ")
+}
+
 fn pipeline<'a>(this: This) -> &'a Pipeline {
     // SAFETY: the title passes one of our pipelines.
     unsafe { &*this.cast::<Pipeline>() }

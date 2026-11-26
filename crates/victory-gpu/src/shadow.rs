@@ -3029,6 +3029,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        crate::waits::declared(address as usize, len as usize);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 

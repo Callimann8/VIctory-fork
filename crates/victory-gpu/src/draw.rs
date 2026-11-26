@@ -794,6 +794,7 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+        crate::waits::bound(pipeline as usize);
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -818,6 +819,7 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+        crate::waits::bound(pipeline as usize);
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {

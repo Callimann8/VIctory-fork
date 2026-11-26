@@ -61,6 +61,8 @@ mod prep_wide;
 mod split;
 pub mod switchmap;
 #[cfg(windows)]
+mod waits;
+#[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
