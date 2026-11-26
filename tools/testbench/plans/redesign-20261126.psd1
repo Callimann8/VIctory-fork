@@ -22,14 +22,15 @@
     CloseCallPct = 5
     RerunSeconds = 240
     SetsFile = 'C:\xcl\run-switches.ps1'
-    Sets = @{}
+    # R2S (final review 2026-11-26): R2b's fallback as one set, so 'best' keeps INPLACE_MB=0 if R2b is kept.
+    Sets = @{ R2S = @{ VICTORY_INPLACE = '1'; VICTORY_INPLACE_MB = '0' } }
 
     Runs = @(
         @{ Name = 'MAIN'; Seconds = 120;  Build = 'main' }                       # picture reference (main build, launcher as is)
         @{ Name = 'R0'; Seconds = 240;    Build = 'test'; Use = 'R0' }           # this build with main behaviour
         @{ Name = 'R1'; Seconds = 240;    Build = 'test'; Use = 'R1'; Try = $true }
         @{ Name = 'R2'; Seconds = 240;    Build = 'test'; Use = 'best', 'R2'; Try = $true }
-        @{ Name = 'R2b'; Seconds = 240;   Build = 'test'; Use = 'best', 'R3'; Env = @{ VICTORY_INPLACE_MB = '0' }; Try = $true; OnlyIfCrashed = 'R2' }   # fallback: sections only
+        @{ Name = 'R2b'; Seconds = 240;   Build = 'test'; Use = 'best', 'R2S', 'R3'; Try = $true; OnlyIfCrashed = 'R2' }   # fallback: sections only (INPLACE=1 needed, MB=0 turns down all but sections)
         @{ Name = 'R3'; Seconds = 240;    Build = 'test'; Use = 'best', 'R2', 'R3'; Try = $true }           # POOL_COMMIT only means something with INPLACE
         @{ Name = 'R3b'; Seconds = 240;   Build = 'test'; Use = 'best', 'R2', 'R3', 'R3b'; Try = $true }    # INPLACE_RUNS on top of in-place + pool
         @{ Name = 'R3c'; Seconds = 240;   Build = 'test'; Use = 'best', 'R3c'; Try = $true }
@@ -56,6 +57,7 @@
         @{ Name = 'ROOM'; Seconds = 120;  Build = 'test'; Use = 'best', 'ROOM' }   # more card room for textures: fewer missing textures? watch 'texture problems' and the card budget line
         @{ Name = 'SWEEP'; Seconds = 120; Build = 'test'; Use = 'best', 'SWEEP' }  # missing textures: free idle copies when the texture queue has no room
         @{ Name = 'KEPT'; Seconds = 120; Build = 'test'; Use = 'best', 'KEPT' }   # missing textures: kept room given to textures after 30 s unchanged
+        @{ Name = 'TB'; Seconds = 120; Build = 'test'; Use = 'best', 'TB' }   # boat fix cost in the cell (fxceless PR #999 TEXTURE_BACK); compared only
         @{ Name = 'TEX'; Seconds = 120;   Build = 'test'; Use = 'best'; Env = @{ VICTORY_CARD_ACCOUNTING = '1'; VICTORY_WAIT_MAP = '1'; VICTORY_WAIT_LOG = '1' } }   # + every CPU wait on the card with its last writer (CPU/GPU side by side data)   # missing textures: what waits for room / is not mapped yet (5-s line); not timed against others
     )
 }
