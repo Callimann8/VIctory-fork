@@ -506,6 +506,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     1
 }
 
+/// `VICTORY_MAP_RUNS=1`: the GPU's page-mapping copies ([`map_alias`]) map
+/// a view per run of pages that follow one another in a section, not one
+/// per page.
+fn map_runs() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// `VICTORY_POOL_COMMIT=1`: sections of physical pages are made committed
 /// whole on Windows too (see `XMemAllocatePhysicalPages`).
 fn pool_commit() -> bool {
@@ -790,19 +798,20 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. A view per run of pages that follow one another in a section;
+/// false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
+    if from == 0 {
+        return true;
+    }
+    // The source page at `at`, as a slice of its section.
+    let slice_at = |physical: &Physical, at: usize| {
+        physical
             .views
             .range(..=at)
             .next_back()
@@ -811,12 +820,30 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
                 index: s.index + (at - base) / PAGE,
                 section: s.section.clone(),
             })
-        else {
+    };
+    // One view per run of pages that follow one another in one section, as
+    // `XMemMapPhysicalPages` maps them: a texture's pages come in runs, and
+    // each view is a split of the placeholder, a mapping and the GPU side's
+    // bookkeeping (page by page before; `VICTORY_MAP_RUNS=1`, off by
+    // default).
+    let runs = map_runs();
+    let mut k = 0;
+    while k < len {
+        let Some(slice) = slice_at(&physical, from + k) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        let mut run = 1;
+        while runs
+            && k + run * PAGE < len
+            && slice_at(&physical, from + k + run * PAGE)
+                .is_some_and(|s| Arc::ptr_eq(&s.section, &slice.section) && s.index == slice.index + run)
+        {
+            run += 1;
+        }
+        if !map(&mut physical, to + k, run * PAGE, slice) {
             return false;
         }
+        k += run * PAGE;
     }
     true
 }
