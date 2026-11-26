@@ -628,7 +628,194 @@ fn known_view(start: usize) -> bool {
         return true;
     }
     let g = guards();
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    g.protected.contains(&first)
+        || g.absent.contains(&first)
+        || (view_known() && g.viewed.contains(&first))
+        || (!g.private.is_empty() && g.private.contains(&first))
+}
+
+/// Blocks per cell of [`guard_private`] (4 MiB, the windows' size).
+const CELL_BLOCKS: usize = 64;
+
+/// Whether big ranges of write-watched memory the host refreshes from
+/// title memory are held by the guards instead of the kernel's write
+/// watch (`VICTORY_GUARD_PRIVATE=1`; off by default).
+///
+/// The kernel's asking walks the page tables of the whole range at every
+/// asking, written or not: with ray tracing on, some 13 to 24 GB of title
+/// memory a frame ("checks", 69 ms on main 90fea82), nearly all of it
+/// unwritten. Guarded, a range is made read-only once; a write faults once
+/// per 64 KiB block and opens it (as view memory always was), and an
+/// asking is a look at the blocks' notes (with the light refresh, their
+/// bits). A cell whose blocks fault more than `VICTORY_GUARD_PRIVATE_HOT`
+/// times in a frame (16 by default) goes back to the write watch for good
+/// ([`private_fault`]); the watch's bits were never reset meanwhile, so
+/// its first asking reports every page written since (more copied once,
+/// nothing missed).
+pub(crate) fn private_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_GUARD_PRIVATE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(hot = private_hot(), "big write-watched ranges the host refreshes are held by guards instead (VICTORY_GUARD_PRIVATE=1)");
+        }
+        on
+    })
+}
+
+/// `VICTORY_GUARD_PRIVATE_HOT`: faults a cell may take in a frame.
+fn private_hot() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_PRIVATE_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
+}
+
+/// Cells taken by [`guard_private`] or sent back to the write watch: no
+/// lock of the guards is taken again for them.
+static PRIVATE_CELLS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+/// Since the start: cells taken by [`guard_private`], cells sent back to the
+/// write watch, faults in blocks of taken cells.
+static PRIVATE_COUNT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With [`private_on`]: the whole 4 MiB cells inside `[start, start + len)`
+/// of title memory (a range the host refreshes for shaders that reach title
+/// memory by address, `crate::memory`) are held by the guards from their
+/// next asking on, unless one was sent back to the write watch.
+pub(crate) fn guard_private(start: usize, len: usize) {
+    if !private_on() || len == 0 {
+        return;
+    }
+    let cell = CELL_BLOCKS * BLOCK;
+    let (first, last) = (start.div_ceil(cell), start.saturating_add(len) / cell);
+    if first >= last {
+        return;
+    }
+    let new: Vec<usize> = {
+        let mut known = PRIVATE_CELLS.lock().unwrap_or_else(|e| e.into_inner());
+        (first..last).filter(|&c| known.insert(c)).collect()
+    };
+    if new.is_empty() {
+        return;
+    }
+    install();
+    {
+        // Guarded at once, then the write watch asked once more: a page
+        // written since its last asking is in the journal as written now
+        // (so the copies take it), and every later write faults. Without
+        // this the first asking of the guards would report every block
+        // written and the copies take their whole cells again. (The
+        // journal's lock before the guards', as `writes` takes them.)
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const WRITE_WATCH_FLAG_RESET: u32 = 0;
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        let mut g = guards();
+        j.asked += 1;
+        let now = j.asked;
+        // As in [`wrote`]: an asking that stands moves with it.
+        if j.kept || !j.ahead.is_empty() {
+            j.ahead_asked = now;
+        }
+        for &c in &new {
+            let blocks = c * CELL_BLOCKS..(c + 1) * CELL_BLOCKS;
+            g.private.extend(blocks.clone());
+            let open: Vec<(usize, usize)> = {
+                // The cell's blocks not already held (a range that spans
+                // into it may have guarded some).
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for b in blocks.clone() {
+                    if g.protected.contains(&b) {
+                        continue;
+                    }
+                    match runs.last_mut() {
+                        Some(r) if r.1 == b => r.1 = b + 1,
+                        _ => runs.push((b, b + 1)),
+                    }
+                }
+                runs
+            };
+            for &(from, to) in &open {
+                protect_here(&mut g, from, to);
+            }
+            // Not reset: a cell sent back to the watch later finds every
+            // page written since it was guarded (copied once, nothing
+            // missed). What was found now is noted as written now.
+            let mut count = CELL_BLOCKS * BLOCK / KERNEL_PAGE;
+            j.found.resize(count.max(j.found.len()), 0);
+            let mut granularity = 0;
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    (blocks.start * BLOCK) as *const _,
+                    CELL_BLOCKS * BLOCK,
+                    j.found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            } != 0;
+            if failed {
+                // Not write-watched (view memory, or memory the kernel does
+                // not watch): the blocks just guarded count as written once
+                // (those the guards already held keep their notes).
+                for &(from, to) in &open {
+                    for b in from..to {
+                        g.clean.remove(&b);
+                    }
+                }
+                continue;
+            }
+            for k in 0..count {
+                j.written.insert(j.found[k] / PAGE, now);
+            }
+        }
+    }
+    let n = PRIVATE_COUNT[0].fetch_add(new.len() as u64, std::sync::atomic::Ordering::Relaxed) + new.len() as u64;
+    if n.is_power_of_two() || n == new.len() as u64 {
+        tracing::info!(
+            cells = n,
+            back = PRIVATE_COUNT[1].load(std::sync::atomic::Ordering::Relaxed),
+            faults = PRIVATE_COUNT[2].load(std::sync::atomic::Ordering::Relaxed),
+            "4 MiB cells of title memory held by guards instead of the write watch, since the start; sent back to the watch; faults in them (VICTORY_GUARD_PRIVATE)"
+        );
+    }
+}
+
+/// With the frame line: what [`guard_private`] holds, since the start.
+pub(crate) fn private_line() {
+    if !private_on() {
+        return;
+    }
+    let [cells, back, faults] = [0, 1, 2].map(|i| PRIVATE_COUNT[i].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(cells, back, faults, "title memory held by guards instead of the write watch since the start (VICTORY_GUARD_PRIVATE): 4 MiB cells taken, sent back to the watch, faults in them");
+}
+
+/// In the write handler, the guards' lock held: a write opened `block`. If
+/// it is one [`guard_private`] took, it counts for its cell's frame; a cell
+/// past [`private_hot`] faults goes back to the write watch, opened whole.
+fn private_fault(g: &mut Guards, block: usize) {
+    if g.private.is_empty() || !g.private.contains(&block) {
+        return;
+    }
+    PRIVATE_COUNT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cell = block / CELL_BLOCKS;
+    let frame = crate::frame::current();
+    let hot = g.hot.entry(cell).or_insert((frame, 0));
+    if hot.0 != frame {
+        *hot = (frame, 0);
+    }
+    hot.1 += 1;
+    if hot.1 <= private_hot() {
+        return;
+    }
+    g.hot.remove(&cell);
+    let blocks = cell * CELL_BLOCKS..(cell + 1) * CELL_BLOCKS;
+    for b in blocks.clone() {
+        g.private.remove(&b);
+        g.viewed.remove(&b);
+    }
+    open_here(g, blocks.start * BLOCK, blocks.end * BLOCK);
+    PRIVATE_COUNT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 struct Guards {
@@ -657,6 +844,13 @@ struct Guards {
     /// others are answered from their notes, which then grow old
     /// ([`note_life`]).
     holes: BTreeSet<usize>,
+    /// With [`private_on`]: blocks of write-watched memory the guards hold
+    /// instead of the kernel's write watch ([`guard_private`]), whether their
+    /// guard stands now or a write has opened it.
+    private: BTreeSet<usize>,
+    /// With [`private_on`]: per 4 MiB cell of [`private`] blocks, the frame
+    /// and how many faults its blocks took in it ([`private_fault`]).
+    hot: BTreeMap<usize, (u64, u32)>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -708,6 +902,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     verified: BTreeMap::new(),
     holes: BTreeSet::new(),
+    private: BTreeSet::new(),
+    hot: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1266,7 +1462,10 @@ fn guard_at(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>>
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        g.protected.contains(&first)
+            || g.absent.contains(&first)
+            || (view_known() && g.viewed.contains(&first))
+            || (!g.private.is_empty() && g.private.contains(&first))
     };
     if !known && !is_view(start, end) {
         return None;
@@ -1768,6 +1967,21 @@ pub fn title_memory_committed(at: usize, len: usize) {
     if len != 0 && crate::inplace::runs_on() {
         crate::inplace::title_memory_freeing(at, len);
     }
+    // Blocks the guards hold instead of the write watch ([`guard_private`]):
+    // a commit gives committed pages the title's protection again, so what
+    // the guards noted of them is forgotten (written at the next asking).
+    if len != 0 && private_on() {
+        let mut g = guards();
+        let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+        if g.private.range(range.clone()).next().is_some() {
+            let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+            for block in blocks {
+                g.protected.remove(&block);
+                g.clean.remove(&block);
+                PUBLISHED.clear(block);
+            }
+        }
+    }
     if len == 0 || absent_mode() == 0 {
         return;
     }
@@ -1901,6 +2115,7 @@ fn install() {
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            private_fault(&mut g, at / BLOCK);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);

@@ -884,6 +884,8 @@ pub(crate) fn ready(
         }
         if read && !asleep && !done {
             for &(start, len) in &m.ranges[n] {
+                // (`VICTORY_GUARD_PRIVATE`: its whole cells held by guards)
+                crate::watch::guard_private(start as usize, len as usize);
                 shadow.refresh(list, start, len);
             }
             refreshed_now.push(n);

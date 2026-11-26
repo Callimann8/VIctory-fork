@@ -8538,6 +8538,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if whole {
         return;
     }
+    // Into title memory: a guard asking on another thread may have made it
+    // read-only again since it was opened (`VICTORY_GUARD_PRIVATE`).
+    if title_dst && crate::watch::private_on() {
+        crate::watch::writing(dst as usize, len);
+        if read(src, dst, len) {
+            return;
+        }
+    }
     // The copy failed: a source page is not there, or the destination is
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
@@ -8683,6 +8691,15 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     };
     if len == 0 || write(dst as usize, len) {
         return;
+    }
+    // A guard asking on another thread may have made the range read-only
+    // again since the caller opened it (`VICTORY_GUARD_PRIVATE` guards far
+    // more memory): opened again and written once more.
+    if crate::watch::private_on() {
+        crate::watch::writing(dst as usize, len);
+        if write(dst as usize, len) {
+            return;
+        }
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
@@ -8917,6 +8934,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::split::line(frames);
+    crate::watch::private_line();
         #[cfg(feature = "diagnostics")]
         crate::backreads::line(frames);
         crate::shadow::placed_line();
