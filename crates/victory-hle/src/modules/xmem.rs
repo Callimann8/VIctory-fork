@@ -153,6 +153,12 @@ fn virtual_alloc(
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
         }
+    } else if watch_fixed() && kind & MEM_RESERVE != 0 && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        // A reservation at the title's own address (`VICTORY_WATCH_FIXED=1`):
+        // watched too, so that the GPU side's copies of it take only what
+        // was written, not the whole range at every refresh ("copied whole
+        // (memory not watched)"). Without the watch if Windows refuses it.
+        kind |= MEM_WRITE_WATCH;
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
@@ -170,6 +176,19 @@ fn virtual_alloc(
             },
             constrained.into(),
         )
+    };
+    let at = if at.is_null() && !constrained && kind & MEM_WRITE_WATCH != 0 {
+        // SAFETY: as above, without the watch (`VICTORY_WATCH_FIXED=1`).
+        unsafe { VirtualAlloc2(GetCurrentProcess(), base, size, kind & !MEM_WRITE_WATCH, protect, std::ptr::null_mut(), 0) }
+    } else {
+        if !at.is_null() && !constrained && kind & MEM_WRITE_WATCH != 0 {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, size, "title reservations at its own address made write-watched (VICTORY_WATCH_FIXED=1), since the start");
+            }
+        }
+        at
     };
     if base.is_null() {
         tracing::debug!(
@@ -536,6 +555,13 @@ fn pages_follow(a: usize, b: usize, k: usize) -> bool {
 /// per page; so do runs of `XMemMapPhysicalPagesScatter`.
 fn map_runs() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_RUNS").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// `VICTORY_WATCH_FIXED=1`: the title's reservations at an address of its
+/// own are made write-watched too (only those at an address of ours were).
+fn watch_fixed() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_WATCH_FIXED").is_some_and(|v| v == "1"));
     *ON
 }
 
