@@ -192,8 +192,13 @@ fn views_in_place() -> bool {
 /// number is given to a new section ([`title_memory_section`]).
 static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, (ID3D12Heap, u64)>>> = Mutex::new(None);
 
-/// Windows placed on sections, and their bytes, since the start.
-static SECTION_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Windows placed on sections and their bytes since the start, refusals
+/// to open a section, and the bytes of such windows alive now. They lock
+/// nothing, so [`most`] does not count them.
+static SECTION_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Every heap opened on a section, by its interface pointer (for [`gone`]).
+static SECTION_PTRS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
 
 /// The heap of `section` (opened on first ask) and its bytes; `None` if
 /// the section is not committed or the host refused it.
@@ -212,6 +217,7 @@ fn section_heap(section: usize) -> Option<(ID3D12Heap, u64)> {
             let size = unsafe { heap.GetDesc() }.SizeInBytes.min(bytes);
             tracing::info!(section, mb = size >> 20, "title memory in place: a section of the page pool opened as a host heap (VICTORY_POOL_COMMIT)");
             heaps.insert(section, (heap.clone(), size));
+            SECTION_PTRS.lock().unwrap_or_else(|e| e.into_inner()).insert(heap.as_raw() as usize);
             Some((heap, size))
         }
         Err(e) => {
@@ -252,8 +258,7 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
         Ok(buffer) => {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
-            STATS[0].fetch_add(1, Ordering::Relaxed);
-            STATS[1].fetch_add(len, Ordering::Relaxed);
+            SECTION_STATS[3].fetch_add(len, Ordering::Relaxed);
             let n = SECTION_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
             SECTION_STATS[1].fetch_add(len, Ordering::Relaxed);
             if n == 1 || n.is_power_of_two() {
@@ -275,7 +280,12 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+pub(crate) fn gone(window: bool, bytes: u64, heap: &ID3D12Heap) {
+    // On a section of the page pool: counted apart ([`place_on_section`]).
+    if SECTION_PTRS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(heap.as_raw() as usize)) {
+        SECTION_STATS[3].fetch_sub(bytes, Ordering::Relaxed);
+        return;
+    }
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
@@ -304,6 +314,14 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    if SECTION_STATS[0].load(Ordering::Relaxed) != 0 {
+        tracing::info!(
+            "title memory in place on sections of the page pool (VICTORY_POOL_COMMIT=1): {} MB of windows now, {} windows placed since the start, {} sections refused",
+            SECTION_STATS[3].load(Ordering::Relaxed) >> 20,
+            SECTION_STATS[0].load(Ordering::Relaxed),
+            SECTION_STATS[2].load(Ordering::Relaxed)
+        );
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
