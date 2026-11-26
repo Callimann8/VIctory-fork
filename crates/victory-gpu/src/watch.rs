@@ -648,7 +648,10 @@ const CELL_BLOCKS: usize = 64;
 /// per 64 KiB block and opens it (as view memory always was), and an
 /// asking is a look at the blocks' notes (with the light refresh, their
 /// bits). A cell whose blocks fault more than `VICTORY_GUARD_PRIVATE_HOT`
-/// times in a frame (16 by default) goes back to the write watch for good
+/// times in a frame (3 by default: a fault, its reopening and the guard
+/// put back cost about what the watch's walk of a 4 MiB cell costs, some
+/// 11 microseconds by run 90fea82's 69 ms for 24.5 GB, and a cell is asked
+/// about a few times a frame) goes back to the write watch for good
 /// ([`private_fault`]); the watch's bits were never reset meanwhile, so
 /// its first asking reports every page written since (more copied once,
 /// nothing missed).
@@ -666,7 +669,7 @@ pub(crate) fn private_on() -> bool {
 /// `VICTORY_GUARD_PRIVATE_HOT`: faults a cell may take in a frame.
 fn private_hot() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_GUARD_PRIVATE_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16))
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_PRIVATE_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3))
 }
 
 /// Blocks [`guard_private`] was given once: no lock of the guards is taken
