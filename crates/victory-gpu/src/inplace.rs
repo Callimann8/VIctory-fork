@@ -147,7 +147,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Cover::Run(section, offset) if window && views_in_place() => {
             return place_on_section(section, offset, start, len);
         }
-        _ => {
+        other => {
+            // (how view memory windows lie, for the line: scattered over
+            // several runs, or with holes)
+            match other {
+                Cover::Scattered => VIEW_COVER[0].fetch_add(1, Ordering::Relaxed),
+                Cover::Holes => VIEW_COVER[1].fetch_add(1, Ordering::Relaxed),
+                _ => VIEW_COVER[2].fetch_add(1, Ordering::Relaxed),
+            };
             STATS[4].fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -196,6 +203,10 @@ static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, (ID3D12Heap,
 /// to open a section, and the bytes of such windows alive now. They lock
 /// nothing, so [`most`] does not count them.
 static SECTION_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Windows over view memory turned down since the start: scattered over
+/// more than one run, with holes, one run but placing on sections off.
+static VIEW_COVER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Every heap opened on a section, by its interface pointer (for [`gone`]).
 static SECTION_PTRS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
@@ -322,6 +333,12 @@ fn say() {
             SECTION_STATS[2].load(Ordering::Relaxed)
         );
     }
+    tracing::info!(
+        scattered = VIEW_COVER[0].load(Ordering::Relaxed),
+        holes = VIEW_COVER[1].load(Ordering::Relaxed),
+        one_run_not_placed = VIEW_COVER[2].load(Ordering::Relaxed),
+        "title memory in place: windows over view memory turned down since the start, by how the views lie"
+    );
     tracing::info!(
         mb = crate::shadow::in_place_recopied() >> 20,
         "title memory in place: copies that overlap it taken whole there at their refreshes since the start (shaders write it with nothing to tell them)"
