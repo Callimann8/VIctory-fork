@@ -656,13 +656,30 @@ const CELL_BLOCKS: usize = 64;
 /// its first asking reports every page written since (more copied once,
 /// nothing missed).
 pub(crate) fn private_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_GUARD_PRIVATE").is_some_and(|v| v == "1");
-        if on {
-            tracing::info!(hot = private_hot(), "big write-watched ranges the host refreshes are held by guards instead (VICTORY_GUARD_PRIVATE=1)");
+    private_mode() != 0
+}
+
+/// `VICTORY_GUARD_PRIVATE=all`: every write-watched range a host copy is
+/// refreshed from is held by the guards, not only the memory shaders reach
+/// by address ([`private_on`]; the copies of buffers and windows the
+/// lists read, 48 ms a frame of copying with ray tracing off).
+pub(crate) fn private_all() -> bool {
+    private_mode() == 2
+}
+
+/// 0 off, 1 the memory shaders reach by address, 2 all.
+fn private_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_GUARD_PRIVATE").as_deref().map(str::trim) {
+            Ok("1") => 1,
+            Ok("all") => 2,
+            _ => 0,
+        };
+        if mode != 0 {
+            tracing::info!(hot = private_hot(), all = mode == 2, "write-watched ranges the host refreshes are held by guards instead (VICTORY_GUARD_PRIVATE)");
         }
-        on
+        mode
     })
 }
 
@@ -674,7 +691,7 @@ fn private_hot() -> u32 {
 
 /// Blocks [`guard_private`] was given once: no lock of the guards is taken
 /// again for them.
-static PRIVATE_KNOWN: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+static PRIVATE_KNOWN: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 
 /// Since the start: blocks taken by [`guard_private`], cells sent back to
 /// the write watch, faults in taken blocks.
@@ -692,18 +709,35 @@ pub(crate) fn guard_private(start: usize, len: usize) {
     if first >= last {
         return;
     }
-    // Runs of blocks not taken before.
+    // Runs of blocks not taken before (the known blocks are kept as merged
+    // runs, so that a range taken before costs one look).
     let runs: Vec<(usize, usize)> = {
         let mut known = PRIVATE_KNOWN.lock().unwrap_or_else(|e| e.into_inner());
         let mut runs: Vec<(usize, usize)> = Vec::new();
-        for b in first..last {
-            if !known.insert(b) {
-                continue;
+        let mut at = first;
+        // The run that holds `first`, if any, then those that start inside.
+        let before = known.range(..=first).next_back().map(|(&a, &b)| (a, b)).filter(|&(_, b)| b > first);
+        let inside: Vec<(usize, usize)> = known.range(first + 1..last).map(|(&a, &b)| (a, b)).collect();
+        for (a, b) in before.into_iter().chain(inside) {
+            if a > at {
+                runs.push((at, a));
             }
-            match runs.last_mut() {
-                Some(r) if r.1 == b => r.1 = b + 1,
-                _ => runs.push((b, b + 1)),
+            at = at.max(b);
+        }
+        if at < last {
+            runs.push((at, last));
+        }
+        if !runs.is_empty() {
+            // Merged into one run with its neighbours.
+            let lo = known.range(..=first).next_back().filter(|&(_, &b)| b >= first).map_or(first, |(&a, _)| a);
+            let mut hi = last;
+            let touching: Vec<usize> = known.range(lo..=last).map(|(&a, _)| a).collect();
+            for a in touching {
+                if let Some(b) = known.remove(&a) {
+                    hi = hi.max(b);
+                }
             }
+            known.insert(lo.min(first), hi);
         }
         runs
     };

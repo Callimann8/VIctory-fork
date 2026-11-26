@@ -3753,6 +3753,10 @@ impl Shadow {
                 }
                 return 0;
             }
+            // `VICTORY_GUARD_PRIVATE=all`: held by the guards from now on.
+            if crate::watch::private_all() && self.watched.load(Ordering::Relaxed) == 1 {
+                crate::watch::guard_private(from, to - from);
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
