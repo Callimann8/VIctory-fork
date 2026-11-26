@@ -290,6 +290,86 @@ fn place_on_section(section: usize, offset: u64, start: u64, len: u64) -> Option
     }
 }
 
+/// Whether title memory that a shader reaches by raw address
+/// (`crate::memory`) gets a window in place of its own, cut to the run of
+/// memory around the page that can be placed, when the 4 MiB window around
+/// it cannot be (`VICTORY_INPLACE_RUNS=1`, with `VICTORY_INPLACE=1`; off by
+/// default). A window that is partly unmapped, or shows pages of more than
+/// one run of the page pool, was turned down whole.
+pub(crate) fn runs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| level() >= 1 && std::env::var_os("VICTORY_INPLACE_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// The longest stretch of `[lo, hi)` around the 64 KiB page at `at` that
+/// can be placed: one run of one section in view memory (with sections
+/// placed, [`views_in_place`]), or private memory committed whole and
+/// read-write; cut to 64 KiB lines. `None` if not even the page can.
+pub(crate) fn run_around(at: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let page = at & !(K64 as u64 - 1);
+    let (start, end) = {
+        let v = views();
+        let found = v.views.range(..=page as usize).next_back().filter(|(base, view)| *base + view.0 > page as usize);
+        if let Some((&base, &(bytes, section, offset))) = found {
+            if !views_in_place() {
+                return None;
+            }
+            // Back while the view before ends here and goes on in the same
+            // section, then on while the next starts here and does too.
+            let (mut start, mut first_offset) = (base, offset);
+            while start as u64 > lo {
+                let Some((&b, &(n, s, o))) = v.views.range(..start).next_back() else { break };
+                if b + n != start || s != section || o + n as u64 != first_offset {
+                    break;
+                }
+                (start, first_offset) = (b, o);
+            }
+            let mut end = base + bytes;
+            let mut next_offset = offset + bytes as u64;
+            while (end as u64) < hi {
+                let Some(&(n, s, o)) = v.views.get(&end) else { break };
+                if s != section || o != next_offset {
+                    break;
+                }
+                end += n;
+                next_offset += n as u64;
+            }
+            (start as u64, end as u64)
+        } else {
+            drop(v);
+            private_run(page, lo, hi)?
+        }
+    };
+    let start = start.max(lo).next_multiple_of(K64 as u64);
+    let end = end.min(hi) & !(K64 as u64 - 1);
+    (start <= page && page + K64 as u64 <= end).then_some((start, end - start))
+}
+
+/// The stretch of private memory, committed and read-write, around `page`
+/// within `[lo, hi)` (regions as Windows reports them from `lo` on).
+fn private_run(page: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let mut at = lo;
+    while at <= page {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return None;
+        }
+        let end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if end > page {
+            let good = info.State == mem::MEM_COMMIT && info.Type == mem::MEM_PRIVATE && info.Protect == mem::PAGE_READWRITE;
+            return good.then_some((at, end.min(hi)));
+        }
+        if end <= at {
+            return None;
+        }
+        at = end;
+    }
+    None
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64, heap: &ID3D12Heap) {
     // On a section of the page pool: counted apart ([`place_on_section`]).

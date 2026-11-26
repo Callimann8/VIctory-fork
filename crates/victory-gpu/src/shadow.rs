@@ -4214,6 +4214,15 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
+        let mut map = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .filter(|(key, _)| key.0 + key.1 > at)
+            .map(|(key, _)| *key)
+            .collect();
+        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+    }
+    {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
@@ -4241,6 +4250,53 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
+
+/// Windows in place cut to a run of memory (`crate::inplace::runs_on`), by
+/// (start, bytes): kept apart from [`LOOSE`] so that no ask of a root view
+/// is given one (a root view reads on to its window's end, and such a
+/// window ends where the run does). Taken out with the others when their
+/// memory is remapped ([`in_place_let_go`]).
+static RUNS: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Whether a title buffer holds the 64 KiB page at `page` (its copy is what
+/// a shader's raw address must reach there).
+pub(crate) fn buffer_holds(page: u64) -> bool {
+    buffers().range(..=(page, usize::MAX)).rev().take(64).any(|(_, e)| e.end > page)
+}
+
+/// A window in place over the run of memory around the page at `page`
+/// within its 4 MiB cell (`crate::inplace::runs_on`), made on first ask;
+/// `None` if runs are off or the page cannot be placed.
+pub(crate) fn run_window(page: u64) -> Option<Arc<Shadow>> {
+    if !crate::inplace::runs_on() {
+        return None;
+    }
+    let page = page & !(PAGE as u64 - 1);
+    let mut map = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(found) = map
+        .range(..=(page, u64::MAX))
+        .rev()
+        .take(16)
+        .find(|(key, _)| key.0 + key.1 >= page + PAGE as u64)
+        .map(|(_, s)| s.clone())
+    {
+        found.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(found);
+    }
+    let cell = page & !(WINDOW - 1);
+    let (start, len) = crate::inplace::run_around(page, cell, cell + WINDOW)?;
+    let placed = crate::inplace::place_for(start, len, true)?;
+    let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+    map.insert((start, len), shadow.clone());
+    let n = RUN_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_power_of_two() {
+        tracing::info!(windows = n, start = format_args!("{start:#x}"), len, "title memory in place: windows cut to a run of memory, made since the start (VICTORY_INPLACE_RUNS=1)");
+    }
+    Some(shadow)
+}
+
+/// Windows [`run_window`] made since the start.
+static RUN_WINDOWS: AtomicU64 = AtomicU64::new(0);
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length

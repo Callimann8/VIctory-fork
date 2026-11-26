@@ -201,7 +201,15 @@ impl Memory {
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let shadow = crate::shadow::find(start, 1)
+        // Memory outside buffers: a window in place cut to the run around the
+        // page, if its whole window cannot be in place
+        // (`VICTORY_INPLACE_RUNS=1`).
+        let run = (crate::inplace::runs_on() && !crate::shadow::buffer_holds(start))
+            .then(|| crate::shadow::find(start, 1).filter(|s| s.in_place() && whole(s)).or_else(|| crate::shadow::run_window(start)))
+            .flatten()
+            .filter(whole);
+        let shadow = run
+            .or_else(|| crate::shadow::find(start, 1))
             .filter(whole)
             .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
         // SAFETY: a live buffer.

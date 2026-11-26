@@ -682,20 +682,49 @@ thread_local! {
     /// While a dispatch is bound: the most bytes of each root view that
     /// are brought up to date and declared written (`self_copy_head`).
     static VIEW_CAP: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    /// While a self-copy dispatch is bound: its root views take the window
+    /// in place cut to a run of memory, where there is one ([`root_find`]).
+    static PREFER_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Sets [`VIEW_CAP`] for its life.
+/// Sets [`VIEW_CAP`] and [`PREFER_RUN`] for its life.
 struct ViewCap;
 impl ViewCap {
     fn set(bytes: u64) -> ViewCap {
         VIEW_CAP.with(|c| c.set(bytes));
+        PREFER_RUN.with(|c| c.set(crate::inplace::runs_on()));
         ViewCap
     }
 }
 impl Drop for ViewCap {
     fn drop(&mut self) {
         VIEW_CAP.with(|c| c.set(u64::MAX));
+        PREFER_RUN.with(|c| c.set(false));
     }
+}
+
+fn prefer_run() -> bool {
+    PREFER_RUN.with(std::cell::Cell::get)
+}
+
+/// The host buffer a root view at `address` binds: the copy `find` gives,
+/// or for a self-copy dispatch with windows cut to runs
+/// (`VICTORY_INPLACE_RUNS=1`) the run window that the builder's raw
+/// addresses reach there, if it holds the program's head. The self-copy's
+/// only change is its head (`State::self_copy`): on the run window the
+/// builder sees it at once, where on a copy it would see it only once the
+/// copy went back to title memory. Past the run's end its view reads zeros
+/// and drops stores: what it stores there is what it read.
+fn root_find(address: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    let found = crate::shadow::find(address, 1);
+    if prefer_run()
+        && !found.as_ref().is_some_and(|s| s.in_place())
+        && !crate::shadow::buffer_holds(address)
+        && let Some(run) = crate::shadow::run_window(address).filter(|s| s.offset_in(address).is_some() && s.left(address) >= 64)
+    {
+        return Some(run);
+    }
+    found
 }
 
 fn view_cap() -> u64 {
@@ -723,7 +752,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = root_find(address)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 })
@@ -1042,7 +1071,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
+                Some(&Root::View(address)) => root_find(address).map_or(0, |s| {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                     ((s.gpu(address) - base) & 15) as u32
@@ -1454,7 +1483,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = root_find(a)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1498,7 +1527,9 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        // (a self-copy's views on a run window are other views than the
+        // window's own, `root_find`)
+        let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0) | u64::from(prefer_run()) << 62);
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
@@ -1568,12 +1599,12 @@ impl State {
         // (title addresses stay below bit 63).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63,
+            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(prefer_run()) << 62,
         );
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| root_find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
