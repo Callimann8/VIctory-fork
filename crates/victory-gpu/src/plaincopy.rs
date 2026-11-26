@@ -197,7 +197,9 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
-    let whole = guarded(to, from, len);
+    // A big copy is shared out over our copy threads (`crate::split`).
+    let (t, f) = (to as usize, from as usize);
+    let whole = crate::split::split(len, &|at, n| guarded((t + at) as *mut u8, (f + at) as *const u8, n));
     if whole {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
