@@ -67,6 +67,7 @@ switches! {
     DstorageStaging = "VICTORY_DSTORAGE_STAGING_MB", "staging sizes raised", "bytes";
     RemapKeep = "VICTORY_REMAP_KEEP", "remainders kept", "bytes";
     CardRehashRuns = "VICTORY_CARD_REHASH_RUNS", "rehash runs", "";
+    PrepWide = "VICTORY_PREP_WIDE", "stretches cut into pieces", "pieces";
 }
 
 const N: usize = NAMES.len();
