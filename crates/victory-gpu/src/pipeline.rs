@@ -767,6 +767,8 @@ pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
+pub(crate) mod samplers;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;

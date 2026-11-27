@@ -24,6 +24,8 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    #[cfg(windows)]
+    crate::pipeline::samplers::use_folder(dir.with_file_name("pipelines"));
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
@@ -128,10 +130,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }
+    }?;
+    // Its static samplers into the list every process makes them from.
+    #[cfg(windows)]
+    crate::pipeline::samplers::know(&shader.static_samplers);
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the

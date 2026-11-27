@@ -840,6 +840,11 @@ pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
 
+/// The host if it has been made (never makes it).
+pub(crate) fn host_made() -> Option<&'static Host> {
+    HOST.get().and_then(|h| h.as_ref())
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -919,6 +924,12 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        // Before anything else has a static sampler (`pipeline::samplers`): the
+        // first thing made with the device, in the run as in the tools. Made
+        // after Streamline had the device (DLSS loaded, in the run only), the
+        // run drew a white-painted material black with the pipelines `victory
+        // warm` had compiled (launcher run rel4, 2026-11-27).
+        crate::pipeline::samplers::prime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
