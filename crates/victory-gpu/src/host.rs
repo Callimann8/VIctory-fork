@@ -1307,6 +1307,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_CARD_METER=1`: the list's own span of card time, and
+    /// that of the pipeline bound last (`cardmeter`).
+    meter: [std::sync::atomic::AtomicU64; 2],
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3848,6 +3851,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod cardmeter;
 pub(crate) mod indirects;
 mod font;
 mod menu;
@@ -4232,6 +4236,8 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            // The list is open from here.
+            let meter = cardmeter::begin(&list);
             let prelude = OnceLock::new();
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
@@ -4287,6 +4293,10 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                meter: [
+                    std::sync::atomic::AtomicU64::new(meter.raw()),
+                    std::sync::atomic::AtomicU64::new(cardmeter::Span::NONE.raw()),
+                ],
             })
         }
     }
@@ -4482,6 +4492,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let meter = cardmeter::begin(list);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4560,6 +4571,7 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    cardmeter::end(list, meter, cardmeter::Kind::Sync);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4642,6 +4654,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let meter = cardmeter::begin(list);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4666,6 +4679,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    cardmeter::end(list, meter, cardmeter::Kind::Check);
                     list.Close()?;
                     list.cast()
                 })()
@@ -6495,6 +6509,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.meter_ends();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -6621,6 +6636,10 @@ impl HostList {
             if let Err(e) = reset {
                 fail(format_args!("a host command list did not reset ({e})"));
             }
+            // What the list held went with the reset, a span never ended
+            // too; it is open again from here.
+            self.meter[1].store(cardmeter::Span::NONE.raw(), Ordering::Relaxed);
+            self.meter[0].store(cardmeter::begin(&self.list).raw(), Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -7067,6 +7086,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let meter = cardmeter::begin(list);
                 if !aliasing.is_empty() {
                     list.ResourceBarrier(&aliasing);
                 }
@@ -7081,6 +7101,12 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if uploads.is_empty() {
+                    cardmeter::end(list, meter, cardmeter::Kind::States);
+                } else {
+                    let name = format!("{} texture uploads, {} barriers", uploads.len(), to_copy.len() + barriers.len());
+                    cardmeter::end_named(list, meter, cardmeter::Kind::Uploads, name);
                 }
                 list.Close()
             })
@@ -7164,6 +7190,33 @@ impl HostList {
     pub(crate) fn ran_indirect(&self, pipeline: usize, name: &str, kind: u32, count: u32, user: &[u32]) {
         if dred_on() || dred_light() {
             self.indirects.lock().unwrap_or_else(|e| e.into_inner()).note(pipeline, name, kind, count, user);
+        }
+    }
+
+    /// With the card's time measured by pipeline (`cardmeter::pipelines`):
+    /// what the list records from here is `name`'s, until the next call or
+    /// the list's end.
+    pub(crate) fn meter_pipeline(&self, name: &str) {
+        if !cardmeter::pipelines() {
+            return;
+        }
+        let last = cardmeter::Span::from_raw(self.meter[1].swap(cardmeter::Span::NONE.raw(), Ordering::Relaxed));
+        cardmeter::end(&self.list, last, cardmeter::Kind::Pipeline);
+        self.meter[1].store(cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
+    }
+
+    /// The list is about to be closed: its spans of card time end here.
+    fn meter_ends(&self) {
+        if !cardmeter::on() {
+            return;
+        }
+        let none = cardmeter::Span::NONE.raw();
+        let last = cardmeter::Span::from_raw(self.meter[1].swap(none, Ordering::Relaxed));
+        cardmeter::end(&self.list, last, cardmeter::Kind::Pipeline);
+        let whole = cardmeter::Span::from_raw(self.meter[0].swap(none, Ordering::Relaxed));
+        if whole != cardmeter::Span::NONE {
+            let name = cardmeter::name_of(&self.pipelines.lock().unwrap_or_else(|e| e.into_inner()));
+            cardmeter::end_named(&self.list, whole, cardmeter::Kind::Lists, name);
         }
     }
 
@@ -9338,6 +9391,7 @@ impl Meter {
         two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
+        cardmeter::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
         fresh_open_line(frames);
