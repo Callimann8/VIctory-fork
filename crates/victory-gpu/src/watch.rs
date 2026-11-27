@@ -600,6 +600,58 @@ fn guard_hot() -> u32 {
     *N.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// Where the guards' time goes, in microseconds and counts since the last
+/// line ([`guard_times_line`]): [0] `guard` calls, [1] waiting for the
+/// guards' lock in `guard`, [2] reading the clean blocks, [3] asking
+/// Windows whether memory is a view, [4] making blocks read-only here,
+/// [5] of that, their other views, [6] blocks made read-only, [7]
+/// `VirtualProtect` calls for them, [8] faults taken, [9] the faults'
+/// time on the title's threads (lock wait and opening), [10] of that,
+/// waiting for the lock, [11] the whole of `guard`.
+pub(crate) static GUARD_TIME: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Adds the time since it was made to [`GUARD_TIME`]`[.0]` when dropped.
+struct Timed(usize, std::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        gt(self.0, self.1.elapsed().as_micros() as u64);
+    }
+}
+
+fn gt(i: usize, n: u64) {
+    GUARD_TIME[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The line of [`GUARD_TIME`], per frame, once every 64 frames.
+fn guard_times_line() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if frame < last + 64 || LAST.compare_exchange(last, frame, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_err() {
+        return;
+    }
+    let frames = (frame - last).max(1) as f64;
+    let v: Vec<f64> = GUARD_TIME.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    let ms = |x: f64| x / 1000.0;
+    tracing::info!(
+        "guard times per frame: {:.0} asks, {:.1} ms in all ({:.1} lock wait, {:.1} clean blocks, {:.1} is-view questions, {:.1} making read-only of which {:.1} other views; {:.0} blocks in {:.0} calls); \
+         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait)",
+        v[0],
+        ms(v[11]),
+        ms(v[1]),
+        ms(v[2]),
+        ms(v[3]),
+        ms(v[4]),
+        ms(v[5]),
+        v[6],
+        v[7],
+        v[8],
+        ms(v[9]),
+        ms(v[10]),
+    );
+}
+
 /// How long a block stays unguarded ([`guard_hot`]).
 const HOT_FRAMES: u64 = 60;
 
@@ -686,11 +738,22 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first)) || g.hot.contains_key(&first)
     };
-    if !known && !is_view(start, end) {
-        return None;
+    let whole = std::time::Instant::now();
+    guard_times_line();
+    gt(0, 1);
+    if !known {
+        let asked = std::time::Instant::now();
+        let view = is_view(start, end);
+        gt(3, asked.elapsed().as_micros() as u64);
+        if !view {
+            return None;
+        }
     }
     install();
+    let waited = std::time::Instant::now();
     let mut g = guards();
+    gt(1, waited.elapsed().as_micros() as u64);
+    let _whole = Timed(11, whole);
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -699,7 +762,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
+    let reading = std::time::Instant::now();
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    gt(2, reading.elapsed().as_micros() as u64);
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
@@ -839,10 +904,14 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    let started = std::time::Instant::now();
+    let _t = Timed(4, started);
+    gt(6, (to - from) as u64);
     protect_here(g, from, to);
     if !view_guard() {
         return;
     }
+    let _a = Timed(5, std::time::Instant::now());
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -910,6 +979,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
+        gt(7, 1);
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
@@ -1296,11 +1366,15 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        let began = std::time::Instant::now();
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
+        gt(10, began.elapsed().as_micros() as u64);
+        let _t = Timed(9, began);
         if open(&mut g, at, at + 1) {
+            gt(8, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
