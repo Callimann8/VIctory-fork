@@ -1401,6 +1401,165 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// `VICTORY_LAND_WIDE=1` (off by default): what shaders wrote to copies in
+/// the PC's memory goes into title memory for several copies at once, on
+/// the threads kept for [`wide`] (after the 7900 XTX fork's `VICTORY_LAND`,
+/// whose relay spent 58-60 ms of a 104 ms frame merging piece by piece on
+/// one thread). The pieces of one copy stay on one thread, in order, under
+/// the copy's own lock as before ([`Shadow::relay_merge`]): nothing about
+/// what is merged or in what order changes for any one copy.
+pub(crate) fn land_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LAND_WIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_LAND_WIDE=1: copies' shader writes merged into title memory on several threads, a copy per thread");
+        }
+        on
+    })
+}
+
+/// Since the last line: landings, landings done wide, copies, pieces, the
+/// largest copy's pieces summed, microseconds merging (wall).
+static LAND_WIDE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`land_wide`]: the bytes written into title memory for each of `work`
+/// (copy, offsets), whose differing pieces are `found` (from [`find_all`]).
+pub(crate) fn relay_merge_wide(work: &[(Arc<Shadow>, usize, usize)], found: Vec<Vec<(usize, usize)>>) -> Vec<usize> {
+    merge_wide(work, found, false)
+}
+
+/// [`land_wide`] for the copy-back on the submitting thread
+/// ([`Shadow::copy_back_with`] for each of `work`, given its pieces).
+pub(crate) fn copy_back_wide(work: &[(Arc<Shadow>, usize, usize)], found: Vec<Vec<(usize, usize)>>) -> Vec<usize> {
+    merge_wide(work, found, true)
+}
+
+fn merge_wide(work: &[(Arc<Shadow>, usize, usize)], found: Vec<Vec<(usize, usize)>>, whole: bool) -> Vec<usize> {
+    let began = std::time::Instant::now();
+    // The work of each copy, in order: (index in `work`, pieces).
+    let mut groups: Vec<(*const Shadow, Vec<(usize, Vec<(usize, usize)>)>)> = Vec::new();
+    for (i, ((shadow, ..), found)) in work.iter().zip(found).enumerate() {
+        // (A copy-back with nothing found still notes the range compared.)
+        if found.is_empty() && !whole {
+            continue;
+        }
+        let key = Arc::as_ptr(shadow);
+        match groups.iter_mut().find(|g| g.0 == key) {
+            Some(g) => g.1.push((i, found)),
+            None => groups.push((key, vec![(i, found)])),
+        }
+    }
+    // Copies that hold the same title memory go on one thread, in the
+    // order given: two merges of one page read title memory and put back a
+    // stretch of it each, and one would undo the other. The same memory:
+    // the same 64 KiB of title addresses (nested buffers), or the same
+    // physical page shown at another address (`crate::inplace::pages_of`).
+    let mut owner: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut parent: Vec<usize> = (0..groups.len()).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for (g, (_, items)) in groups.iter().enumerate() {
+        for (i, found) in items {
+            let start = work[*i].0.start as usize;
+            for &(at, n) in found {
+                let mut page = (start + at) / PAGE * PAGE;
+                while page < start + at + n {
+                    let key = crate::inplace::pages_of(page).into_iter().min().unwrap_or(page);
+                    match owner.get(&key) {
+                        Some(&other) => {
+                            let (a, b) = (root(&mut parent, other), root(&mut parent, g));
+                            if a != b {
+                                parent[b] = a;
+                            }
+                        }
+                        None => {
+                            owner.insert(key, g);
+                        }
+                    }
+                    page += PAGE;
+                }
+            }
+        }
+    }
+    let mut joined: Vec<(*const Shadow, Vec<(usize, Vec<(usize, usize)>)>)> = Vec::new();
+    let mut at_root: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (g, group) in groups.into_iter().enumerate() {
+        let r = root(&mut parent, g);
+        match at_root.get(&r) {
+            Some(&j) => joined[j].1.extend(group.1),
+            None => {
+                at_root.insert(r, joined.len());
+                joined.push(group);
+            }
+        }
+    }
+    for g in &mut joined {
+        g.1.sort_by_key(|w| w.0);
+    }
+    let groups = joined;
+    let pieces: usize = groups.iter().map(|g| g.1.iter().map(|w| w.1.len()).sum::<usize>()).sum();
+    let largest: usize = groups.iter().map(|g| g.1.iter().map(|w| w.1.len()).sum::<usize>()).max().unwrap_or(0);
+    let written: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(vec![0; work.len()]));
+    let wide_now = groups.len() >= 2;
+    let work_of: Arc<Vec<(usize, usize, usize)>> = Arc::new(work.iter().map(|(_, from, to)| (0, *from, *to)).collect());
+    let jobs: Vec<Job> = groups
+        .into_iter()
+        .map(|(_, items)| {
+            let shadows: Vec<Arc<Shadow>> = items.iter().map(|w| work[w.0].0.clone()).collect();
+            let written = written.clone();
+            let work_of = work_of.clone();
+            Box::new(move || {
+                let (mut now, mut title) = (Vec::new(), Vec::new());
+                let mut mine = Vec::with_capacity(items.len());
+                for ((i, found), shadow) in items.into_iter().zip(shadows) {
+                    let n: usize = if whole {
+                        let (_, from, to) = &work_of[i];
+                        shadow.copy_back_with(*from, to - from, Some(found))
+                    } else {
+                        found.into_iter().map(|(at, n)| shadow.relay_merge(at, n, &mut now, &mut title)).sum()
+                    };
+                    mine.push((i, n));
+                }
+                let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
+                for (i, n) in mine {
+                    w[i] = n;
+                }
+            }) as Job
+        })
+        .collect();
+    let copies = jobs.len();
+    wide(jobs);
+    for (k, n) in [1, u64::from(wide_now), copies as u64, pieces as u64, largest as u64, began.elapsed().as_micros() as u64].into_iter().enumerate() {
+        LAND_WIDE[k].fetch_add(n, Ordering::Relaxed);
+    }
+    land_wide_line();
+    let w = written.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    w
+}
+
+/// The line of [`LAND_WIDE`], per frame, once every 64 frames.
+fn land_wide_line() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    let last = LAST.load(Ordering::Relaxed);
+    if frame < last + 64 || LAST.compare_exchange(last, frame, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let frames = (frame - last).max(1) as f64;
+    let v: Vec<f64> = LAND_WIDE.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "relay merges per frame (VICTORY_LAND_WIDE): {:.1} landings ({:.1} wide), {:.1} copies, {:.0} pieces (largest copy {:.0}), {:.1} ms merging",
+        v[0], v[1], v[2], v[3], v[4], v[5] / 1000.0
+    );
+}
+
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {

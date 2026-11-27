@@ -84,8 +84,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
-    // Opt-in title patches (from victory-perf via pepezin-ai/VIctory-NVIDIA),
-    // each checked against the 1.0.2.1 hash and the bytes it replaces.
+    // Opt-in title patches, each checked against the 1.0.2.1 hash and its bytes (hooks.rs).
     if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
         // SAFETY: just mapped, and no title code has run.
         let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
@@ -99,7 +98,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             "title resolution levers ({}, {}, {})",
             crate::hooks::RENDER_SCALE_ENV,
             crate::hooks::OWN_UPSCALER_ENV,
-            crate::hooks::FORCE_FSR_ENV
+            crate::hooks::FSR_UPSCALER_ENV
         );
     }
     tracing::info!(
