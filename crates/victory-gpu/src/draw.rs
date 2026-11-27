@@ -1096,6 +1096,10 @@ fn dropped(pipeline: usize) {
 
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+/// Self-copies run as one group, and listed programs that were not one
+/// (`VICTORY_SELF_COPY_SHRINK`).
+static SELF_COPY_SHRUNK: AtomicU64 = AtomicU64::new(0);
+static SELF_COPY_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
@@ -3751,6 +3755,18 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // A copy of a range onto itself (`VICTORY_SELF_COPY_SHRINK`): one
+        // group. Binding (refresh, copy back) stays exactly as it is.
+        let [x, y, z] = if x != 0 && y != 0 && z != 0 && self.self_copy(p) {
+            let n = SELF_COPY_SHRUNK.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(8192) {
+                let groups = u64::from(x) * u64::from(y) * u64::from(z);
+                tracing::info!(shrunk = n, groups, "a copy of title memory onto itself runs as one group (VICTORY_SELF_COPY_SHRINK)");
+            }
+            [1, 1, 1]
+        } else {
+            [x, y, z]
+        };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
@@ -4376,6 +4392,66 @@ impl State {
         } else if self.targets.iter().filter(|&&t| t != 0).count() >= 4 {
             let r = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
             *census.1.entry(r).or_insert(0) += 1;
+        }
+    }
+
+    /// Whether this dispatch is a title program that copies a range onto
+    /// itself (`VICTORY_SELF_COPY_SHRINK=1`, or a list of shader hash
+    /// prefixes; unset or `0`: never): its shader is a listed one (`1`:
+    /// `c42a31951201f9a0`), and its one root SRV and one root UAV are the
+    /// same address.
+    ///
+    /// c42a31951201f9a0 (made by the title at run time; 63 dispatches a lit
+    /// frame with ray tracing on, ~240 ms of the card's time on an RTX 4070):
+    /// thread `i` copies the 16 bytes at `i * 16` from the root SRV to the
+    /// root UAV, and steps by user word 4 (the threads the title launched)
+    /// x 16 until the byte count from the source's header (dword 1 x 64 +
+    /// 64); then thread 0 writes an empty box at +16..+39 if word 5 is not
+    /// 0. Its addresses are the two root descriptors alone, and the step
+    /// does not depend on the groups launched: with both the same address,
+    /// one group copies a part of the range onto itself (stores what is
+    /// there) and still writes the box, after its own copy stores as
+    /// before. The memory after it is the same as after all the groups.
+    /// (From Callimann8/VIctory-fork 77e9678.)
+    fn self_copy(&self, p: &crate::pipeline::host::HostPipeline) -> bool {
+        static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let list = LIST.get_or_init(|| {
+            let v = std::env::var("VICTORY_SELF_COPY_SHRINK").unwrap_or_default();
+            match v.trim() {
+                "" | "0" => Vec::new(),
+                "1" => vec!["c42a31951201f9a0".to_owned()],
+                v => v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect(),
+            }
+        });
+        if list.is_empty() {
+            return false;
+        }
+        let [stage] = &p.stages[..] else { return false };
+        if !list.iter().any(|h| stage.shader.hash.starts_with(h.as_str())) {
+            return false;
+        }
+        // A listed program: a refusal is said, with why.
+        let refuse = |why: &'static str, detail: String| {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let n = SELF_COPY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if SAID.fetch_add(1, Ordering::Relaxed) < 24 || n.is_power_of_two() {
+                tracing::info!(refused = n, hash = %stage.shader.hash, why, detail, "a listed self-copy program runs as the title launched it (VICTORY_SELF_COPY_SHRINK)");
+            }
+            false
+        };
+        let ([(srv, _)], [(uav, _)]) = (&stage.root_srvs[..], &stage.root_uavs[..]) else {
+            return refuse(
+                "not one root SRV and one root UAV",
+                format!("srvs {:?} uavs {:?}", stage.root_srvs, stage.root_uavs),
+            );
+        };
+        let roots = self.roots_ref(true);
+        match (roots.get(usize::from(*srv)), roots.get(usize::from(*uav))) {
+            (Some(Root::View(a)), Some(Root::View(b))) if a == b => true,
+            (Some(Root::View(a)), Some(Root::View(b))) => {
+                refuse("source and destination differ", format!("{a:#x} {b:#x}"))
+            }
+            (a, b) => refuse("a root view not set", format!("srv {a:?} uav {b:?}")),
         }
     }
 
