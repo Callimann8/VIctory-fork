@@ -574,6 +574,10 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// With [`guard_fast`]: for a block in `aliased`, the views of its
+    /// pages as they were when it was guarded (addresses), so that a fault
+    /// opens them without asking `crate::inplace` under the guards' lock.
+    alias_of: BTreeMap<usize, std::sync::Arc<Vec<usize>>>,
     /// With [`view_known`]: blocks made read-only at least once since the
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
@@ -609,8 +613,8 @@ fn guard_hot() -> u32 {
 /// time on the title's threads (lock wait and opening), [10] of that,
 /// waiting for the lock, [11] the whole of `guard`, [12] questions whether
 /// absent blocks are committed now, [13] their time, [14] the time `guard`
-/// held the lock.
-pub(crate) static GUARD_TIME: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+/// held the lock, [15] opening other views at faults and writes.
+pub(crate) static GUARD_TIME: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
 /// Adds the time since it was made to [`GUARD_TIME`]`[.0]` when dropped.
 struct Timed(usize, std::time::Instant);
@@ -638,7 +642,7 @@ fn guard_times_line() {
     let ms = |x: f64| x / 1000.0;
     tracing::info!(
         "guard times per frame: {:.0} asks, {:.1} ms in all ({:.1} lock wait, {:.1} clean blocks, {:.1} is-view questions, {:.1} making read-only of which {:.1} other views; {:.0} blocks in {:.0} calls); \
-         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={})",
+         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms; {:.1} ms opening other views (VICTORY_GUARD_FAST={})",
         v[0],
         ms(v[11]),
         ms(v[1]),
@@ -654,6 +658,7 @@ fn guard_times_line() {
         v[12],
         ms(v[13]),
         ms(v[14]),
+        ms(v[15]),
         u8::from(guard_fast()),
     );
 }
@@ -712,6 +717,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    alias_of: BTreeMap::new(),
     viewed: BTreeSet::new(),
     heat: BTreeMap::new(),
     hot: BTreeMap::new(),
@@ -972,13 +978,15 @@ fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
     {
         let mut g = guards();
         let known = view_known();
-        for (block, shown) in &shown_by {
+        for (block, shown) in shown_by {
             #[cfg(feature = "diagnostics")]
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for &alias in shown {
+            let shown = std::sync::Arc::new(shown);
+            for &alias in shown.iter() {
                 let alias = alias / BLOCK;
+                g.alias_of.insert(alias, shown.clone());
                 g.aliased.insert(alias);
-                if alias != *block && g.protected.insert(alias) {
+                if alias != block && g.protected.insert(alias) {
                     if known {
                         g.viewed.insert(alias);
                     }
@@ -1242,9 +1250,15 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let looking = std::time::Instant::now();
     for block in aliased {
         g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
+        let shown = match g.alias_of.remove(&block) {
+            Some(shown) => shown,
+            None => std::sync::Arc::new(crate::inplace::pages_of(block * BLOCK)),
+        };
+        for &alias in shown.iter() {
+            g.alias_of.remove(&(alias / BLOCK));
             if alias / BLOCK != block {
                 if alias_lazy() {
                     // The other view stays read-only (a write through it
@@ -1264,6 +1278,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
             g.aliased.remove(&(alias / BLOCK));
         }
     }
+    gt(15, looking.elapsed().as_micros() as u64);
     any
 }
 
@@ -1503,6 +1518,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+        g.alias_of.remove(&block);
     }
     if !g.hot.is_empty() || !g.heat.is_empty() {
         let blocks = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
