@@ -1488,22 +1488,6 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
-/// `VICTORY_COPY_WIDE=N` (0/1 off by default): a refresh that copies
-/// [`COPY_WIDE_LEAST`] bytes or more spreads its stale stretches over `N`
-/// threads. OV8's frame spent 55-72 ms in these copies (316 MB, 45,000
-/// page faults), on the submitting thread alone; the stretches are apart
-/// and each copy's CPU side is written only where its stretch lies.
-fn refresh_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_COPY_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
-}
-
-/// The least a refresh copies before [`refresh_threads`] spreads it.
-const COPY_WIDE_LEAST: usize = 1 << 20;
-
-/// Refreshes spread by [`refresh_threads`] since the start.
-pub(crate) static COPY_WIDE_DONE: AtomicU64 = AtomicU64::new(0);
-
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -3457,71 +3441,36 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
-        // The stale stretches, found under the lock; copied after it (with
-        // `VICTORY_COPY_WIDE` on several threads).
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let mut writes = written.iter().peekable();
-            let mut run = None;
-            let last = (to - 1) / PAGE;
-            for page in from / PAGE..=last {
-                let write = match writes.peek() {
-                    Some(&&(p, w)) if p == page => {
-                        writes.next();
-                        w
-                    }
-                    _ => 0,
-                };
-                let at = &mut copied[page - base];
-                if *at == 0 || write > *at {
-                    // A page only partly in the range is copied in part: it
-                    // stays stale for the rest.
-                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        *at = now;
-                    }
-                    run.get_or_insert(page);
-                } else if let Some(first) = run.take() {
-                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writes = written.iter().peekable();
+        let (mut bytes, mut run) = (0, None);
+        let last = (to - 1) / PAGE;
+        for page in from / PAGE..=last {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
                 }
-            }
-            // Cut to the range: next to it shaders may be writing the copy.
-            if let Some(first) = run {
-                runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
-            }
-        }
-        let total: usize = runs.iter().map(|&(a, b)| b - a).sum();
-        let threads = refresh_threads();
-        if threads < 2 || total < COPY_WIDE_LEAST {
-            return runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
-        }
-        // In pieces of about an equal share.
-        let share = total.div_ceil(threads).next_multiple_of(PAGE).max(PAGE);
-        let mut pieces: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
-        let mut filled = 0;
-        for (mut a, b) in runs {
-            while a < b {
-                let take = (b - a).min(share - filled);
-                let cut = a + take;
-                pieces.last_mut().unwrap().push((a, cut));
-                filled += cut - a;
-                a = cut;
-                if filled >= share {
-                    pieces.push(Vec::new());
-                    filled = 0;
+                _ => 0,
+            };
+            let at = &mut copied[page - base];
+            if *at == 0 || write > *at {
+                // A page only partly in the range is copied in part: it
+                // stays stale for the rest.
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
                 }
+                run.get_or_insert(page);
+            } else if let Some(first) = run.take() {
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
-        COPY_WIDE_DONE.fetch_add(1, Ordering::Relaxed);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = pieces
-                .into_iter()
-                .filter(|p| !p.is_empty())
-                .map(|piece| scope.spawn(move || piece.into_iter().map(|(a, b)| self.copy(a, b)).sum::<usize>()))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
-        })
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some(first) = run {
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
