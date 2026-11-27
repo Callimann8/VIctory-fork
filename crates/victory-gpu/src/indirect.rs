@@ -2730,7 +2730,6 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             // pipeline; buffers the test holds until the list has run.
             unsafe {
                 list.list.SetComputeRootSignature(&worker.root);
-                list.meter_pipeline("ours: a pass over indirect records");
                 list.list.SetPipelineState(&worker.pso);
                 list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                 list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
@@ -2751,7 +2750,6 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
-            list.meter_pipeline("ours: a pass over indirect records");
             list.list.SetPipelineState(&worker.pso);
             list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
             list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
@@ -2921,7 +2919,6 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 // pipeline; buffers the test holds until the list has run.
                 unsafe {
                     list.list.SetComputeRootSignature(&worker.root);
-                    list.meter_pipeline("ours: a pass over indirect records");
                     list.list.SetPipelineState(&worker.pso);
                     list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                     for i in 0..groups.len() as u64 {
@@ -3246,7 +3243,6 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 // pipeline; buffers the test holds until the list has run.
                 unsafe {
                     list.list.SetComputeRootSignature(&worker.root);
-                    list.meter_pipeline("ours: a pass over indirect records");
                     list.list.SetPipelineState(&worker.pso);
                     list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
                 }
@@ -3307,7 +3303,6 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         // buffers the test holds until the list has run.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
-            list.meter_pipeline("ours: a pass over indirect records");
             list.list.SetPipelineState(&worker.pso);
             list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
         }

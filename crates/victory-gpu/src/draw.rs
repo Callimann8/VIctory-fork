@@ -1948,7 +1948,6 @@ impl State {
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
         if self.host_pipeline != p.pso.as_raw() as usize {
-            list.meter_pipeline(&p.name);
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
