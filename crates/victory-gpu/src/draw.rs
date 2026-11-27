@@ -4398,8 +4398,8 @@ impl State {
     /// Whether this dispatch is a title program that copies a range onto
     /// itself (`VICTORY_SELF_COPY_SHRINK=1`, or a list of shader hash
     /// prefixes; unset or `0`: never): its shader is a listed one (`1`:
-    /// `c42a31951201f9a0`), and its one root SRV and one root UAV are the
-    /// same address.
+    /// `c42a31951201f9a0`), and the two root views of the title it reaches
+    /// (bound, or read as title memory by address) are the same address.
     ///
     /// c42a31951201f9a0 (made by the title at run time; 63 dispatches a lit
     /// frame with ray tracing on, ~240 ms of the card's time on an RTX 4070):
@@ -4439,19 +4439,44 @@ impl State {
             }
             false
         };
-        let ([(srv, _)], [(uav, _)]) = (&stage.root_srvs[..], &stage.root_uavs[..]) else {
+        // The title's root views the program reaches: bound as root views,
+        // or, in a program with a spilled user-data table, read as title
+        // memory by address (`USER_ROOT_ADDRESS`; its host root views are
+        // then ours alone, `SLOT_MEMORY` and `SLOT_FAULTS`).
+        use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, USER_ROOT_ADDRESS};
+        let ours = |slot: u8| slot == SLOT_MEMORY || slot == SLOT_FAULTS || slot == SLOT_STRIDES;
+        let mut slots: Vec<u8> = Vec::new();
+        let bound = stage.root_srvs.iter().chain(&stage.root_uavs).map(|&(slot, _)| slot);
+        let by_address = stage
+            .translated()
+            .host
+            .user_data
+            .iter()
+            .filter(|u| u.root == RootType::Other(USER_ROOT_ADDRESS))
+            .map(|u| u.slot);
+        for slot in bound.chain(by_address) {
+            if !ours(slot) && !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+        let &[a, b] = &slots[..] else {
             return refuse(
-                "not one root SRV and one root UAV",
-                format!("srvs {:?} uavs {:?}", stage.root_srvs, stage.root_uavs),
+                "not two root views of the title",
+                format!(
+                    "slots {slots:?} srvs {:?} uavs {:?} words {:?}",
+                    stage.root_srvs,
+                    stage.root_uavs,
+                    stage.translated().host.user_data.iter().map(|u| (u.root, u.slot, u.dword)).collect::<Vec<_>>()
+                ),
             );
         };
         let roots = self.roots_ref(true);
-        match (roots.get(usize::from(*srv)), roots.get(usize::from(*uav))) {
+        match (roots.get(usize::from(a)), roots.get(usize::from(b))) {
             (Some(Root::View(a)), Some(Root::View(b))) if a == b => true,
             (Some(Root::View(a)), Some(Root::View(b))) => {
                 refuse("source and destination differ", format!("{a:#x} {b:#x}"))
             }
-            (a, b) => refuse("a root view not set", format!("srv {a:?} uav {b:?}")),
+            (x, y) => refuse("a root view not set", format!("slots {a} {b}: {x:?} {y:?}")),
         }
     }
 
