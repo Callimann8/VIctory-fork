@@ -5753,7 +5753,7 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + self.sweep_every_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
@@ -10190,6 +10190,40 @@ impl Host {
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
+    /// How long between sweeps made behind flights ([`late_free_present`]).
+    /// Each settles everything in the air first, and that frame took 36 to
+    /// 82 ms instead of ~31 on an RTX 5070 Ti: at every 1.5 s, the 0.7
+    /// frames a second over 50 ms that made the prison stutter; without
+    /// sweeps, none. So while memory is not pressed they come every
+    /// `VICTORY_SWEEP_EVERY_MS` (15,000 by default; 1,500 as before), and
+    /// every 1.5 s while it is: the PC's memory under the residency
+    /// thresholds ([`crate::residency::pressured`]) or the card's use over
+    /// 97% of its budget (the texture pool fills it to about nine tenths by
+    /// design: 10.2 of 11.0 GB in the cell). Looked at twice a second.
+    fn sweep_every_ms(&self) -> u64 {
+        const PRESSED_MS: u64 = 1500;
+        static EVERY: OnceLock<u64> = OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_SWEEP_EVERY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(15_000)
+        });
+        if every <= PRESSED_MS {
+            return every;
+        }
+        static LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let now = now_ms();
+        if now >= LOOKED.load(Ordering::Relaxed) + 500 {
+            LOOKED.store(now, Ordering::Relaxed);
+            crate::residency::refresh();
+            let card = self.video_memory().is_none_or(|[budget, used, ..]| used > budget / 100 * 97);
+            let pressed = crate::residency::pressured() || card;
+            if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
+                tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
+            }
+        }
+        if PRESSED.load(Ordering::Relaxed) { PRESSED_MS } else { every }
+    }
+
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
