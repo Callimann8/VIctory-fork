@@ -1317,6 +1317,13 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
+    // With `VICTORY_GUARD_FAST` a block can be left read-only with no guard
+    // noted (a race that the fault handler's orphan opening covers for
+    // writes by code); a kernel write does not fault into the handler, so
+    // read-only view blocks there are opened now.
+    if guard_fast() {
+        open_orphans(at, at.saturating_add(len));
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1644,6 +1651,49 @@ fn open_orphan(g: &mut Guards, at: usize) -> bool {
     g.clean.remove(&block);
     ORPHANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// For [`writing`] with [`guard_fast`]: opens every read-only block of
+/// mapped view memory in `[start, end)` that no guard holds, noting it
+/// written (as [`open_orphan`] does for a fault). Walks the regions
+/// Windows reports, so a long range of other memory costs a few questions.
+fn open_orphans(start: usize, end: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    let mut at = start;
+    let mut asked = 0;
+    while at < end && asked < 4096 {
+        asked += 1;
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return;
+        }
+        let base = info.BaseAddress as usize;
+        let next = base.saturating_add(info.RegionSize);
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READONLY {
+            let mut g = guards();
+            let (from, to) = ((base.max(start)) / BLOCK, next.min(end).div_ceil(BLOCK));
+            for block in from..to {
+                if g.protected.contains(&block) {
+                    continue;
+                }
+                let mut old = 0;
+                // SAFETY: a title view block read-only by a guard of ours
+                // whose bookkeeping was lost; only its protection changes.
+                if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0 {
+                    g.clean.remove(&block);
+                    ORPHANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        if next <= at {
+            return;
+        }
+        at = next;
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
