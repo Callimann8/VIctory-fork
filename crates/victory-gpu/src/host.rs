@@ -3480,10 +3480,6 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     spans
 }
 
-/// `VICTORY_SETTLE_STALE=1` (after Belobug 007fe55): for title memory changed
-/// under shader writes, wait only until no flight in the air may still
-/// write the stale spans, ask again and look again (three times), and only
-/// then settle everything as before.
 /// `VICTORY_SYNC_SNAPSHOT=1`: changed bytes of copies in the card's memory go
 /// up from a per-submission snapshot, not from the CPU side at the time the
 /// card runs the copy (which later merges may have changed already).
@@ -3496,13 +3492,6 @@ fn sync_snapshot() -> u8 {
 
 /// Bytes put in [`sync_snapshot`] buffers since the last frame-rate line.
 static SNAPSHOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-static SETTLE_STALE_SPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn settle_stale_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_STALE").is_some_and(|v| v == "1"))
-}
 
 /// With [`late_exact`]: the most changed runs one submission sends up to
 /// copies in the card's memory in place of a settle
@@ -3537,20 +3526,6 @@ pub(crate) fn merge_pages_stage() -> u8 {
             return 0;
         }
         std::env::var("VICTORY_MERGE_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    })
-}
-
-/// Most changed runs one page may have to be merged under shader writes
-/// (`VICTORY_MERGE_PAGE_RUNS`; no limit by default): a page past it (the
-/// game rewriting most of a page) settles the flights as before, so dense
-/// pages can be kept apart from sparse ones in tests.
-pub(crate) fn merge_page_runs() -> usize {
-    static RUNS: OnceLock<usize> = OnceLock::new();
-    *RUNS.get_or_init(|| {
-        std::env::var("VICTORY_MERGE_PAGE_RUNS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(usize::MAX)
     })
 }
 
@@ -4083,12 +4058,6 @@ fn late_line(frames: f64) {
             CARD_COPY_REFUSED[1].swap(0, Ordering::Relaxed) as f64 / frames,
             CARD_COPY_REFUSED[2].swap(0, Ordering::Relaxed) as f64 / frames,
             CARD_COPY_REFUSED[3].swap(0, Ordering::Relaxed) as f64 / frames
-        );
-    }
-    if settle_stale_on() {
-        tracing::info!(
-            "settles under shader writes spared per frame (VICTORY_SETTLE_STALE=1): {:.2}",
-            SETTLE_STALE_SPARED.swap(0, Ordering::Relaxed) as f64 / frames
         );
     }
 }
@@ -6211,28 +6180,13 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     /// For a submission of `runs` whose refreshes leave `stale` spans
-    /// behind ([`stale_under_flights`]): with [`settle_stale_on`] (and
-    /// [`relay_exact`]) only the flights that may write those spans land
-    /// first, up to three times; what is left settles everything. The
-    /// submission's asking (`ranges`) is made again after each.
+    /// behind ([`stale_under_flights`]): everything settles, and the
+    /// submission's asking (`ranges`) is made again.
     fn settle_stale(
         &self,
         submitted: &mut u64,
-        runs: &[&HostList],
-        mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
-        if settle_stale_on() && relay_exact() {
-            for _ in 0..3 {
-                relay_wait(WHY_STALE, |line| stale.iter().all(|(_, from, to)| !touches(&line.written, *from, *to)));
-                crate::watch::ask_once(ranges);
-                stale = stale_under_flights(runs);
-                if stale.is_empty() {
-                    SETTLE_STALE_SPARED.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            }
-        }
         self.settle(submitted, WHY_STALE);
         crate::watch::ask_once(ranges);
     }
@@ -6475,7 +6429,7 @@ impl Host {
             let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(&mut submitted, &ranges);
                 settled += settling.elapsed();
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
