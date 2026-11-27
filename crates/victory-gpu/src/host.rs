@@ -3674,6 +3674,35 @@ fn land() {
     }
 }
 
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: caller owns the event and fence for the entire wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3713,9 +3742,7 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
-            }
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3857,6 +3884,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("relay fence reported device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3879,14 +3910,7 @@ fn relay_worker() {
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -4373,6 +4397,7 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        crate::census::made(8, 0);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -4750,6 +4775,15 @@ impl Host {
                 }
             }
         }
+        // Experiment (`VICTORY_SKIP_WC_COMPARE=1`): copies of write-combining
+        // title memory are left out of the hashing and the compare; nothing
+        // of them is fetched back. Pending ranges are still closed by the
+        // flights' own declared writes (`declared_writes`).
+        if crate::census::skip_wc_compare() {
+            let before = declared.len();
+            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
+        }
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5026,6 +5060,11 @@ impl Host {
                             list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
                             list.Dispatch(groups.div_ceil(64), 1, 1);
                         }
+                        crate::census::sent(
+                            shadow.title_start(),
+                            ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
+                            ranges.len() as u64,
+                        );
                         let Some(before) = before else {
                             if state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
                                 // Back to where the lists find it.
@@ -5418,12 +5457,16 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
+                        if lo < hi
+                            && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
+                            && seen.insert((copy, lo, hi))
+                        {
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
                 }
             }
         }
@@ -5576,6 +5619,11 @@ impl Host {
             CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            if crate::census::on() {
+                for (shadow, lo, hi, _) in &pieces {
+                    crate::census::fetched(shadow.title_start(), (hi - lo) as u64);
+                }
+            }
         }
         let mut title = Vec::new();
         let mut written = 0;
@@ -5727,11 +5775,14 @@ impl Host {
             // copy into it ran in the plan's flight, which the card has run.
             let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
             written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
+            let landed = gpu.len() as u64;
+            bytes += landed;
+            crate::census::fetched(shadow.title_start(), landed);
         }
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
             }
         }
         copy_back(1, written as u64);
@@ -5901,12 +5952,16 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            crate::census::compared(r.shadow.title_start(), u64::from(r.span.pieces));
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -5968,6 +6023,11 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if crate::census::on() {
+                    for &(i, lo, hi, _) in &pieces {
+                        crate::census::fetched(plan.ranges[i].shadow.title_start(), (hi - lo) as u64);
+                    }
+                }
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
@@ -7293,10 +7353,21 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // A target whose ticket went stale (the title reused or remapped the
+        // memory it tiles into) must be re-registered, or the read-back
+        // would be dropped as one of memory the texture no longer holds.
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -7321,6 +7392,24 @@ impl HostList {
             u.writing = false;
             u.behind[0] = Some(true);
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -8772,6 +8861,7 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(0, size);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
@@ -8811,6 +8901,7 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(1, size);
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9616,6 +9707,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        crate::census::made(2, size);
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9668,6 +9760,7 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        crate::census::made(3, size);
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
