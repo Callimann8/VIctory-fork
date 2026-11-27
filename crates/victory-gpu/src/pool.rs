@@ -636,10 +636,12 @@ fn where_the_card_reads(heap: &ID3D12Heap, texture: &ID3D12Resource, piece: Piec
     }
 }
 
-/// Textures made in the last second ([`fresh`]), and when.
+/// Textures made in the last second ([`fresh`]), and when: those cut from a
+/// block, and those past [`most`] with memory of their own ([`own`]).
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
 
-/// Whether `texture` was made in a block in the last second.
+/// Whether `texture` was made in the last second, in a block or past
+/// [`most`] with memory of its own.
 pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
     let raw = texture.as_raw() as usize;
     let since = now().saturating_sub(1000);
@@ -742,6 +744,15 @@ pub(crate) unsafe fn own(device: &ID3D12Device, texture: &ID3D12Resource, desc: 
     OWN[2].fetch_add(1, Ordering::Relaxed);
     OWN[3].fetch_add(info.SizeInBytes, Ordering::Relaxed);
     give_back_with(texture, Piece { block: NO_BLOCK, start: 0, len: info.SizeInBytes });
+    // New as one cut from a block is: its first upload may go ahead on the
+    // copy queue (`crate::texture::ahead`), and its slots are shown after
+    // that upload and after the lists sent before it (`VICTORY_SHOW_AFTER`,
+    // `VICTORY_SHOW_NEW_LATER`), which all ask [`fresh`] and
+    // [`begun_before`]. Run A4 (2026-11-27) left this out: the uploads of
+    // some 1,200 such textures went into the frames' lists, the lit cell
+    // took 115 ms where run A2 took 80, and a face of the intro was black
+    // in one picture.
+    made_now(texture);
 }
 
 /// For the memory line: the blocks of textures by how full they are, their
