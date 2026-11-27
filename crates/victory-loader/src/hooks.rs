@@ -71,21 +71,6 @@ pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
 
-/// Environment variable that makes the title take its FSR path on every
-/// console profile (Series X otherwise picks its own upscaler), so its upscale
-/// goes through `ffxDispatch`, where the layer can do it (stretch or DLSS).
-/// LOCAL (claude/dlss-1440): the reverse of [`OWN_UPSCALER_ENV`].
-pub(crate) const FSR_UPSCALER_ENV: &str = "VICTORY_FSR_UPSCALER";
-
-/// The upscaler choice again: `cmovne eax, ecx` made `mov eax, ecx` + `nop`,
-/// so the FSR value in ecx is taken whatever the profile asks.
-const FSR_UPSCALER: Patch<'static> = Patch {
-    what: "upscaler: always FSR (ffxDispatch)",
-    rva: 0x7e9426,
-    expect: &[0x0F, 0x45, 0xC1],
-    new: &[0x89, 0xC8, 0x90],
-};
-
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
     what: &'static str,
@@ -186,8 +171,7 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
-    let fsr = !own && std::env::var_os(FSR_UPSCALER_ENV).is_some_and(|v| v != "0");
-    if scale.is_none() && !own && !fsr {
+    if scale.is_none() && !own {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -200,10 +184,6 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     if own {
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
-    }
-    if fsr {
-        // SAFETY: forwarded from this function's contract.
-        applied += usize::from(unsafe { apply(base, &FSR_UPSCALER) });
     }
     if let Some(text) = scale {
         match parse_scale(&text) {
