@@ -578,26 +578,6 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
-    /// With [`guard_hot`]: per block guarded again after a write, the
-    /// frame of that and how many frames in a row it was written.
-    heat: BTreeMap<usize, (u64, u32)>,
-    /// Blocks written so many frames in a row that they are no longer
-    /// guarded ([`guard_hot`]), with the frame they became so.
-    hot: BTreeMap<usize, u64>,
-}
-
-/// `VICTORY_GUARD_HOT=N` (off by default): a block of view memory written
-/// in N frames in a row stops being guarded. It is left writable and
-/// reported written at every asking, so its copies take it every time,
-/// as they did anyway with it written every frame; what goes is the
-/// fault that opened it (on the title's thread) and the `VirtualProtect`
-/// that guarded it again (on ours), some 2,500 a frame in the cell.
-/// After [`HOT_FRAMES`] frames it is guarded again, to see whether it
-/// still is written so often. Blocks whose pages have other views are
-/// never left unguarded: a write through this view must open those.
-fn guard_hot() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 /// Where the guards' time goes, in microseconds and counts since the last
@@ -652,14 +632,6 @@ fn guard_times_line() {
     );
 }
 
-/// How long a block stays unguarded ([`guard_hot`]).
-const HOT_FRAMES: u64 = 60;
-
-/// Diagnostics of [`guard_hot`] since the start: blocks that became hot,
-/// blocks guarded again after their time, pages reported written for hot
-/// blocks.
-pub(crate) static HOT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
 /// Whether a block once guarded stays known as view memory while its
 /// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default).
 ///
@@ -707,8 +679,6 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
-    heat: BTreeMap::new(),
-    hot: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -736,7 +706,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
         let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first)) || g.hot.contains_key(&first)
+        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
     };
     let whole = std::time::Instant::now();
     guard_times_line();
@@ -771,8 +741,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
-    let hot_n = guard_hot();
-    let frame = if hot_n > 0 { crate::frame::current() } else { 0 };
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -790,15 +758,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 g.absent.remove(&block);
             }
         }
-        if open && hot_n > 0 && !g.protected.contains(&block) && hot_block(&mut g, block, frame, hot_n) {
-            // Unguarded: written as far as anyone knows, nothing to guard.
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            HOT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(from) = run.take() {
-                protect(&mut g, from, block);
-            }
-            continue;
-        }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -814,43 +773,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
-}
-
-/// [`guard_hot`] for a written, unguarded block about to be guarded
-/// again: whether it stays unguarded (hot) instead.
-fn hot_block(g: &mut Guards, block: usize, frame: u64, n: u32) -> bool {
-    if let Some(&since) = g.hot.get(&block) {
-        // Its time is up, or another view of its pages appeared.
-        if frame >= since + HOT_FRAMES || crate::inplace::pages_of(block * BLOCK).len() >= 2 {
-            g.hot.remove(&block);
-            g.heat.remove(&block);
-            HOT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return false;
-        }
-        return true;
-    }
-    let heat = g.heat.entry(block).or_insert((frame, 0));
-    if heat.0 + 1 == frame {
-        heat.1 += 1;
-    } else if heat.0 != frame || heat.1 == 0 {
-        heat.1 = 1;
-    }
-    heat.0 = frame;
-    if heat.1 >= n && !g.aliased.contains(&block) && crate::inplace::pages_of(block * BLOCK).len() < 2 {
-        g.hot.insert(block, frame);
-        let n = HOT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::info!(
-                became_hot = n,
-                guarded_again = HOT[1].load(std::sync::atomic::Ordering::Relaxed),
-                hot_now = g.hot.len(),
-                pages_reported_hot = HOT[2].load(std::sync::atomic::Ordering::Relaxed),
-                "blocks of view memory written frame after frame are left unguarded (VICTORY_GUARD_HOT)"
-            );
-        }
-        return true;
-    }
-    false
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -1314,17 +1236,6 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
-    }
-    if !g.hot.is_empty() || !g.heat.is_empty() {
-        let blocks = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-        let hot: Vec<usize> = g.hot.range(blocks.clone()).map(|(&b, _)| b).collect();
-        for block in hot {
-            g.hot.remove(&block);
-        }
-        let heat: Vec<usize> = g.heat.range(blocks).map(|(&b, _)| b).collect();
-        for block in heat {
-            g.heat.remove(&block);
-        }
     }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
