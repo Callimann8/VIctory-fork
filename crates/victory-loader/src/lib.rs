@@ -36,6 +36,10 @@ mod thunks;
 mod tls;
 #[cfg(windows)]
 mod windows;
+// Title patches for the 1.0.2.1 executable (render scale, upscaler choice, watchdog), from
+// pepezin-ai/VIctory-NVIDIA (victory-perf / ScarlettPort, GPL-3.0-or-later); opt-in, byte-checked.
+#[cfg(windows)]
+mod hooks;
 
 #[cfg(windows)]
 pub use crash::{
