@@ -2845,8 +2845,9 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// destination's host copy by a list of ours ahead of the submission's
 /// lists, and into a read-back buffer whose bytes go to title memory when
 /// the flight lands (until then the range counts as written by flights, so
-/// what reads it on the CPU waits). Only when both are copies in the card's
-/// memory, the copy is at most 64 KiB, the submission runs no title work
+/// what reads it on the CPU waits). Either copy may be in the card's memory
+/// or in PC memory the card reads and writes (OV11: the source, 14 KiB,
+/// is below the card's least size). Only when the copy is at most 64 KiB, the submission runs no title work
 /// and no other step of it touches the destination. Needs the relay's
 /// second stage.
 ///
@@ -2929,7 +2930,7 @@ fn take_card_copies(runs: &[&HostList], written: &[(usize, usize)]) {
             };
             let holds = |shadow: &crate::shadow::Shadow, a: usize| {
                 let (start, n) = shadow.span();
-                shadow.carded() && start as usize <= a && a + len <= (start + n) as usize
+                start as usize <= a && a + len <= (start + n) as usize
             };
             if std::sync::Arc::ptr_eq(&from, &to) || !holds(&from, src) || !holds(&to, dst) {
                 continue;
