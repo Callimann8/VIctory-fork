@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod defaults;
 mod inspect;
 mod run;
 mod shader;
@@ -129,7 +130,14 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // SAFETY: the first thing the process does, before any thread is made.
+    let given = unsafe { defaults::apply() };
     victory_core::logging::init("info");
+    match &given {
+        Some(given) if given.is_empty() => {}
+        Some(given) => eprintln!("switches       set by the environment, not the built-in main values: {}", given.join(" ")),
+        None => eprintln!("switches       VICTORY_DEFAULTS=0: none of the main build's switches are set"),
+    }
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
