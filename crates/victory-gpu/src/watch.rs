@@ -584,6 +584,49 @@ struct Guards {
     /// Blocks written so many frames in a row that they are no longer
     /// guarded ([`guard_hot`]), with the frame they became so.
     hot: BTreeMap<usize, u64>,
+    /// With [`rest`]: blocks a write fault of the title opened, and when.
+    opened: BTreeMap<usize, std::time::Instant>,
+}
+
+impl Guards {
+    /// Whether `block` is left open for now: the title has just written it.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault of the title opened `block`.
+    fn opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+}
+
+/// `VICTORY_GUARD_REST=<microseconds>` (off by default; 3000 is the value
+/// of the 7900 XTX fork, where it is on): a block a write fault of the
+/// title opened is not made read-only again by a refresh within that time.
+/// It counts as written at each asking meanwhile, so nothing is missed;
+/// the first asking after its rest guards it again.
+///
+/// There, 220 of a frame's 586 faults came within 3 ms of a refresh making
+/// the block read-only while the title was still writing it, up to a dozen
+/// times a frame: each a fault on the title's thread, a wait for the
+/// guards' lock and a `VirtualProtect` on ours (avatarmanz/VIctory-7900XTX,
+/// via pepezin-ai/VIctory-NVIDIA `watch.rs`).
+fn rest() -> std::time::Duration {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_micros(*US.get_or_init(|| {
+        let us = std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if us > 0 {
+            tracing::warn!(us, "VICTORY_GUARD_REST: blocks the title just wrote stay open that long");
+        }
+        us
+    }))
 }
 
 /// `VICTORY_GUARD_HOT=N` (off by default): a block of view memory written
@@ -638,7 +681,7 @@ fn guard_times_line() {
     let ms = |x: f64| x / 1000.0;
     tracing::info!(
         "guard times per frame: {:.0} asks, {:.1} ms in all ({:.1} lock wait, {:.1} clean blocks, {:.1} is-view questions, {:.1} making read-only of which {:.1} other views; {:.0} blocks in {:.0} calls); \
-         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={})",
+         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={}); {:.0} blocks left open resting (VICTORY_GUARD_REST)",
         v[0],
         ms(v[11]),
         ms(v[1]),
@@ -655,6 +698,7 @@ fn guard_times_line() {
         ms(v[13]),
         ms(v[14]),
         u8::from(guard_fast()),
+        RESTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
     );
 }
 
@@ -715,6 +759,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     heat: BTreeMap::new(),
     hot: BTreeMap::new(),
+    opened: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -730,6 +775,9 @@ pub(crate) fn clean(page: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+/// Blocks [`rest`] left open at an asking (count).
+pub(crate) static RESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
@@ -783,6 +831,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     let hot_n = guard_hot();
+    let rest = rest();
     let frame = if hot_n > 0 { crate::frame::current() } else { 0 };
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
@@ -815,9 +864,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.rests(block, rest) {
                 run.get_or_insert(block);
                 continue;
+            } else {
+                RESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if let Some(from) = run.take() {
@@ -1570,6 +1621,9 @@ fn install() {
         gt(10, began.elapsed().as_micros() as u64);
         let _t = Timed(9, began);
         if open(&mut g, at, at + 1) {
+            if !rest().is_zero() {
+                g.opened(at / BLOCK);
+            }
             gt(8, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
