@@ -7768,6 +7768,11 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // A window in write-combining title memory: the title's CPU does not
+        // read it back (`VICTORY_SKIP_WC_WINDOWS=1`, experiment).
+        if shadow.is_window() && !shadow.carded() && crate::census::skip_window_write(address, len) {
+            return;
+        }
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));

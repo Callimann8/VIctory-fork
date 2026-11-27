@@ -115,6 +115,49 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// `VICTORY_SKIP_WC_WINDOWS=1` (LOCAL, claude/dlss-1440; off by default):
+/// shader writes to windows outside buffers (copies in the PC's memory,
+/// mostly the ray tracing's memory by address) that lie wholly in
+/// write-combining title memory are not declared at all: no snapshot before
+/// the submission, no compare and no copy back after it. The title's CPU
+/// does not read write-combining memory it gave the GPU (the same bet as
+/// [`skip_wc_back`] for buffers' card copies, there with a floor of 8 MiB).
+/// With ray tracing on, the CPU compared ~144 MB of such windows a frame
+/// (run S1080), part of ~45 ms of preparing and ~40 ms of copy-back.
+pub(crate) fn skip_wc_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SKIP_WC_WINDOWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_SKIP_WC_WINDOWS=1: shader writes to write-combining windows are NOT copied back (experiment)");
+        }
+        on
+    })
+}
+
+/// Windows' declared writes left out by [`skip_window_write`]: count and bytes.
+static SKIPPED_WINDOWS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Whether a declared shader write `[address, address + len)` of a window
+/// outside buffers is left out ([`skip_wc_windows`]).
+pub(crate) fn skip_window_write(address: usize, len: usize) -> bool {
+    if !skip_wc_windows() || len == 0 {
+        return false;
+    }
+    let Some(end) = address.checked_add(len) else { return false };
+    if !all_wc(&[(address, end)]) {
+        return false;
+    }
+    use std::sync::atomic::Ordering;
+    let n = SKIPPED_WINDOWS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let b = SKIPPED_WINDOWS[1].fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+    if n.is_power_of_two() {
+        tracing::info!("VICTORY_SKIP_WC_WINDOWS: {n} declared window writes ({} MB) of write-combining memory left out so far", b >> 20);
+    }
+    true
+}
+
 /// The smallest host copy whose pieces [`skip_back`] leaves on the card
 /// (`VICTORY_SKIP_WC_BACK_MIN_KB`, 1024 KiB). With every title buffer's copy
 /// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`, a Yuriko default)
