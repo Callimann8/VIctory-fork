@@ -3946,6 +3946,16 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    if crate::shadow::land_wide() {
+        let written = crate::shadow::relay_merge_wide(&work, found);
+        for ((_, from, to), written) in work.iter().zip(written) {
+            copy_back(1, written as u64);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::compared(*from, to - from, written);
+            let _ = (from, to);
+        }
+        return;
+    }
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
@@ -4296,6 +4306,19 @@ fn hand_back(back: &[Declared]) {
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+        if crate::shadow::land_wide() {
+            let written = crate::shadow::copy_back_wide(&work, found);
+            for ((_, from, to), written) in work.iter().zip(written) {
+                copy_back(1, written as u64);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+                let _ = (from, to);
+            }
+            for (shadow, declared) in back {
+                shadow.copy_back_done(declared);
+            }
+            return;
+        }
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             copy_back(1, written as u64);
