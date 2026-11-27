@@ -16,7 +16,6 @@ pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
-pub mod ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;

@@ -85,12 +85,6 @@ mod texture;
 mod watch;
 #[cfg(windows)]
 mod texback;
-// The title's upscale in place of its FidelityFX passes: a stretch, or DLSS
-// (`VICTORY_UPSCALE=stretch|dlss`, claude/dlss-1440, from pepezin-ai/VIctory-NVIDIA).
-#[cfg(windows)]
-mod stretch;
-#[cfg(all(windows, feature = "dlss"))]
-mod dlss;
 
 #[cfg(windows)]
 pub use host::on_failure;
