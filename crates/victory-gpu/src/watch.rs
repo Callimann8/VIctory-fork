@@ -607,10 +607,8 @@ fn guard_hot() -> u32 {
 /// [5] of that, their other views, [6] blocks made read-only, [7]
 /// `VirtualProtect` calls for them, [8] faults taken, [9] the faults'
 /// time on the title's threads (lock wait and opening), [10] of that,
-/// waiting for the lock, [11] the whole of `guard`, [12] questions whether
-/// absent blocks are committed now, [13] their time, [14] the time `guard`
-/// held the lock.
-pub(crate) static GUARD_TIME: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
+/// waiting for the lock, [11] the whole of `guard`.
+pub(crate) static GUARD_TIME: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Adds the time since it was made to [`GUARD_TIME`]`[.0]` when dropped.
 struct Timed(usize, std::time::Instant);
@@ -638,7 +636,7 @@ fn guard_times_line() {
     let ms = |x: f64| x / 1000.0;
     tracing::info!(
         "guard times per frame: {:.0} asks, {:.1} ms in all ({:.1} lock wait, {:.1} clean blocks, {:.1} is-view questions, {:.1} making read-only of which {:.1} other views; {:.0} blocks in {:.0} calls); \
-         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={})",
+         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait)",
         v[0],
         ms(v[11]),
         ms(v[1]),
@@ -651,10 +649,6 @@ fn guard_times_line() {
         v[8],
         ms(v[9]),
         ms(v[10]),
-        v[12],
-        ms(v[13]),
-        ms(v[14]),
-        u8::from(guard_fast()),
     );
 }
 
@@ -756,15 +750,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     install();
-    if guard_fast() {
-        let _whole = Timed(11, whole);
-        return Some(guard_fast_held(start, end));
-    }
     let waited = std::time::Instant::now();
     let mut g = guards();
     gt(1, waited.elapsed().as_micros() as u64);
     let _whole = Timed(11, whole);
-    let _held = Timed(14, std::time::Instant::now());
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -825,168 +814,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     Some(written)
-}
-
-/// `VICTORY_GUARD_FAST=1` (off by default; needs the orphan opening,
-/// `VICTORY_GUARD_ORPHANS`, which is on by default): [`guard`] holds the
-/// guards' lock only to read and note, and makes blocks read-only (and
-/// their other views) with the lock released.
-///
-/// In CG1 `guard` held the lock some 35 ms a frame, 16 of them in
-/// `VirtualProtect` and the look at other views, and the title's threads
-/// waited 42-45 ms a frame for it in the fault handler. Now a block to
-/// guard is noted guarded and clean first, then made read-only. A write
-/// between the two does not fault, but it comes before the caller's copy,
-/// which takes it. A fault elsewhere that opens the block in between (as
-/// another view of written pages) leaves it read-only and unknown once our
-/// `VirtualProtect` lands: its next write faults and the orphan opening
-/// opens it and notes it written. A block that will not be made read-only
-/// is un-noted and handled as before (absent, or left written).
-fn guard_fast() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_FAST").is_some_and(|v| v == "1") && orphan_opens())
-}
-
-/// The loop of [`guard`] for [`guard_fast`]: the written pages.
-fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let mut written = Vec::new();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Runs of blocks noted guarded here, to make read-only after.
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    {
-        let waited = std::time::Instant::now();
-        let mut g = guards();
-        gt(1, waited.elapsed().as_micros() as u64);
-        let _held = Timed(14, std::time::Instant::now());
-        let reading = std::time::Instant::now();
-        let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-        gt(2, reading.elapsed().as_micros() as u64);
-        if clean.len() == last - first {
-            return written;
-        }
-        let mut next_clean = 0;
-        let mut uncommitted_until = first;
-        let mut run: Option<usize> = None;
-        let known = view_known();
-        let note = |g: &mut Guards, from: usize, to: usize, runs: &mut Vec<(usize, usize)>| {
-            g.protected.extend(from..to);
-            g.clean.extend(from..to);
-            if known {
-                g.viewed.extend(from..to);
-            }
-            runs.push((from, to));
-        };
-        for block in first..=last {
-            while next_clean < clean.len() && clean[next_clean] < block {
-                next_clean += 1;
-            }
-            let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-            let mut open = block < last && !is_clean;
-            if open && g.absent.contains(&block) {
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                }
-                open = block >= uncommitted_until;
-                if open {
-                    g.absent.remove(&block);
-                }
-            }
-            if open {
-                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                if g.protected.contains(&block) {
-                    g.clean.insert(block);
-                } else {
-                    run.get_or_insert(block);
-                    continue;
-                }
-            }
-            if let Some(from) = run.take() {
-                note(&mut g, from, block, &mut runs);
-            }
-        }
-    }
-    if runs.is_empty() {
-        return written;
-    }
-    let started = std::time::Instant::now();
-    let _t = Timed(4, started);
-    let set = |from: usize, to: usize| {
-        gt(7, 1);
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0 }
-    };
-    for &(from, to) in &runs {
-        gt(6, (to - from) as u64);
-        if set(from, to) {
-            continue;
-        }
-        // Not all of it: un-noted, and block by block as before.
-        let mut g = guards();
-        for block in from..to {
-            g.protected.remove(&block);
-            g.clean.remove(&block);
-            g.viewed.remove(&block);
-        }
-        protect_here(&mut g, from, to);
-    }
-    if !view_guard() {
-        return written;
-    }
-    let _a = Timed(5, std::time::Instant::now());
-    // Their other views: looked up with the lock released, noted guarded
-    // (not clean) under it, made read-only after.
-    let mut shown_by: Vec<(usize, Vec<usize>)> = Vec::new();
-    for &(from, to) in &runs {
-        for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-            let a = (base / BLOCK).max(from);
-            let b = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-            for block in a..b {
-                let shown = crate::inplace::pages_of(block * BLOCK);
-                if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                    continue;
-                }
-                shown_by.push((block, shown));
-            }
-        }
-    }
-    if shown_by.is_empty() {
-        return written;
-    }
-    let mut to_set = Vec::new();
-    {
-        let mut g = guards();
-        let known = view_known();
-        for (block, shown) in &shown_by {
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for &alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != *block && g.protected.insert(alias) {
-                    if known {
-                        g.viewed.insert(alias);
-                    }
-                    to_set.push(alias);
-                }
-            }
-        }
-    }
-    let mut failed = Vec::new();
-    for &alias in &to_set {
-        if !set(alias, alias + 1) {
-            failed.push(alias);
-        }
-    }
-    if !failed.is_empty() {
-        let mut g = guards();
-        for alias in failed {
-            g.protected.remove(&alias);
-            g.viewed.remove(&alias);
-        }
-    }
-    written
 }
 
 /// [`guard_hot`] for a written, unguarded block about to be guarded
@@ -1201,8 +1028,6 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
-    let _t = Timed(13, std::time::Instant::now());
-    gt(12, 1);
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
