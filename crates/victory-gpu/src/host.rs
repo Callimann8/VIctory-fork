@@ -10197,9 +10197,12 @@ impl Host {
     /// sweeps, none. So while memory is not pressed they come every
     /// `VICTORY_SWEEP_EVERY_MS` (15,000 by default; 1,500 as before), and
     /// every 1.5 s while it is: the PC's memory under the residency
-    /// thresholds ([`crate::residency::pressured`]) or the card's use over
-    /// 97% of its budget (the texture pool fills it to about nine tenths by
-    /// design: 10.2 of 11.0 GB in the cell). Looked at twice a second.
+    /// thresholds ([`crate::residency::pressured`]) or the card's use (less
+    /// the texture pool's free part) at the line textures are made up to
+    /// ([`crate::resource::room_line`]): textures are held back for room
+    /// then, and the sweep is what lets idle ones go (at 97% of the budget
+    /// instead, ~150,000 slots were held back a 5 s line for a minute of the
+    /// cutscene). Looked at twice a second.
     fn sweep_every_ms(&self) -> u64 {
         const PRESSED_MS: u64 = 1500;
         static EVERY: OnceLock<u64> = OnceLock::new();
@@ -10215,7 +10218,11 @@ impl Host {
         if now >= LOOKED.load(Ordering::Relaxed) + 500 {
             LOOKED.store(now, Ordering::Relaxed);
             crate::residency::refresh();
-            let card = self.video_memory().is_none_or(|[budget, used, ..]| used > budget / 100 * 97);
+            // The card past the line textures are made up to: textures are
+            // held back for room, and it is the sweep that lets idle ones go.
+            let card = self
+                .video_memory()
+                .is_none_or(|[budget, used, ..]| used.saturating_sub(crate::pool::texture_room()) >= crate::resource::room_line(budget));
             let pressed = crate::residency::pressured() || card;
             if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
                 tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
