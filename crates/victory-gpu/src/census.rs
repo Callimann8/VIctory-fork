@@ -130,12 +130,31 @@ fn skip_back_least() -> u64 {
     })
 }
 
+/// `VICTORY_SKIP_WC_BACK_KEEP`: title addresses (hex, comma separated); a
+/// host copy holding one of them always comes back. For finding the copies
+/// whose card writes the title's CPU does read (the census lists them).
+fn kept(start: u64, copy: u64) -> bool {
+    static KEEP: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let keep = KEEP.get_or_init(|| {
+        let list: Vec<u64> = std::env::var("VICTORY_SKIP_WC_BACK_KEEP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if !list.is_empty() {
+            tracing::warn!("VICTORY_SKIP_WC_BACK_KEEP: copies holding {list:x?} always come back");
+        }
+        list
+    });
+    keep.iter().any(|&a| start <= a && a < start.saturating_add(copy))
+}
+
 /// A flagged piece is clipped to its declaration. Keep every piece of a
 /// mixed declaration so the normal read-back covers it in full. `copy`: the
 /// bytes of the host copy the piece is in; a copy under
 /// [`skip_back_least`] always comes back.
-pub(crate) fn skip_back(declared: (usize, usize), bytes: u64, copy: u64) -> bool {
-    if !skip_wc_back() || copy < skip_back_least() {
+pub(crate) fn skip_back(declared: (usize, usize), bytes: u64, start: u64, copy: u64) -> bool {
+    if !skip_wc_back() || copy < skip_back_least() || kept(start, copy) {
         return false;
     }
     let wc = all_wc(&[declared]);

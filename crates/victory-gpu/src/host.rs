@@ -5458,7 +5458,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
-                            && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
+                            && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.title_start(), r.shadow.span().1)
                             && seen.insert((copy, lo, hi))
                         {
                             pieces.push((r.shadow.clone(), lo, hi, total));
@@ -5953,7 +5953,7 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
-                    && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.span().1)
+                    && !crate::census::skip_back(r.declared, (hi - lo) as u64, r.shadow.title_start(), r.shadow.span().1)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));
