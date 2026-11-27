@@ -78,11 +78,6 @@ pub fn run(
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
         }
-        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-            && let Some(real) = dll.export("ffxCreateContext")
-        {
-            victory_hle::modules::ffx::set_real_create(real);
-        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -125,16 +120,6 @@ pub fn run(
             if ours {
                 return victory_loader::Resolution::Found {
                     address: victory_hle::modules::ffx::dispatch_address(),
-                    provenance: victory_loader::Provenance::Hle,
-                };
-            }
-            // The context too: the title's FSR4 refuses a 4K output (Series X) at creation.
-            let create = self.1
-                && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
-                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxCreateContext");
-            if create {
-                return victory_loader::Resolution::Found {
-                    address: victory_hle::modules::ffx::create_context_address(),
                     provenance: victory_loader::Provenance::Hle,
                 };
             }
