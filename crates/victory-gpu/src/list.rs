@@ -852,6 +852,113 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// The title's upscale as its `ffxDispatch` asks for it (`victory_hle::modules::ffx`):
+/// title resources by address, and the numbers a temporal upscaler takes.
+/// LOCAL (claude/dlss-1440): from pepezin-ai/VIctory-NVIDIA, without its frame
+/// generation and its thin recording.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Upscale {
+    pub colour: u64,
+    pub depth: u64,
+    pub motion: u64,
+    pub exposure: u64,
+    pub output: u64,
+    pub render: [u32; 2],
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub reset: bool,
+    pub pre_exposure: f32,
+    pub near: f32,
+    pub far: f32,
+    pub frame_ms: f32,
+    /// DLSS asked for (`VICTORY_UPSCALE=dlss`); else a plain stretch.
+    pub dlss: bool,
+}
+
+/// The title's upscale in place of its own FidelityFX passes (which are not
+/// translated): DLSS if asked for and it can, else a plain stretch of the
+/// colour input over the output (`crate::stretch`). False if nothing could be
+/// recorded (the caller then passes the dispatch to the title's own DLL).
+#[cfg(windows)]
+pub fn upscale(this: *const std::ffi::c_void, up: &Upscale) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let this: This = this.cast();
+    if this.is_null() || up.colour == 0 || up.output == 0 {
+        return false;
+    }
+    let t = |a: u64| -> This { a as This };
+    let (colour, output) = (t(up.colour), t(up.output));
+    let mut done = false;
+    with_state(this, |list, state| {
+        let (Some(to), Some(from), Some(host)) = (
+            crate::resource::host_resource(output),
+            crate::resource::host_resource(colour),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        // An input the title fills itself is uploaded first, as for a copy.
+        if crate::texture::title_written(from) {
+            crate::texture::upload(list, colour, from);
+        }
+        crate::texture::card_writes(list, output, to, None);
+        ensure_state(list, colour, SHADER_READ);
+        ensure_state(list, output, UNORDERED);
+        #[cfg(feature = "dlss")]
+        if up.dlss {
+            let input = |a: u64| {
+                let r = t(a);
+                crate::resource::host_resource(r).inspect(|_| ensure_state(list, r, SHADER_READ))
+            };
+            let inputs = crate::dlss::Inputs {
+                colour: from,
+                depth: input(up.depth),
+                motion: input(up.motion),
+                exposure: input(up.exposure),
+                output: to,
+                jitter: up.jitter,
+                motion_scale: up.motion_scale,
+                render: up.render,
+                reset: up.reset,
+                pre_exposure: up.pre_exposure,
+                near: up.near,
+                far: up.far,
+                frame_ms: up.frame_ms,
+            };
+            done = crate::dlss::record(&host.device, &list.list, &inputs);
+        }
+        if !done {
+            done = crate::stretch::record_stretch(&host.device, &list.list, to, from, up.render);
+        }
+        if done {
+            crate::texture::host_written(output);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("upscale {colour:?} to {output:?} (render {:?}, dlss {})", up.render, up.dlss));
+        }
+        // The upscaler set its own heaps, root signature and pipeline: the title's again.
+        state.replay(list);
+    });
+    done
+}
+
+/// For the upscale probe (`VICTORY_UPSCALE_PROBE=1`): each title texture's
+/// host copy as `WxH fmt N` (DXGI format number), or `none`.
+#[cfg(windows)]
+pub fn upscale_inputs(textures: &[*const std::ffi::c_void]) -> Vec<String> {
+    textures
+        .iter()
+        .map(|&t| match crate::resource::host_resource(t.cast()) {
+            Some(r) => {
+                // SAFETY: a live host resource.
+                let d = unsafe { r.GetDesc() };
+                format!("{}x{} fmt {}", d.Width, d.Height, d.Format.0)
+            }
+            None => "none".to_owned(),
+        })
+        .collect()
+}
+
 /// Copies left out because both sides were one host texture
 /// ([`copy_resource`], [`copy_texture_region`]), since the start.
 #[cfg(windows)]
