@@ -192,6 +192,8 @@ struct Segment {
     kind: u32,
     stride: u32,
     list: usize,
+    /// The list's noted shader writes when the pass was recorded (mode 2).
+    writes_at: usize,
     scratch: ID3D12Resource,
     table: *mut u32,
     slots: std::collections::HashMap<u32, u32>,
@@ -378,7 +380,13 @@ pub(crate) fn window_line(frames: f64) {
     let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     let seg: Vec<f64> = crate::indirect::SEGMENT_STATS.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     if crate::indirect::segments() {
-        tracing::info!("segments per frame (VICTORY_GATHER_SEGMENTS=1): {:.0} passes, {:.0} draws read a segment's record", seg[0], seg[1]);
+        tracing::info!(
+            "segments per frame (VICTORY_GATHER_SEGMENTS): {:.0} passes, {:.0} draws read a segment's record ({:.0} of them indirect dispatches), {:.0} segments ended by a write that touched a record",
+            seg[0],
+            seg[1],
+            seg[2],
+            seg[3]
+        );
     }
     let g: Vec<f64> = crate::indirect::GATHER_NONE.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     tracing::info!(
@@ -1264,6 +1272,11 @@ impl State {
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip()) && !quarantined;
+            // A shader that stores by address, or one kept from copying
+            // back, may change any of the card's copies (segments, mode 2).
+            if t.stores && (quarantined || t.host.writes_guest_memory) {
+                list.note_shader_write(0, usize::MAX);
+            }
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // A traversal can read the scene by address and write its
@@ -2347,10 +2360,23 @@ impl State {
     /// in a new one whose pass is recorded now (`crate::indirect::segments`):
     /// the scratch buffer and the record's place in it. None if the record
     /// does not fit the clamp or no pass could be recorded.
-    fn segment_slot(&mut self, list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+    fn segment_slot(
+        &mut self,
+        list: &HostList,
+        (src, src_id): (&ID3D12Resource, u64),
+        offset: u64,
+        (kind, stride): (u32, u32),
+        (address, len): (usize, usize),
+    ) -> Option<(ID3D12Resource, u64)> {
         let here = std::ptr::from_ref(list) as usize;
         if list.first_use(SEGMENT_USE) || self.segment.as_ref().is_some_and(|s| s.list != here) {
             self.segment = None;
+        }
+        // Mode 2: a shader noted since the pass may have written the record.
+        if self.segment.as_ref().is_some_and(|s| list.shader_write_touches(s.writes_at, address, len)) {
+            self.segment = None;
+            #[cfg(feature = "diagnostics")]
+            crate::indirect::SEGMENT_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // SAFETY: a live D3D12 buffer resource.
         let offset = crate::indirect::gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, (kind, stride))?;
@@ -2367,7 +2393,7 @@ impl State {
             // The pass bound a compute pipeline of its own.
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
-            self.segment = Some(Segment { src: src.clone(), src_id, kind, stride, list: here, scratch, table, slots: Default::default() });
+            self.segment = Some(Segment { src: src.clone(), src_id, kind, stride, list: here, writes_at: list.shader_writes_now(), scratch, table, slots: Default::default() });
         }
         let s = self.segment.as_mut()?;
         let slot = match s.slots.get(&offset) {
@@ -2388,6 +2414,15 @@ impl State {
         Some((s.scratch.clone(), crate::indirect::SEGMENT_AT + u64::from(slot) * u64::from(stride)))
     }
 
+    /// A command that may write arguments was recorded: the open segment
+    /// ends, unless segments end only where a noted write touches a record
+    /// (`crate::indirect::segments` mode 2).
+    fn end_segment_on_write(&mut self) {
+        if crate::indirect::segment_mode() < 2 {
+            self.segment = None;
+        }
+    }
+
     /// Whether the shaders of the pipeline bound now can store to buffers
     /// (or the pipeline is not known): a draw with them may write the
     /// arguments of draws after it, which ends a list's gathering
@@ -2402,7 +2437,7 @@ impl State {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
-            self.segment = None;
+            self.end_segment_on_write();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2806,7 +2841,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
-            self.segment = None;
+            self.end_segment_on_write();
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3215,7 +3250,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
-            self.segment = None;
+            self.end_segment_on_write();
         }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3324,7 +3359,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
-            self.segment = None;
+            self.end_segment_on_write();
         }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3473,7 +3508,7 @@ impl State {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             list.gather_close();
-            self.segment = None;
+            self.end_segment_on_write();
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
@@ -3518,7 +3553,19 @@ impl State {
         // the segment open since the last command that may write arguments
         // (`crate::indirect::segments`).
         let gathered = match gathered {
-            None if hit.is_none() && windowed && crate::indirect::segments() => self.segment_slot(list, (&args.buffer, args.id()), offset, (kind, stride)),
+            None if hit.is_none() && windowed && crate::indirect::segments() => {
+                self.segment_slot(list, (&args.buffer, args.id()), offset, (kind, stride), (arguments as usize, len as usize))
+            }
+            // Mode 2: indirect dispatches and storing draws join too (their
+            // own writes come after their record is read).
+            None if hit.is_none() && crate::indirect::segment_mode() >= 2 && max == 1 && count.is_none() => {
+                let slot = self.segment_slot(list, (&args.buffer, args.id()), offset, (kind, stride), (arguments as usize, len as usize));
+                #[cfg(feature = "diagnostics")]
+                if slot.is_some() && kind == DISPATCH {
+                    crate::indirect::SEGMENT_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                slot
+            }
             g => g,
         };
         let (bounded, at) = match (hit, gathered) {

@@ -629,9 +629,28 @@ pub(crate) const SEGMENT_MOST: u32 = 512;
 /// gathering, applied from each writing command on instead of only from
 /// the list's start; between the pass and a draw only draws that store
 /// nothing run, so the record the pass reads is the one the draw needs.
+///
+/// `VICTORY_GATHER_SEGMENTS=2`: a writing command no longer ends the
+/// segment. The list notes what its shaders may write (the ranges they
+/// declare for copying back, and all of title memory for a shader that
+/// stores by address), and a record joins the open segment only if
+/// nothing noted since the segment's pass touches it; otherwise a new
+/// segment starts there. Indirect dispatches and draws whose shaders store
+/// join segments too (their own writes come after their record is read):
+/// the ~990 passes a frame left for indirect dispatches in run GT2.
 pub(crate) fn segments() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_SEGMENTS").is_some_and(|v| v == "1"))
+    segment_mode() >= 1
+}
+
+/// 0 off, 1 segments end at writing commands, 2 they end where a write
+/// touches the record ([`segments`]).
+pub(crate) fn segment_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_SEGMENTS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Records in `list` the pass of a new segment ([`segments`]): it clamps
@@ -688,9 +707,10 @@ pub(crate) fn segment_pass(list: &HostList, src: &ID3D12Resource, (kind, stride)
 }
 
 /// Diagnostics of [`segments`] since the last line: passes, records drawn
-/// from a segment.
+/// from a segment, of those indirect dispatches, segments ended because a
+/// noted write touched the record (mode 2).
 #[cfg(feature = "diagnostics")]
-pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last line: records that got no slot because they do not fit
 /// the clamp, because their list had stopped gathering, because the list
