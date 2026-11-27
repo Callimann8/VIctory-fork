@@ -854,6 +854,20 @@ fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Runs of blocks noted guarded here, to make read-only after.
     let mut runs: Vec<(usize, usize)> = Vec::new();
+    // The questions about absent blocks (whether they are committed now),
+    // asked before the lock is taken: 15,000 a frame, 5 ms with the lock
+    // held in CG2. Asked where the loop below would ask, from the absent
+    // blocks as they are now; a block absent only by the time the loop
+    // reaches it is asked there.
+    let absent: Vec<usize> = guards().absent.range(first..last).copied().collect();
+    let mut asked = std::collections::HashMap::new();
+    let mut until = first;
+    for &block in &absent {
+        if block >= until {
+            until = uncommitted_end(block);
+            asked.insert(block, until);
+        }
+    }
     {
         let waited = std::time::Instant::now();
         let mut g = guards();
@@ -885,7 +899,7 @@ fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
             let mut open = block < last && !is_clean;
             if open && g.absent.contains(&block) {
                 if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
+                    uncommitted_until = asked.get(&block).copied().unwrap_or_else(|| uncommitted_end(block));
                 }
                 open = block >= uncommitted_until;
                 if open {
