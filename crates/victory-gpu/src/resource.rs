@@ -2712,10 +2712,11 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    let in_a_block = fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
-        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+    if in_a_block
         // SAFETY: the description has the host layout, as below.
         && let Some(t) = unsafe {
             crate::pool::texture(
@@ -2779,6 +2780,11 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        if in_a_block && !reserved {
+            // One too large for a block (`VICTORY_POOL_MOST_KB`): counted.
+            // SAFETY: the description the texture was made with.
+            unsafe { crate::pool::own(&host.device, t, (&raw const d).cast()) };
+        }
     }
     texture
 }
