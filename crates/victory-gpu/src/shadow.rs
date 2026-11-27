@@ -3459,11 +3459,14 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         // The stale stretches, found under the lock; copied after it (with
         // `VICTORY_COPY_WIDE` on several threads).
-        let mut runs: Vec<(usize, usize)> = Vec::new();
+        // (from, to, known): `known` runs are of pages taken before, which
+        // [`by_parts`] may cut to the 4 KiB parts written since.
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let mut writes = written.iter().peekable();
-            let mut run = None;
+            let mut run: Option<(usize, bool)> = None;
             let last = (to - 1) / PAGE;
             for page in from / PAGE..=last {
                 let write = match writes.peek() {
@@ -3475,22 +3478,39 @@ impl Shadow {
                 };
                 let at = &mut copied[page - base];
                 if *at == 0 || write > *at {
+                    let taken = *at;
                     // A page only partly in the range is copied in part: it
                     // stays stale for the rest.
                     let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                     if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                         *at = now;
                     }
-                    run.get_or_insert(page);
-                } else if let Some(first) = run.take() {
-                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to)));
+                    // Cut where pages taken before meet pages never taken.
+                    let again = taken != 0;
+                    if again {
+                        again_at.push((page, taken));
+                    }
+                    if let Some((first, known)) = run
+                        && known != again
+                    {
+                        runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                        run = None;
+                    }
+                    run.get_or_insert((page, again));
+                } else if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
                 }
             }
             // Cut to the range: next to it shaders may be writing the copy.
-            if let Some(first) = run {
-                runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to)));
+            if let Some((first, known)) = run {
+                runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
             }
         }
+        let runs: Vec<(usize, usize)> = if again_at.is_empty() {
+            runs.into_iter().map(|(a, b, _)| (a, b)).collect()
+        } else {
+            by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
+        };
         let total: usize = runs.iter().map(|&(a, b)| b - a).sum();
         let threads = refresh_threads();
         if threads < 2 || total < COPY_WIDE_LEAST {
@@ -4603,4 +4623,37 @@ static MERGE_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// [`MERGE_REFUSED`], taken, per frame.
 pub(crate) fn merge_refusals(frames: f64) -> [f64; 4] {
     [0, 1, 2, 3].map(|i| MERGE_REFUSED[i].swap(0, Ordering::Relaxed) as f64 / frames)
+}
+
+/// `runs` (from, to, known) cut, where `known`, to the 4 KiB parts written
+/// since each page was taken (`pages`: the pages taken before, in order, and
+/// `parts`: their parts written since, from `crate::watch::parts_written`).
+/// Pages whose parts are all written stay whole (`VICTORY_PAGE_PARTS`;
+/// from the 7900 XTX fork via pepezin-ai/VIctory-NVIDIA).
+fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u16]) -> Vec<(usize, usize)> {
+    const PART: usize = PAGE / 16;
+    if parts.iter().all(|&p| p == u16::MAX) {
+        return runs.into_iter().map(|(a, b, _)| (a, b)).collect();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len() + pages.len());
+    let mut pages = pages.iter().zip(parts).peekable();
+    for (from, to, known) in runs {
+        if !known {
+            out.push((from, to));
+            continue;
+        }
+        while let Some((&(page, _), &parts)) = pages.next_if(|((page, _), _)| page * PAGE < to) {
+            for k in (0..16).filter(|k| parts >> k & 1 != 0) {
+                let (a, b) = ((page * PAGE + k * PART).max(from), (page * PAGE + (k + 1) * PART).min(to));
+                if a >= b {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some((_, end)) if *end == a => *end = b,
+                    _ => out.push((a, b)),
+                }
+            }
+        }
+    }
+    out
 }

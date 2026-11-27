@@ -33,6 +33,81 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// The parts of a page.
+const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All of them.
+const WHOLE: u16 = u16::MAX;
+
+/// `VICTORY_PAGE_PARTS=1` (off by default; on in the 7900 XTX fork): the
+/// journal keeps which 4 KiB parts of a 64 KiB page the kernel named, and a
+/// refresh of a page taken before copies only the parts written since.
+/// There 29 MB a frame written so were most of 114 MB copied, and as much
+/// sent up and hashed again on the card. What is checked is as before, a
+/// page; guarded view memory is always whole pages.
+fn parts_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PAGE_PARTS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_PAGE_PARTS=1: refreshes copy the 4 KiB parts the kernel names");
+        }
+        on
+    })
+}
+
+impl Journal {
+    /// Page `page` was found written by asking `now`: the parts in `parts`
+    /// (a bit each). The asking that found it written before (0: none).
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let before = self.written.insert(page, now).unwrap_or(0);
+        if parts == WHOLE || !parts_on() {
+            self.parts.remove(&page);
+            return before;
+        }
+        let all = self.parts.entry(page).or_insert([before; PARTS]);
+        for (k, at) in all.iter_mut().enumerate() {
+            if parts >> k & 1 != 0 {
+                *at = now;
+            }
+        }
+        before
+    }
+
+    /// The parts of `page` written by an asking after `taken`.
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        match self.parts.get(&page) {
+            Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
+            None => WHOLE,
+        }
+    }
+
+    /// Notes the kernel's answer (4 KiB page addresses, ascending) under
+    /// asking `now`, page by page with its parts.
+    fn note_found(&mut self, count: usize, now: u64) {
+        let mut k = 0;
+        while k < count {
+            let page = self.found[k] / PAGE;
+            let mut parts = 0u16;
+            while k < count && self.found[k] / PAGE == page {
+                parts |= 1 << (self.found[k] % PAGE / KERNEL_PAGE);
+                k += 1;
+            }
+            self.note(page, parts, now);
+        }
+    }
+}
+
+/// Of the pages of a copy that were written after it took them (page number,
+/// the asking it took the page at): the parts to take again, a bit for each
+/// 4 KiB, in the same order. All [`WHOLE`] when parts are off.
+pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if !parts_on() {
+        return vec![WHOLE; pages.len()];
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -59,6 +134,9 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// With [`parts_on`]: per page, the asking that last found each 4 KiB
+    /// part written; a page not here was written whole.
+    parts: BTreeMap<usize, [u64; PARTS]>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -75,6 +153,7 @@ struct Journal {
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    parts: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -275,7 +354,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        j.note(page, WHOLE, now);
     }
 }
 
@@ -298,10 +377,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.note(page, WHOLE, now);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.note(other, WHOLE, now);
         }
     }
     (before, now)
@@ -358,10 +437,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
+    j.note_found(count, now);
     true
 }
 
@@ -457,9 +533,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    j.note_found(count, now);
+    for page in guarded {
+        j.note(page, WHOLE, now);
     }
     Some((
         now,
