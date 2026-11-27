@@ -2206,10 +2206,6 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
-    /// Title memory the list's shaders may write, in recording order
-    /// (start, end; `(0, usize::MAX)` for a shader that stores by address):
-    /// for `crate::indirect::segments` mode 2.
-    shader_writes: Vec<(usize, usize)>,
 }
 
 impl Deferred {
@@ -7776,26 +7772,6 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
-    }
-
-    /// The list's shaders may write `[address, address + len)` of title
-    /// memory from here on (`crate::indirect::segments` mode 2).
-    pub(crate) fn note_shader_write(&self, address: usize, len: usize) {
-        if crate::indirect::segment_mode() >= 2 {
-            self.deferred().shader_writes.push((address, address.saturating_add(len)));
-        }
-    }
-
-    /// How many shader writes the list has noted so far.
-    pub(crate) fn shader_writes_now(&self) -> usize {
-        self.deferred().shader_writes.len()
-    }
-
-    /// Whether a shader write noted since the first `since` may touch
-    /// `[address, address + len)`.
-    pub(crate) fn shader_write_touches(&self, since: usize, address: usize, len: usize) -> bool {
-        let end = address.saturating_add(len);
-        self.deferred().shader_writes.get(since..).is_some_and(|w| w.iter().any(|&(a, b)| a < end && address < b))
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
