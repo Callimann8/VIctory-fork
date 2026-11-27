@@ -115,10 +115,27 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// The smallest host copy whose pieces [`skip_back`] leaves on the card
+/// (`VICTORY_SKIP_WC_BACK_MIN_KB`, 1024 KiB). With every title buffer's copy
+/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`, a Yuriko default)
+/// the small ones hold what the title's CPU does read: draw counts and the
+/// lists of what is seen. Left on the card, the world went black here (`wk1`,
+/// 2026-11-26), and an RTX 5080 tester drew half the frame, black, until
+/// only copies of 1 MiB and more were left out (fxceless issue #1379,
+/// Zignixx 83e4cfc33: copy-back 12.8 -> 4.6 ms a frame).
+fn skip_back_least() -> u64 {
+    static LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_WC_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 10
+    })
+}
+
 /// A flagged piece is clipped to its declaration. Keep every piece of a
-/// mixed declaration so the normal read-back covers it in full.
-pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
-    if !skip_wc_back() {
+/// mixed declaration so the normal read-back covers it in full. `copy`: the
+/// bytes of the host copy the piece is in; a copy under
+/// [`skip_back_least`] always comes back.
+pub(crate) fn skip_back(declared: (usize, usize), bytes: u64, copy: u64) -> bool {
+    if !skip_wc_back() || copy < skip_back_least() {
         return false;
     }
     let wc = all_wc(&[declared]);
