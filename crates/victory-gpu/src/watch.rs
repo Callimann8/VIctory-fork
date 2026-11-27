@@ -466,6 +466,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // Clean view memory known by its bits: the journal has every write.
+    if guarded && light() && PUBLISHED.all(first, last) {
+        LIGHT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some((j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+    }
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -510,6 +515,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if failed && !known_view && guarded {
         failed_asking(first * PAGE, last * PAGE);
     }
+    let was_guarded = failed && guarded;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -536,6 +542,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.note_found(count, now);
     for page in guarded {
         j.note(page, WHOLE, now);
+    }
+    if was_guarded && light() {
+        publish(first, last);
     }
     Some((
         now,
@@ -636,6 +645,115 @@ fn known_view(start: usize) -> bool {
     let g = guards();
     let first = start / BLOCK;
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+}
+
+/// `VICTORY_LIGHT_REFRESH=1` (off by default; on in the 7900 XTX fork,
+/// whose idea this is, via pepezin-ai/VIctory-NVIDIA): view memory that
+/// nothing wrote since an asking noted it in the journal is known by its
+/// bits ([`PUBLISHED`]), and [`writes`] answers for a range of it from the
+/// journal, without the guards' lock or a kernel call. There a frame asked
+/// about view memory some 1,500 times, nearly always to hear that nothing
+/// was written. Not with [`guard_fast`] (blocks are noted clean before
+/// they are read-only there).
+pub(crate) fn light() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LIGHT_REFRESH").is_some_and(|v| v == "1") && !guard_fast();
+        if on {
+            tracing::warn!("VICTORY_LIGHT_REFRESH=1: clean guarded view memory is answered from the journal");
+        }
+        on
+    })
+}
+
+/// A bit per block of the address space, in pieces made when first needed
+/// and never let go.
+struct Bits([std::sync::atomic::AtomicPtr<BitsPiece>; Bits::PIECES]);
+
+/// The bits of 4 GiB.
+type BitsPiece = [std::sync::atomic::AtomicU64; Bits::WORDS];
+
+impl Bits {
+    const WORDS: usize = 1 << 10;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = 1 << 15;
+
+    const fn new() -> Bits {
+        Bits([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Bits::PIECES])
+    }
+
+    fn piece(&self, word: usize) -> Option<&BitsPiece> {
+        let piece = self.0.get(word / Bits::WORDS)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `set`, which is never freed.
+        unsafe { piece.as_ref() }
+    }
+
+    fn set(&self, block: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        let word = block / 64;
+        let Some(place) = self.0.get(word / Bits::WORDS) else {
+            return;
+        };
+        if place.load(Acquire).is_null() {
+            let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+            let piece = Box::into_raw(piece);
+            if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+                // SAFETY: made just now, and another thread's is there.
+                drop(unsafe { Box::from_raw(piece) });
+            }
+        }
+        if let Some(piece) = self.piece(word) {
+            piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
+        }
+    }
+
+    fn clear(&self, block: usize) {
+        let word = block / 64;
+        if let Some(piece) = self.piece(word) {
+            piece[word % Bits::WORDS].fetch_and(!(1 << (block % 64)), std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the bits of all of `[first, last)` are set (not so of none).
+    fn all(&self, first: usize, last: usize) -> bool {
+        let mut block = first;
+        while block < last {
+            let word = block / 64;
+            let until = ((word + 1) * 64).min(last);
+            let mask = (u64::MAX >> (64 - (until - block))) << (block % 64);
+            let Some(piece) = self.piece(word) else {
+                return false;
+            };
+            if piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst) & mask != mask {
+                return false;
+            }
+            block = until;
+        }
+        first < last
+    }
+}
+
+/// The blocks that are read-only by our hand, not written since, and of
+/// which the journal holds every write from before that ([`light`]). A bit
+/// is set under the guards' lock, with the journal's held, by the asking
+/// that found the block clean, after it noted what it found ([`publish`]);
+/// it is cleared before the block is made writable again or forgotten. So
+/// while it is set nothing wrote the block through this address, and who
+/// reads the journal (holding its lock) finds every earlier write in it.
+static PUBLISHED: Bits = Bits::new();
+
+/// Askings [`writes`] answered from [`PUBLISHED`] (count).
+pub(crate) static LIGHT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After an asking of `[first, last)` (blocks) noted what it found, with
+/// the journal's lock held: its clean blocks are published.
+fn publish(first: usize, last: usize) {
+    let g = guards();
+    for &block in g.clean.range(first..last) {
+        if g.protected.contains(&block) {
+            PUBLISHED.set(block);
+        }
+    }
 }
 
 struct Guards {
@@ -757,7 +875,7 @@ fn guard_times_line() {
     let ms = |x: f64| x / 1000.0;
     tracing::info!(
         "guard times per frame: {:.0} asks, {:.1} ms in all ({:.1} lock wait, {:.1} clean blocks, {:.1} is-view questions, {:.1} making read-only of which {:.1} other views; {:.0} blocks in {:.0} calls); \
-         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={}); {:.0} blocks left open resting (VICTORY_GUARD_REST)",
+         {:.0} faults, {:.1} ms on the title's threads ({:.1} of it lock wait); {:.0} questions about absent blocks ({:.1} ms); lock held {:.1} ms (VICTORY_GUARD_FAST={}); {:.0} blocks left open resting (VICTORY_GUARD_REST); {:.0} askings answered by their bits (VICTORY_LIGHT_REFRESH)",
         v[0],
         ms(v[11]),
         ms(v[1]),
@@ -775,6 +893,7 @@ fn guard_times_line() {
         ms(v[14]),
         u8::from(guard_fast()),
         RESTED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+        LIGHT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
     );
 }
 
@@ -1066,6 +1185,7 @@ fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
         // Not all of it: un-noted, and block by block as before.
         let mut g = guards();
         for block in from..to {
+            PUBLISHED.clear(block);
             g.protected.remove(&block);
             g.clean.remove(&block);
             g.viewed.remove(&block);
@@ -1123,6 +1243,7 @@ fn guard_fast_held(start: usize, end: usize) -> Vec<usize> {
     if !failed.is_empty() {
         let mut g = guards();
         for alias in failed {
+            PUBLISHED.clear(alias);
             g.protected.remove(&alias);
             g.viewed.remove(&alias);
         }
@@ -1379,6 +1500,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
                     // as clean, so its copies take the pages again
                     // (`guard`: read-only and not clean is written).
                     let b = alias / BLOCK;
+                    PUBLISHED.clear(b);
                     if g.protected.contains(&b) && g.clean.remove(&b) {
                         #[cfg(feature = "diagnostics")]
                         ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1413,6 +1535,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .copied()
         .collect();
     for &block in &blocks {
+        PUBLISHED.clear(block);
         g.protected.remove(&block);
         g.clean.remove(&block);
         let mut old = 0;
@@ -1618,6 +1741,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
+        PUBLISHED.clear(block);
         g.protected.remove(&block);
         g.clean.remove(&block);
         // `xmem` maps a view, commits it and only then says so: a copy's
@@ -1757,6 +1881,7 @@ fn open_orphan(g: &mut Guards, at: usize) -> bool {
     }
     let block = at / BLOCK;
     let mut old = 0;
+    PUBLISHED.clear(block);
     // SAFETY: a title view block read-only by a guard of ours; only its
     // protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0 {
@@ -1795,6 +1920,7 @@ fn open_orphans(start: usize, end: usize) {
                     continue;
                 }
                 let mut old = 0;
+                PUBLISHED.clear(block);
                 // SAFETY: a title view block read-only by a guard of ours
                 // whose bookkeeping was lost; only its protection changes.
                 if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0 {
