@@ -2862,6 +2862,11 @@ fn copy_on_card() -> bool {
 /// and their bytes.
 static CARD_COPIED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Copies that would have waited and were not taken, by why: title work in
+/// the submission, another step touches the destination, no host copy
+/// holds the source or destination, both the same copy.
+static CARD_COPY_REFUSED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// [`copy_on_card`]: turns the copies of `runs` it holds for into a refresh
 /// of the source and a [`Step::CardCopy`], against `written` (what the
 /// flights in the air may write).
@@ -2874,6 +2879,7 @@ fn take_card_copies(runs: &[&HostList], written: &[(usize, usize)]) {
     for list in runs {
         let deferred = list.deferred();
         if deferred.copies.iter().any(|s| matches!(s, Step::Run(_))) {
+            CARD_COPY_REFUSED[0].fetch_add(1, Ordering::Relaxed);
             return;
         }
         steps += deferred.copies.len();
@@ -2923,16 +2929,23 @@ fn take_card_copies(runs: &[&HostList], written: &[(usize, usize)]) {
         // From the back, so that the indices before stay right.
         for &(i, dst, src, len) in candidates.iter().rev() {
             if touched_elsewhere((l, i), dst, dst + len) {
+                CARD_COPY_REFUSED[1].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64)) else {
+                CARD_COPY_REFUSED[2].fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             let holds = |shadow: &crate::shadow::Shadow, a: usize| {
                 let (start, n) = shadow.span();
                 start as usize <= a && a + len <= (start + n) as usize
             };
-            if std::sync::Arc::ptr_eq(&from, &to) || !holds(&from, src) || !holds(&to, dst) {
+            if !holds(&from, src) || !holds(&to, dst) {
+                CARD_COPY_REFUSED[2].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if std::sync::Arc::ptr_eq(&from, &to) {
+                CARD_COPY_REFUSED[3].fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let mut deferred = list.deferred();
@@ -4039,9 +4052,13 @@ fn late_line(frames: f64) {
     }
     if copy_on_card() {
         tracing::info!(
-            "title buffer copies done on the card per frame (VICTORY_COPY_ON_CARD=1): {:.2}, {:.0} bytes",
+            "title buffer copies done on the card per frame (VICTORY_COPY_ON_CARD=1): {:.2}, {:.0} bytes; not taken: title work {:.2}, destination touched {:.2}, no host copy {:.2}, same copy {:.2}",
             CARD_COPIED[0].swap(0, Ordering::Relaxed) as f64 / frames,
-            CARD_COPIED[1].swap(0, Ordering::Relaxed) as f64 / frames
+            CARD_COPIED[1].swap(0, Ordering::Relaxed) as f64 / frames,
+            CARD_COPY_REFUSED[0].swap(0, Ordering::Relaxed) as f64 / frames,
+            CARD_COPY_REFUSED[1].swap(0, Ordering::Relaxed) as f64 / frames,
+            CARD_COPY_REFUSED[2].swap(0, Ordering::Relaxed) as f64 / frames,
+            CARD_COPY_REFUSED[3].swap(0, Ordering::Relaxed) as f64 / frames
         );
     }
     if settle_stale_on() {
