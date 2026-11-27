@@ -978,36 +978,14 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block {
-                if alias_lazy() {
-                    // The other view stays read-only (a write through it
-                    // still faults and opens it); it only stops counting
-                    // as clean, so its copies take the pages again
-                    // (`guard`: read-only and not clean is written).
-                    let b = alias / BLOCK;
-                    if g.protected.contains(&b) && g.clean.remove(&b) {
-                        #[cfg(feature = "diagnostics")]
-                        ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                } else if open_here(g, alias, alias.saturating_add(BLOCK)) {
-                    #[cfg(feature = "diagnostics")]
-                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+                #[cfg(feature = "diagnostics")]
+                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             g.aliased.remove(&(alias / BLOCK));
         }
     }
     any
-}
-
-/// `VICTORY_ALIAS_LAZY=1`: a write through one view of guarded pages leaves
-/// the other views read-only and only marks them written, instead of giving
-/// each write access back (CP1: some 150,000 such opens a second, each a
-/// `VirtualProtect` under the guards' lock, and as many guards set again
-/// after). Off by default.
-fn alias_lazy() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_LAZY").is_some_and(|v| v == "1"))
 }
 
 /// [`open`] for one range, without the other views of its pages.
