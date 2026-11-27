@@ -182,6 +182,29 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
+/// A segment's pass and table (`crate::indirect::segments`): the argument
+/// buffer (its host copy and number), kind and stride of its records, the
+/// host list it was recorded in, the scratch buffer, the table (word 0 the
+/// count, then the records' offsets) and each record's slot.
+struct Segment {
+    src: ID3D12Resource,
+    src_id: u64,
+    kind: u32,
+    stride: u32,
+    list: usize,
+    scratch: ID3D12Resource,
+    table: *mut u32,
+    slots: std::collections::HashMap<u32, u32>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the table is the list's own
+// upload memory, written while the list is recorded, before it is submitted.
+unsafe impl Send for Segment {}
+
+/// The key of [`HostList::first_use`] that tells a segment's host list was
+/// reset or replaced.
+const SEGMENT_USE: usize = usize::MAX - 0x78;
+
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
 
@@ -353,6 +376,10 @@ pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 14] = [const { std:
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_line(frames: f64) {
     let n: Vec<f64> = WINDOW_WHY.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    let seg: Vec<f64> = crate::indirect::SEGMENT_STATS.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
+    if crate::indirect::segments() {
+        tracing::info!("segments per frame (VICTORY_GATHER_SEGMENTS=1): {:.0} passes, {:.0} draws read a segment's record", seg[0], seg[1]);
+    }
     let g: Vec<f64> = crate::indirect::GATHER_NONE.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0)).collect();
     tracing::info!(
         "indirect commands per frame by their clamp: {:.0} read from a window (no pass of ours); a pass of ours for {:.0}: {:.0} dispatches, {:.0} of more than one record, {:.0} with a count \
@@ -423,6 +450,8 @@ pub(crate) struct State {
     /// whether a draw has read from it since.
     window_jumped: bool,
     window_read: bool,
+    /// The segment open on the host list being recorded (`crate::indirect::segments`).
+    segment: Option<Segment>,
     /// Diagnostics: the argument buffer and the offset of the indirect
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
@@ -2314,6 +2343,51 @@ impl State {
         });
     }
 
+    /// The slot of the record at `offset` of `src` in the open segment, or
+    /// in a new one whose pass is recorded now (`crate::indirect::segments`):
+    /// the scratch buffer and the record's place in it. None if the record
+    /// does not fit the clamp or no pass could be recorded.
+    fn segment_slot(&mut self, list: &HostList, (src, src_id): (&ID3D12Resource, u64), offset: u64, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, u64)> {
+        let here = std::ptr::from_ref(list) as usize;
+        if list.first_use(SEGMENT_USE) || self.segment.as_ref().is_some_and(|s| s.list != here) {
+            self.segment = None;
+        }
+        // SAFETY: a live D3D12 buffer resource.
+        let offset = crate::indirect::gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, (kind, stride))?;
+        let fits = |s: &Segment| {
+            s.src_id == src_id
+                && s.kind == kind
+                && s.stride == stride
+                && s.src.as_raw() == src.as_raw()
+                && (s.slots.contains_key(&offset) || (s.slots.len() as u32) < crate::indirect::SEGMENT_MOST)
+        };
+        if !self.segment.as_ref().is_some_and(fits) {
+            self.segment = None;
+            let (scratch, table) = crate::indirect::segment_pass(list, src, (kind, stride))?;
+            // The pass bound a compute pipeline of its own.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            self.segment = Some(Segment { src: src.clone(), src_id, kind, stride, list: here, scratch, table, slots: Default::default() });
+        }
+        let s = self.segment.as_mut()?;
+        let slot = match s.slots.get(&offset) {
+            Some(&slot) => slot,
+            None => {
+                let slot = s.slots.len() as u32;
+                // SAFETY: the table holds `SEGMENT_MOST + 1` words; `slot` is below `SEGMENT_MOST`.
+                unsafe {
+                    s.table.add(1 + slot as usize).write_volatile(offset);
+                    s.table.write_volatile(slot + 1);
+                }
+                s.slots.insert(offset, slot);
+                slot
+            }
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::indirect::SEGMENT_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some((s.scratch.clone(), crate::indirect::SEGMENT_AT + u64::from(slot) * u64::from(stride)))
+    }
+
     /// Whether the shaders of the pipeline bound now can store to buffers
     /// (or the pipeline is not known): a draw with them may write the
     /// arguments of draws after it, which ends a list's gathering
@@ -2328,6 +2402,7 @@ impl State {
         // It may write the arguments a window holds clamped.
         self.window = None;
         list.gather_close();
+            self.segment = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2731,6 +2806,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
+            self.segment = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3139,6 +3215,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
+            self.segment = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3247,6 +3324,7 @@ impl State {
         self.window = None;
         if self.may_store() {
             list.gather_close();
+            self.segment = None;
         }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3395,6 +3473,7 @@ impl State {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             list.gather_close();
+            self.segment = None;
         }
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
@@ -3434,6 +3513,13 @@ impl State {
             slot
         } else {
             None
+        };
+        // A record that misses its window and was not gathered: a slot in
+        // the segment open since the last command that may write arguments
+        // (`crate::indirect::segments`).
+        let gathered = match gathered {
+            None if hit.is_none() && windowed && crate::indirect::segments() => self.segment_slot(list, (&args.buffer, args.id()), offset, (kind, stride)),
+            g => g,
         };
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
@@ -3519,6 +3605,10 @@ impl State {
                     None => (step, records),
                 };
                 self.window_read = false;
+                // A clamp this big writes over a segment's records.
+                if u64::from(step) * u64::from(records) > crate::indirect::SEGMENT_AT {
+                    self.segment = None;
+                }
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);

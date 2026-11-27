@@ -48,6 +48,7 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing. Bit 2: the records are gathered
     // (`gather`): record i lies in the source where word i of the table
     // behind `count_buf` says (from `count_offset` on), and goes to slot i.
+    // Bit 3: the number of gathered records is word 0 of that table.
     uint has_count;
     uint count_offset;
 };
@@ -80,6 +81,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+    // Bit 3 (with bit 2): the table's word 0 says how many records it
+    // holds, filled after the pass was recorded (`segment_pass`).
+    [branch]
+    if ((has_count & 8u) != 0) {
+        eff_count = min(eff_count, count_buf.Load(0));
     }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
@@ -598,6 +605,92 @@ pub(crate) fn gather(list: &HostList, (src, src_id): (&ID3D12Resource, u64), off
     };
     list.gather_slot(src, src_id, offset, spec)
 }
+
+/// Where in a list's indirect scratch buffer a segment's records go
+/// ([`segment_pass`]), past every clamp of up to this many bytes.
+pub(crate) const SEGMENT_AT: u64 = 64 << 10;
+/// The most records one segment pass clamps.
+pub(crate) const SEGMENT_MOST: u32 = 512;
+
+/// Whether draws that miss their window are clamped a segment at a time
+/// (`VICTORY_GATHER_SEGMENTS=1`; off by default; needs
+/// `VICTORY_INDIRECT_WINDOW=1`).
+///
+/// A record that misses its window, and that the list's prelude could not
+/// gather (the list wrote arguments before it), got a pass of ours between
+/// two full waits right before its draw: about 965 passes for 2,030 draws a
+/// frame in the cell (run GT1). With the switch the first such record after
+/// anything that may write arguments (a dispatch, a draw whose shaders
+/// store to buffers, another host list) records one pass that clamps a
+/// table of records, and the records that miss after it, up to the next
+/// such command, are added to its table: the pass runs before their draws
+/// and reads the table (upload memory of the list, filled before the list
+/// is submitted, its word 0 the count). The rule is the prelude's
+/// gathering, applied from each writing command on instead of only from
+/// the list's start; between the pass and a draw only draws that store
+/// nothing run, so the record the pass reads is the one the draw needs.
+pub(crate) fn segments() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GATHER_SEGMENTS").is_some_and(|v| v == "1"))
+}
+
+/// Records in `list` the pass of a new segment ([`segments`]): it clamps
+/// the records the returned table names (word 0 the count, the records'
+/// offsets in `src` from word 1 on, up to [`SEGMENT_MOST`]) into the list's
+/// indirect scratch buffer from [`SEGMENT_AT`] on, record `i` at
+/// `i * stride`, charged to the list's budget. The scratch buffer and the
+/// table (its host address); None, with nothing recorded, if anything does
+/// not fit. Replaces the list's compute root signature and pipeline.
+pub(crate) fn segment_pass(list: &HostList, src: &ID3D12Resource, (kind, stride): (u32, u32)) -> Option<(ID3D12Resource, *mut u32)> {
+    let c = clamp()?;
+    // SAFETY: a live D3D12 buffer resource.
+    let src_gpu = unsafe { src.GetGPUVirtualAddress() };
+    gatherable(src_gpu, 0, (kind, stride))?;
+    let budget = list.budget()?;
+    let scratch = list.indirect_scratch(SEGMENT_AT + u64::from(SEGMENT_MOST) * u64::from(GATHER_STRIDE))?;
+    let (table_gpu, table) = list.scratch(u64::from(SEGMENT_MOST + 1) * 4)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { scratch.GetGPUVirtualAddress() } + SEGMENT_AT;
+    if !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) || !table_gpu.is_multiple_of(4) {
+        return None;
+    }
+    let table = table.cast::<u32>();
+    // SAFETY: the table holds `SEGMENT_MOST + 1` words of the list's upload memory.
+    unsafe { table.write_volatile(0) };
+    let before = list.indirect_state(&scratch);
+    let constants = [kind, stride, SEGMENT_MOST, 0u32, 4u32 | 8u32, 4u32];
+    let first = [uav_barrier(), transition(&scratch, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+    let second = [
+        uav_barrier(),
+        transition(&scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    ];
+    #[cfg(feature = "diagnostics")]
+    SEGMENT_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let l = &list.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // table, scratch and budget buffers. As a clamp in the list: the first
+    // wait puts the pass behind every earlier shader write and every
+    // earlier read of the scratch buffer, the second puts the draws behind it.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(SEGMENT_MOST.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    list.indirect_readable(&scratch);
+    Some((scratch, table))
+}
+
+/// Diagnostics of [`segments`] since the last line: passes, records drawn
+/// from a segment.
+#[cfg(feature = "diagnostics")]
+pub(crate) static SEGMENT_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last line: records that got no slot because they do not fit
 /// the clamp, because their list had stopped gathering, because the list
