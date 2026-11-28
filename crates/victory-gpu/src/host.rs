@@ -9613,6 +9613,15 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        // (cut from a block, if it is small enough: `crate::pool::cpu_buffer`)
+        if let Some(cut) = crate::pool::cpu_buffer(&self.device, crate::pool::CpuBuffer::Upload, size) {
+            return Some(cut);
+        }
+        self.upload_buffer_own(size)
+    }
+
+    /// [`Host::upload_buffer`] as an allocation of its own.
+    pub(crate) fn upload_buffer_own(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10737,6 +10746,15 @@ impl Host {
 
     /// [`Host::shared_buffer`], made now.
     pub(crate) fn shared_buffer_now(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        // (cut from a block, if it is small enough: `crate::pool::cpu_buffer`)
+        if let Some(cut) = crate::pool::cpu_buffer(&self.device, crate::pool::CpuBuffer::Shared, size) {
+            return Some(cut);
+        }
+        self.shared_buffer_own(size)
+    }
+
+    /// [`Host::shared_buffer_now`] as an allocation of its own.
+    pub(crate) fn shared_buffer_own(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         self.buffers_now(size, 1, true).pop().map(|(b, data)| (b, data as *mut u8))
     }
 
