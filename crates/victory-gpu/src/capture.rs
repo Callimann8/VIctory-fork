@@ -150,8 +150,20 @@ pub(crate) fn wanted(n: u64) -> bool {
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
+    //
+    // `VICTORY_CAPTURE_WORLD_EVERY=<n>`: every nth instead (0: none, only
+    // the listed ones). A saved frame is presented and read back at once,
+    // which settles everything in the air (`Host::present_planes`): at
+    // every 8th frame that was 0.125 settles a frame, each the length of
+    // the card's work in the air, and the frames over 100 ms of the runs
+    // measured with it (GTA VI, runs A13 and A14: 13 to 16 of 100 frames,
+    // the same with every other wait gone).
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+    });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && every != 0 && first != u64::MAX && n > first && (n - first).is_multiple_of(every);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
