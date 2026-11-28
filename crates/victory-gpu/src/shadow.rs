@@ -425,7 +425,14 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    crate::ahead::want_card();
+    // (Card buffers are made ahead only where a copy can be of their size: with the least
+    // copy above it, as on cards of 12 GB and less, a store on the card would only take the
+    // textures' room.)
+    if least <= crate::ahead::SIZE {
+        crate::ahead::want_card();
+    } else {
+        crate::ahead::start();
+    }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
     // the world loads, before the textures fill the card; the texture
