@@ -10272,7 +10272,14 @@ impl Host {
                     used.saturating_sub(crate::pool::texture_room()) >= crate::resource::room_line(budget)
                 })
             };
-            let pressed = crate::residency::pressured() || card;
+            // `VICTORY_SWEEP_PRESS_BY_RAM=0`: the PC's memory does not count.
+            // On a PC that stands under the residency thresholds from the
+            // first minute to the end (32 GB with other programs open:
+            // pressed from ~48 s on in every run) the sweeps otherwise stay
+            // at every 1.5 s for good; the card's room still brings them back.
+            static BY_RAM: OnceLock<bool> = OnceLock::new();
+            let by_ram = *BY_RAM.get_or_init(|| std::env::var_os("VICTORY_SWEEP_PRESS_BY_RAM").is_none_or(|v| v != "0"));
+            let pressed = (by_ram && crate::residency::pressured()) || card;
             if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
                 tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
             }
