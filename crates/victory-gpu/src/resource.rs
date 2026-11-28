@@ -2266,23 +2266,21 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    // The card's rule keeps idle copies for ten minutes while the card has
-    // room. When the PC's own commit is the limit, only copies for title
-    // memory that is no longer mapped are taken, after 5 s (1 s under
-    // 8 GiB): a mapped, hot texture keeps the full cache.
-    let host_idle = crate::residency::host_texture_idle_ms();
-    let (idle_ms, most) = match host_idle {
-        Some(ms) => (ms, u64::MAX),
-        None => match memory {
-            Some([budget, used, ..]) if keep => {
-                let used = used.saturating_sub(crate::pool::texture_room())
-                    + crate::shadow::card_room_kept()
-                    + targets_room_kept();
-                crate::host::vram_keep_below(budget, used, room_line(budget))
-            }
-            _ => (crate::host::vram_idle_ms(memory), u64::MAX),
-        },
+    let (idle_ms, most) = match memory {
+        Some([budget, used, ..]) if keep => {
+            let used = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            crate::host::vram_keep_below(budget, used, room_line(budget))
+        }
+        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // Beside the card's rule, not in its place: when the PC's own commit is
+    // the limit, copies for title memory that is no longer mapped also go,
+    // after 5 s (1 s under 8 GiB). (In the card's place, a PC that is short
+    // of memory for a whole run never let an idle copy go for the card's
+    // sake: new textures waited for room to the end, run A10 of 2026-11-28.)
+    let host_idle = crate::residency::host_texture_idle_ms();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2309,7 +2307,7 @@ pub(crate) fn let_go_idle() {
     let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
     let part = if most != u64::MAX {
         0
-    } else if whole || (idle_ms < 60_000 && host_idle.is_none()) {
+    } else if whole || idle_ms < 60_000 {
         usize::MAX
     } else {
         PART
@@ -2317,23 +2315,18 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
-            break;
-        }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
+    // Lets the host copy of the texture at `at` go if nothing but its title
+    // texture holds it and it was idle for `idle_ms`; its bytes then.
+    let let_go = |at: usize, idle_ms: u64, unmapped_only: bool| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
+            return None;
         }
-        if host_idle.is_some() {
+        if unmapped_only {
             // All of the placed texture's range, not just its first page:
             // a smaller-but-mapped part would be lost with the copy. With
             // neither end committed this is two queries and no walk
@@ -2344,8 +2337,8 @@ pub(crate) fn let_go_idle() {
                     f.size > 0 && crate::texture::mapped_bytes(r.data().cast_const(), f.size as usize) == 0
                 });
             if !unmapped {
-                // Mapped, hot: the card's rule still decides when it may go.
-                continue;
+                // Mapped, hot: the card's rule decides when it may go.
+                return None;
             }
         }
         let gone = {
@@ -2365,20 +2358,51 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+        let (host, _) = gone?;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        let bytes = host.bytes;
+        if unmapped_only {
+            HOST_PRESSURE[0].fetch_add(1, Relaxed);
+            HOST_PRESSURE[1].fetch_add(bytes, Relaxed);
+        }
+        crate::host::retire(host);
+        Some(bytes)
+    };
+    // The card's rule.
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+        if bytes >= most {
+            break;
+        }
+        looked += 1;
+        if part == PART {
+            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        }
+        if let Some(gone) = let_go(at, idle_ms, false) {
             went += 1;
-            bytes += host.bytes;
+            bytes += gone;
             if first.is_none() {
                 first = Some(at);
             }
-            if host_idle.is_some() {
-                HOST_PRESSURE[0].fetch_add(1, Relaxed);
-                HOST_PRESSURE[1].fetch_add(host.bytes, Relaxed);
+        }
+    }
+    // The host's: a part of the textures at each look, the next one at the
+    // next.
+    if let Some(host_ms) = host_idle {
+        static FROM_HOST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let from = FROM_HOST.load(Relaxed);
+        let mut looked = 0;
+        for at in all.range(from..).take(PART).copied() {
+            looked += 1;
+            FROM_HOST.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+            if let Some(gone) = let_go(at, host_ms, true) {
+                went += 1;
+                bytes += gone;
+                if first.is_none() {
+                    first = Some(at);
+                }
             }
-            crate::host::retire(host);
         }
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
