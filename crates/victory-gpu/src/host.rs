@@ -2654,7 +2654,6 @@ fn trim_spare_uploads() {
         let freed = {
             let mut spare = spare.lock().unwrap_or_else(|e| e.into_inner());
             spare.bytes = 0;
-            spare.low = 0;
             std::mem::take(&mut spare.kept)
         };
         drop(freed);

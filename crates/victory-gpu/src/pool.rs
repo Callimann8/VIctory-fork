@@ -1056,9 +1056,9 @@ pub(crate) fn cpu_buffer(device: &ID3D12Device, kind: CpuBuffer, size: u64) -> O
             return None;
         }
         let heap = heap?;
-        let waited = crate::host::resident(device, &heap).and_then(|()| match kind {
+        let waited = crate::host::resident(device, &heap, crate::host::Made::Block).and_then(|()| match kind {
             CpuBuffer::Upload => Ok(()),
-            CpuBuffer::Shared => crate::host::mapped(device),
+            CpuBuffer::Shared => crate::host::mapped(device, crate::host::Made::Block),
         });
         if let Err(e) = waited {
             tracing::warn!(error = %e, ?kind, "a block of buffers is not resident");
