@@ -10220,9 +10220,23 @@ impl Host {
             crate::residency::refresh();
             // The card past the line textures are made up to: textures are
             // held back for room, and it is the sweep that lets idle ones go.
-            let card = self
-                .video_memory()
-                .is_none_or(|[budget, used, ..]| used.saturating_sub(crate::pool::texture_room()) >= crate::resource::room_line(budget));
+            // Asked as the texture pass asks it (`crate::resource::room`,
+            // with what is kept for render targets and buffer copies): by
+            // the card's use alone it said "not pressed" for seconds at a
+            // time while every pass held new textures back (a cutscene:
+            // thousands of slots a second held, served up to 32 s after
+            // their write, sweeps every 15 s meanwhile).
+            // `VICTORY_SWEEP_PRESS_BY_ROOM=0`: by the use alone, as before.
+            static BY_ROOM: OnceLock<bool> = OnceLock::new();
+            let by_room = *BY_ROOM.get_or_init(|| std::env::var_os("VICTORY_SWEEP_PRESS_BY_ROOM").is_none_or(|v| v != "0"));
+            let memory = self.video_memory();
+            let card = if by_room {
+                !crate::resource::room(memory)
+            } else {
+                memory.is_none_or(|[budget, used, ..]| {
+                    used.saturating_sub(crate::pool::texture_room()) >= crate::resource::room_line(budget)
+                })
+            };
             let pressed = crate::residency::pressured() || card;
             if PRESSED.swap(pressed, Ordering::Relaxed) != pressed {
                 tracing::info!(pressed, every_ms = if pressed { PRESSED_MS } else { every }, "sweeps behind flights");
