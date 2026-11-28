@@ -96,10 +96,13 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     }
     let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
     let (was, will) = (bits(p.number), bits(number));
+    let long = p.frames.iter().filter(|&&t| t > 100.0).count();
+    let longest = p.frames.iter().copied().fold(0.0f32, f32::max);
     let (mean, median, most) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
     tracing::info!(
-        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, longest {longest:.1}, {long} over 100 ms, \
+         {:.0} draws a frame",
         p.number,
         on.join(" "),
         p.frames.len(),
